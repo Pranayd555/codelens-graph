@@ -22,6 +22,10 @@
         "title": "CodeLens: Build Knowledge Graph"
       },
       {
+        "command": "codelens-graph.rebuildGraph",
+        "title": "CodeLens: Force Rebuild Graph"
+      },
+      {
         "command": "codelens-graph.showGraph",
         "title": "CodeLens: Show Graph Explorer"
       },
@@ -30,12 +34,20 @@
         "title": "CodeLens: Show Agent Context Preview"
       },
       {
-        "command": "codelens-graph.rebuildGraph",
-        "title": "CodeLens: Force Rebuild Graph"
-      },
-      {
         "command": "codelens-graph.searchSymbol",
         "title": "CodeLens: Search Symbol in Graph"
+      },
+      {
+        "command": "codelens-graph.getContextForTask",
+        "title": "CodeLens: Get Context for Task (Agent)"
+      },
+      {
+        "command": "codelens-graph.updateAfterAgentRun",
+        "title": "CodeLens: Update Graph After Agent Run"
+      },
+      {
+        "command": "codelens-graph.regenerateSkills",
+        "title": "CodeLens: Regenerate AI Agent Skill Files"
       }
     ],
     "viewsContainers": {

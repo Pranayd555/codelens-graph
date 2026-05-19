@@ -1,84 +1,87 @@
 // ─── Node types ────────────────────────────────────────────────────────────────
-// Every symbol in the codebase becomes one of these node types in the graph.
 
 export type NodeType =
-  | 'file'        // a source file
-  | 'class'       // class declaration
-  | 'interface'   // interface / type declaration
-  | 'function'    // top-level function
-  | 'method'      // method inside a class
-  | 'variable'    // module-level variable or constant
-  | 'property'    // property inside a class
-  | 'import'      // import statement
-  | 'export'      // export declaration
-  | 'enum'        // enum declaration
-  | 'type'        // type alias
-  | 'decorator';  // decorator (TypeScript / Python)
+  | 'file'
+  | 'class'
+  | 'interface'
+  | 'function'
+  | 'method'
+  | 'variable'
+  | 'property'
+  | 'import'
+  | 'export'
+  | 'enum'
+  | 'type'
+  | 'decorator';
 
 // ─── Edge types ────────────────────────────────────────────────────────────────
-// Relationships between nodes. These are directed (from → to).
 
 export type EdgeType =
-  | 'contains'      // file contains class; class contains method
-  | 'calls'         // function/method calls another function/method
-  | 'imports'       // file imports from another file or package
-  | 'inherits'      // class extends another class
-  | 'implements'    // class implements an interface
-  | 'uses_type'     // variable/param uses a type
-  | 'instantiates'  // new ClassName()
-  | 'exports'       // file exports a symbol
-  | 'references'    // variable / property references another symbol
-  | 'modifies';     // agent run modified this node (tracked post-run)
+  | 'contains'
+  | 'calls'
+  | 'imports'
+  | 'inherits'
+  | 'implements'
+  | 'uses_type'
+  | 'instantiates'
+  | 'exports'
+  | 'references'
+  | 'modifies'
+  | 'undefined_ref';   // NEW: symbol used in body but never defined/imported
 
 // ─── Graph node ────────────────────────────────────────────────────────────────
 
 export interface GraphNode {
-  id: string;           // unique: "filePath::symbolName::line"
+  id: string;
   type: NodeType;
-  name: string;         // symbol name (e.g. "getUserById")
-  filePath: string;     // absolute path
-  line: number;         // line number where defined
-  endLine: number;      // last line of the symbol
-  language: string;     // "typescript" | "python" | etc.
+  name: string;
+  filePath: string;
+  line: number;
+  endLine: number;
+  language: string;
 
-  // Symbol-level detail
-  signature?: string;   // full function/method signature
-  returnType?: string;  // return type annotation
-  params?: Param[];     // parameter list
-  modifiers?: string[]; // public, private, static, async, export, etc.
-  docComment?: string;  // JSDoc / docstring above the symbol
+  signature?: string;
+  returnType?: string;
+  params?: Param[];
+  modifiers?: string[];
+  docComment?: string;
 
-  // File-level metadata (only on file nodes)
-  size?: number;        // bytes
-  lastModified?: number; // unix timestamp
+  // NEW: identifiers used inside this function that are never defined or imported
+  undefinedRefs?: string[];
 
-  // Graph state
-  hash?: string;        // content hash — used to detect changes
-  updatedAt: number;    // unix timestamp of last graph update
+  // NEW: local variables defined inside this function (scope map)
+  localVars?: string[];
+
+  // NEW: external symbols this function instantiates via `new`
+  instantiates?: string[];
+
+  size?: number;
+  lastModified?: number;
+  hash?: string;
+  updatedAt: number;
 }
 
 export interface Param {
   name: string;
   type?: string;
   defaultValue?: string;
-  rest?: boolean;       // ...args
+  rest?: boolean;
 }
 
 // ─── Graph edge ────────────────────────────────────────────────────────────────
 
 export interface GraphEdge {
-  id: string;           // "fromId::edgeType::toId"
+  id: string;
   fromId: string;
   toId: string;
   type: EdgeType;
-  metadata?: Record<string, string>; // e.g. { importedAs: "Router" }
+  metadata?: Record<string, string>;
 }
 
 // ─── Snapshot ──────────────────────────────────────────────────────────────────
-// Created before and after every agent run.
 
 export interface GraphSnapshot {
-  id: string;           // uuid
+  id: string;
   timestamp: number;
   agentRunId?: string;
   nodeCount: number;
@@ -88,7 +91,7 @@ export interface GraphSnapshot {
   removedNodeIds: string[];
 }
 
-// ─── Parsed file (output of AST parser) ────────────────────────────────────────
+// ─── Parsed file ───────────────────────────────────────────────────────────────
 
 export interface ParsedFile {
   filePath: string;
@@ -98,19 +101,32 @@ export interface ParsedFile {
   parseErrors: string[];
 }
 
-// ─── Context payload (what gets injected into agents) ──────────────────────────
+// ─── Agent context ─────────────────────────────────────────────────────────────
 
 export interface AgentContext {
   taskDescription: string;
-  entryPoints: string[];           // node ids most relevant to the task
+  entryPoints: string[];
   subgraph: {
     nodes: GraphNode[];
     edges: GraphEdge[];
   };
-  existingFiles: string[];         // all files in scope
-  warnings: string[];              // "X already exists at line Y — do not duplicate"
+  existingFiles: string[];
+  warnings: string[];
+  // NEW: diagnosed issues found in the relevant subgraph
+  diagnoses: Diagnosis[];
   tokenEstimate: number;
   generatedAt: number;
+}
+
+// NEW: a concrete issue the graph found that the agent should fix
+export interface Diagnosis {
+  severity: 'error' | 'warning' | 'info';
+  type: 'undefined_ref' | 'duplicate_symbol' | 'missing_import' | 'stale_import';
+  message: string;
+  filePath: string;
+  line?: number;
+  symbol?: string;
+  suggestion?: string;
 }
 
 // ─── Graph stats ───────────────────────────────────────────────────────────────

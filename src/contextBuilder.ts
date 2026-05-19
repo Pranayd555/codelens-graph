@@ -70,6 +70,7 @@ export class ContextBuilder {
       warnings,
       tokenEstimate: 0,
       generatedAt: Date.now(),
+      diagnoses: []
     };
 
     context.tokenEstimate = estimateTokens(this.serialize(context));

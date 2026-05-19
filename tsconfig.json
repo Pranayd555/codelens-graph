@@ -11,7 +11,6 @@
     "sourceMap": true,
     "resolveJsonModule": true,
     "lib": ["ES2020"],
-    "types": ["node"],
     "moduleResolution": "node"
   },
   "exclude": ["node_modules", ".vscode-test", "out"]

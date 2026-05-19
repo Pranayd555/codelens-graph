@@ -69,6 +69,7 @@ export class ContextBuilder {
       subgraph: { nodes: trimmedNodes, edges: trimmedEdges },
       existingFiles,
       warnings,
+      diagnoses: [],
       tokenEstimate: 0,
       generatedAt: Date.now(),
     };

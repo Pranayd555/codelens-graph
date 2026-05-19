@@ -1,97 +1,204 @@
-// ─── VS Code extension entry point ───────────────────────────────────────────
-// This file is loaded by VS Code when the extension activates.
-// It wires together: DB → parser → scanner → watcher → context builder → UI.
-
 import * as vscode from 'vscode';
-import * as path from 'path';
+import * as path   from 'path';
 import * as crypto from 'crypto';
 
-import { GraphDB }          from './graph/graphDB';
-import { ASTParser }        from './ingestion/astParser';
-import { WorkspaceScanner } from './ingestion/workspaceScanner';
-import { FileWatcher }      from './ingestion/fileWatcher';
-import { ContextBuilder }   from './context/contextBuilder';
-import { GraphDiffer }      from './graph/differ';
+import { GraphDB }            from './graph/graphDB';
+import { ASTParser }          from './ingestion/astParser';
+import { WorkspaceScanner }   from './ingestion/workspaceScanner';
+import { FileWatcher }        from './ingestion/fileWatcher';
+import { ContextBuilder }     from './context/contextBuilder';
+import { GraphDiffer }        from './graph/differ';
+import { SkillGenerator }     from './agent/skillGenerator';
+import { BackgroundScanner }  from './agent/backgroundScanner';
 import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
-import { GraphStats }       from './types';
+import { GraphStats }         from './types';
 
-// ─── Global extension state ───────────────────────────────────────────────────
+// ─── Extension-wide state ─────────────────────────────────────────────────────
 
-let db:             GraphDB;
-let parser:         ASTParser;
-let scanner:        WorkspaceScanner;
-let watcher:        FileWatcher;
-let contextBuilder: ContextBuilder;
-let differ:         GraphDiffer;
+let db:                GraphDB;
+let parser:            ASTParser;
+let scanner:           WorkspaceScanner;
+let fileWatcher:       FileWatcher;
+let contextBuilder:    ContextBuilder;
+let differ:            GraphDiffer;
+let skillGenerator:    SkillGenerator;
+let backgroundScanner: BackgroundScanner;
 
-let graphPanel:     vscode.WebviewPanel | undefined;
-let statusBarItem:  vscode.StatusBarItem;
-let lastBuildStats: GraphStats | undefined;
+let graphPanel:    vscode.WebviewPanel | undefined;
+let statusBarItem: vscode.StatusBarItem;
 
 // ─── activate ─────────────────────────────────────────────────────────────────
-// Called once when VS Code loads the extension.
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log('[CodeLens Graph] Activating…');
 
-  // ── 1. Initialize core services ──────────────────────────────────────────
+  // ── 1. Boot all services ──────────────────────────────────────────────────
 
   db             = new GraphDB(context.globalStorageUri.fsPath);
   parser         = new ASTParser();
   scanner        = new WorkspaceScanner(parser, db);
-  watcher        = new FileWatcher(scanner);
+  fileWatcher    = new FileWatcher(scanner);
   contextBuilder = new ContextBuilder(db);
   differ         = new GraphDiffer(db);
+  skillGenerator = new SkillGenerator(db);
+  backgroundScanner = new BackgroundScanner(db, scanner, skillGenerator);
 
   await db.init();
 
-  // ── 2. Status bar item ────────────────────────────────────────────────────
+  // ── 2. Status bar ──────────────────────────────────────────────────────────
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBarItem.command = 'codelens-graph.showGraph';
-  updateStatusBar('idle');
+  setStatus('idle');
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  // ── 3. Register commands ──────────────────────────────────────────────────
+  // ── 3. Background scanner callbacks ───────────────────────────────────────
+
+  backgroundScanner.onStatus(state => {
+    if (state === 'scanning')  { setStatus('scanning'); }
+    if (state === 'updating')  { setStatus('updating'); }
+    if (state === 'ready')     {
+      const s = db.getStats();
+      setStatus('ready', s.totalNodes, s.totalEdges);
+      refreshGraphPanel();
+    }
+    if (state === 'error')     { setStatus('error'); }
+  });
+
+  backgroundScanner.onComplete(stats => {
+    setStatus('ready', stats.totalNodes, stats.totalEdges);
+    refreshGraphPanel();
+  });
+
+  backgroundScanner.onSkills(written => {
+    // Silent — only notify first time so user knows what happened
+    const shownKey = 'codelens.skillsNotified';
+    if (!context.globalState.get(shownKey)) {
+      context.globalState.update(shownKey, true);
+      vscode.window.showInformationMessage(
+        `CodeLens Graph: AI agent rules written to ${written.length} locations ` +
+        `(.cursor/rules, .github/copilot-instructions.md, .clinerules…). ` +
+        `Your AI agent will now use the graph automatically.`,
+        'Show Graph'
+      ).then(choice => { if (choice === 'Show Graph') { showGraphPanel(context); } });
+    }
+  });
+
+  // ── 4. Commands ───────────────────────────────────────────────────────────
 
   context.subscriptions.push(
 
+    // Manual full rebuild (user-triggered)
     vscode.commands.registerCommand('codelens-graph.buildGraph', async () => {
-      await buildGraph(context);
+      await manualBuild(context);
     }),
 
     vscode.commands.registerCommand('codelens-graph.rebuildGraph', async () => {
-      await buildGraph(context, true);
+      await manualBuild(context, true);
     }),
 
+    // Graph viewer
     vscode.commands.registerCommand('codelens-graph.showGraph', () => {
       showGraphPanel(context);
     }),
 
+    // Agent context preview (still available for debugging)
     vscode.commands.registerCommand('codelens-graph.showContext', async () => {
       await showContextPreview();
     }),
 
+    // Symbol search
     vscode.commands.registerCommand('codelens-graph.searchSymbol', async () => {
       await searchSymbol();
     }),
+
+    // ── Agent-callable commands (invoked by AI via VS Code command palette) ──
+
+    // Called by the AI agent BEFORE starting work on a task.
+    // Returns a compressed context JSON — the agent reads it, not the user.
+    vscode.commands.registerCommand('codelens-graph.getContextForTask', async (taskDescription?: string) => {
+      const task = taskDescription
+        ?? await vscode.window.showInputBox({ prompt: 'Task description for context lookup' });
+      if (!task) { return; }
+
+      const cfg = getConfig();
+      const agentCtx = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget);
+      const injection = contextBuilder.buildSystemPromptInjection(agentCtx);
+
+      // Write to a temp file the agent can read
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (workspaceRoot) {
+        const outPath = path.join(workspaceRoot, '.codelens', 'agent-context.md');
+        const fs = require('fs');
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, injection, 'utf-8');
+      }
+
+      // Also show in editor so agent can read it inline
+      const doc = await vscode.workspace.openTextDocument({
+        language: 'markdown',
+        content: injection,
+      });
+      await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
+
+      return { context: injection, tokenEstimate: agentCtx.tokenEstimate };
+    }),
+
+    // Called by the AI agent AFTER it finishes making changes.
+    // Re-scans changed files and regenerates skill files.
+    vscode.commands.registerCommand('codelens-graph.updateAfterAgentRun', async (changedFiles?: string[]) => {
+      const cfg = getConfig();
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { return; }
+
+      const files = changedFiles ?? await detectRecentlyChangedFiles(workspaceRoot);
+
+      setStatus('updating');
+      await backgroundScanner.handleAgentRunComplete(files, workspaceRoot, {
+        excludePatterns:     cfg.excludePatterns,
+        supportedExtensions: cfg.supportedExtensions,
+      });
+
+      vscode.window.setStatusBarMessage('$(check) CodeLens: graph updated after agent run', 3000);
+    }),
+
+    // Regenerate just the skill files (no rescan)
+    vscode.commands.registerCommand('codelens-graph.regenerateSkills', () => {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { return; }
+      const dbStats = db.getStats();
+      const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
+      const written = skillGenerator.generateAll(workspaceRoot, stats);
+      vscode.window.showInformationMessage(`CodeLens: Skills regenerated → ${written.join(', ')}`);
+    }),
   );
 
-  // ── 4. File system watcher (auto-update on save) ──────────────────────────
+  // ── 5. File system watcher → incremental graph updates ────────────────────
 
-  const config = getConfig();
-  if (config.autoRebuildOnSave) {
-    const supported = config.supportedExtensions.join(',');
+  const cfg = getConfig();
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  const supported = cfg.supportedExtensions.join(',');
+
+  if (cfg.autoRebuildOnSave && workspaceRoot) {
     const fsWatcher = vscode.workspace.createFileSystemWatcher(`**/*{${supported}}`);
 
-    fsWatcher.onDidChange(uri => watcher.handleFileChange(uri.fsPath).then(() => {
+    fsWatcher.onDidChange(async uri => {
+      // Skip files inside .codelens/ to avoid self-triggering
+      if (uri.fsPath.includes('.codelens')) { return; }
+      await backgroundScanner.handleFileChanged(uri.fsPath, workspaceRoot, {
+        excludePatterns:     cfg.excludePatterns,
+        supportedExtensions: cfg.supportedExtensions,
+      });
       refreshGraphPanel();
-      updateStatusBar('idle');
-    }));
-    fsWatcher.onDidCreate(uri => watcher.handleFileCreate(uri.fsPath).then(() => {
+    });
+
+    fsWatcher.onDidCreate(async uri => {
+      if (uri.fsPath.includes('.codelens')) { return; }
+      await fileWatcher.handleFileCreate(uri.fsPath);
       refreshGraphPanel();
-    }));
+    });
+
     fsWatcher.onDidDelete(uri => {
       db.deleteNodesByFile(uri.fsPath);
       db.persist();
@@ -101,114 +208,107 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(fsWatcher);
   }
 
-  // ── 5. Auto-build on first activation if workspace has files ─────────────
+  // ── 6. Auto-scan on activation (the core of autonomous operation) ─────────
 
-  const stats = db.getStats();
-  if (stats.totalNodes === 0 && vscode.workspace.workspaceFolders?.length) {
-    // First time: build automatically in the background
-    buildGraph(context).catch(console.error);
-  } else {
-    updateStatusBar('ready', stats.totalNodes, stats.totalEdges);
+  if (workspaceRoot) {
+    const stats = db.getStats();
+
+    if (stats.totalNodes === 0) {
+      // First time: scan immediately (with a small delay to not block VS Code startup)
+      backgroundScanner.scheduleInitialScan(workspaceRoot, {
+        excludePatterns:     cfg.excludePatterns,
+        supportedExtensions: cfg.supportedExtensions,
+      }, context);
+    } else {
+      // Already have a graph: just regenerate skills (fast, no rescan needed)
+      setStatus('ready', stats.totalNodes, stats.totalEdges);
+      const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
+      skillGenerator.generateAll(workspaceRoot, fullStats);
+      console.log(`[CodeLens] Existing graph loaded: ${stats.totalNodes} nodes. Skills refreshed.`);
+    }
   }
 
+  context.subscriptions.push({ dispose: () => backgroundScanner.dispose() });
   console.log('[CodeLens Graph] Activated ✓');
 }
 
-// ─── deactivate ────────────────────────────────────────────────────────────────
+// ─── deactivate ───────────────────────────────────────────────────────────────
 
 export function deactivate(): void {
-  watcher?.dispose();
+  backgroundScanner?.dispose();
+  fileWatcher?.dispose();
   db?.close();
   console.log('[CodeLens Graph] Deactivated');
 }
 
-// ─── buildGraph ───────────────────────────────────────────────────────────────
+// ─── manualBuild ──────────────────────────────────────────────────────────────
+// Triggered by the user explicitly. Shows progress UI unlike background scan.
 
-async function buildGraph(context: vscode.ExtensionContext, force = false): Promise<void> {
+async function manualBuild(context: vscode.ExtensionContext, _force = false): Promise<void> {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders?.length) {
     vscode.window.showWarningMessage('CodeLens Graph: No workspace folder open.');
     return;
   }
 
-  const config = getConfig();
-  updateStatusBar('building');
+  const workspaceRoot = folders[0].uri.fsPath;
+  const cfg = getConfig();
+  setStatus('scanning');
 
   await vscode.window.withProgress({
-    location: vscode.ProgressLocation.Notification,
-    title: 'CodeLens: Building knowledge graph…',
+    location:    vscode.ProgressLocation.Notification,
+    title:       'CodeLens: Building knowledge graph…',
     cancellable: false,
   }, async (progress) => {
-    const rootPaths = folders.map(f => f.uri.fsPath);
 
-    const result = await scanner.scanWorkspace(rootPaths, {
-      excludePatterns: config.excludePatterns,
-      supportedExtensions: config.supportedExtensions,
+    const result = await scanner.scanWorkspace([workspaceRoot], {
+      excludePatterns:     cfg.excludePatterns,
+      supportedExtensions: cfg.supportedExtensions,
       onProgress: (current, total, filePath) => {
-        const pct = Math.round((current / total) * 100);
         progress.report({
-          message: `${pct}%  ${path.basename(filePath)}`,
+          message:   `${Math.round((current / total) * 100)}%  ${path.basename(filePath)}`,
           increment: 100 / total,
         });
       },
     });
 
     const dbStats = db.getStats();
-    lastBuildStats = {
-      ...dbStats,
-      lastBuilt: Date.now(),
-      buildDurationMs: result.durationMs,
-    };
+    const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: result.durationMs };
 
-    updateStatusBar('ready', dbStats.totalNodes, dbStats.totalEdges);
+    setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
     refreshGraphPanel();
 
-    vscode.window.showInformationMessage(
-      `CodeLens Graph built: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.edgesAdded} edges  (${result.durationMs}ms)`
-    );
+    // Generate / update skill files
+    const written = skillGenerator.generateAll(workspaceRoot, stats);
 
-    if (result.errors.length > 0) {
-      console.warn('[CodeLens] Parse errors:', result.errors.slice(0, 10));
-    }
+    vscode.window.showInformationMessage(
+      `CodeLens Graph: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.durationMs}ms` +
+      ` | Skills → ${written.length} agent rule files updated`
+    );
   });
 }
 
-// ─── showGraphPanel ────────────────────────────────────────────────────────────
+// ─── showGraphPanel ───────────────────────────────────────────────────────────
 
 function showGraphPanel(context: vscode.ExtensionContext): void {
-  if (graphPanel) {
-    graphPanel.reveal();
-    return;
-  }
+  if (graphPanel) { graphPanel.reveal(); return; }
 
   graphPanel = vscode.window.createWebviewPanel(
-    'codelens-graph',
-    'CodeLens Graph',
+    'codelens-graph', 'CodeLens Graph',
     vscode.ViewColumn.Beside,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-    }
+    { enableScripts: true, retainContextWhenHidden: true }
   );
 
-  // Load all nodes and edges for initial render
   const allFiles = db.getAllFiles();
-  const allNodes: ReturnType<typeof db.getNodesByFile>[number][] = [];
-  for (const f of allFiles) { allNodes.push(...db.getNodesByFile(f)); }
+  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
+  const allEdges = allNodes.flatMap(n => db.getEdgesFrom(n.id));
+  const nonce    = crypto.randomBytes(16).toString('hex');
 
-  // Collect all edges
-  const allEdges: ReturnType<typeof db.getEdgesFrom>[number][] = [];
-  for (const node of allNodes) { allEdges.push(...db.getEdgesFrom(node.id)); }
+  graphPanel.webview.html = getGraphPanelHtml(toWebviewData(allNodes, allEdges), nonce);
 
-  const webviewData = toWebviewData(allNodes, allEdges);
-  const nonce = crypto.randomBytes(16).toString('hex');
-  graphPanel.webview.html = getGraphPanelHtml(webviewData, nonce);
-
-  // Handle messages from webview (e.g. click → open file)
   graphPanel.webview.onDidReceiveMessage(msg => {
     if (msg.command === 'openFile' && msg.filePath) {
-      const uri = vscode.Uri.file(msg.filePath);
-      vscode.window.showTextDocument(uri, {
+      vscode.window.showTextDocument(vscode.Uri.file(msg.filePath), {
         selection: new vscode.Range(
           new vscode.Position(Math.max(0, (msg.line ?? 1) - 1), 0),
           new vscode.Position(Math.max(0, (msg.line ?? 1) - 1), 0)
@@ -220,55 +320,38 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
   graphPanel.onDidDispose(() => { graphPanel = undefined; });
 }
 
-// Push updated graph data to an open webview panel
 function refreshGraphPanel(): void {
   if (!graphPanel) { return; }
-
   const allFiles = db.getAllFiles();
-  const allNodes: ReturnType<typeof db.getNodesByFile>[number][] = [];
-  for (const f of allFiles) { allNodes.push(...db.getNodesByFile(f)); }
-
-  const allEdges: ReturnType<typeof db.getEdgesFrom>[number][] = [];
-  for (const node of allNodes) { allEdges.push(...db.getEdgesFrom(node.id)); }
-
-  const webviewData = toWebviewData(allNodes, allEdges);
-  graphPanel.webview.postMessage({ command: 'updateGraph', ...webviewData });
+  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
+  const allEdges = allNodes.flatMap(n => db.getEdgesFrom(n.id));
+  graphPanel.webview.postMessage({ command: 'updateGraph', ...toWebviewData(allNodes, allEdges) });
 }
 
 // ─── showContextPreview ───────────────────────────────────────────────────────
 
 async function showContextPreview(): Promise<void> {
   const task = await vscode.window.showInputBox({
-    prompt: 'Describe the task the AI agent will work on',
-    placeHolder: 'e.g. "add email validation to the user registration form"',
+    prompt:      'Describe the AI agent task',
+    placeHolder: 'e.g. "add rate limiting to auth middleware"',
   });
-
   if (!task) { return; }
 
-  const config = getConfig();
-  const agentContext = contextBuilder.build(task, config.maxGraphDepth, config.maxTokenBudget);
-  const injection    = contextBuilder.buildSystemPromptInjection(agentContext);
+  const cfg    = getConfig();
+  const ctx    = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget);
+  const output = contextBuilder.buildSystemPromptInjection(ctx);
 
-  // Show in a new editor tab
-  const doc = await vscode.workspace.openTextDocument({
-    language: 'markdown',
-    content: [
-      `# CodeLens Agent Context Preview`,
-      `**Task:** ${task}`,
-      `**Estimated tokens:** ${agentContext.tokenEstimate}`,
-      `**Relevant symbols found:** ${agentContext.subgraph.nodes.length}`,
-      '',
-      '## System Prompt Injection',
-      '```',
-      injection,
-      '```',
-      '',
-      '## Warnings',
-      agentContext.warnings.length > 0
-        ? agentContext.warnings.map(w => `- ⚠️ ${w}`).join('\n')
-        : '_No conflicts detected._',
-    ].join('\n'),
-  });
+  const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: [
+    `# CodeLens Agent Context`,
+    `**Task:** ${task}`,
+    `**Tokens:** ~${ctx.tokenEstimate}  |  **Symbols:** ${ctx.subgraph.nodes.length}`,
+    '',
+    '```', output, '```',
+    '',
+    ctx.warnings.length
+      ? '## ⚠️ Warnings\n' + ctx.warnings.map(w => `- ${w}`).join('\n')
+      : '## ✅ No conflicts detected',
+  ].join('\n') });
 
   await vscode.window.showTextDocument(doc);
 }
@@ -277,34 +360,28 @@ async function showContextPreview(): Promise<void> {
 
 async function searchSymbol(): Promise<void> {
   const query = await vscode.window.showInputBox({
-    prompt: 'Search for a symbol in the graph',
-    placeHolder: 'function name, class, variable…',
+    prompt: 'Search symbol in graph', placeHolder: 'function / class / variable name…',
   });
-
   if (!query) { return; }
 
   const results = db.searchNodes(query, 20);
-  if (results.length === 0) {
-    vscode.window.showInformationMessage(`No symbols found matching "${query}"`);
+  if (!results.length) {
+    vscode.window.showInformationMessage(`No symbols found for "${query}"`);
     return;
   }
 
-  const items = results.map(n => ({
-    label:       `$(symbol-${n.type === 'function' ? 'method' : n.type}) ${n.name}`,
-    description: `${n.type} — ${path.basename(n.filePath)}:${n.line}`,
-    detail:      n.signature?.slice(0, 100),
-    node:        n,
-  }));
-
-  const selected = await vscode.window.showQuickPick(items, {
-    matchOnDescription: true,
-    matchOnDetail: true,
-    placeHolder: `${results.length} symbols found`,
-  });
+  const selected = await vscode.window.showQuickPick(
+    results.map(n => ({
+      label:       `$(symbol-${n.type === 'function' ? 'method' : n.type}) ${n.name}`,
+      description: `${n.type} · ${path.basename(n.filePath)}:${n.line}`,
+      detail:      n.signature?.slice(0, 120),
+      node:        n,
+    })),
+    { matchOnDescription: true, matchOnDetail: true }
+  );
 
   if (selected) {
-    const uri = vscode.Uri.file(selected.node.filePath);
-    await vscode.window.showTextDocument(uri, {
+    await vscode.window.showTextDocument(vscode.Uri.file(selected.node.filePath), {
       selection: new vscode.Range(
         new vscode.Position(Math.max(0, selected.node.line - 1), 0),
         new vscode.Position(Math.max(0, selected.node.line - 1), 0)
@@ -313,28 +390,59 @@ async function searchSymbol(): Promise<void> {
   }
 }
 
+// ─── detectRecentlyChangedFiles ───────────────────────────────────────────────
+// Fallback: if the agent doesn't pass changed files, detect files modified in
+// the last 5 minutes.
+
+async function detectRecentlyChangedFiles(workspaceRoot: string): Promise<string[]> {
+  const uris = await vscode.workspace.findFiles(
+    '**/*', '**/node_modules/**', 200
+  );
+  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+  const fs = require('fs');
+  return uris
+    .map(u => u.fsPath)
+    .filter(fp => {
+      try { return fs.statSync(fp).mtimeMs > fiveMinutesAgo; }
+      catch { return false; }
+    });
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getConfig() {
   const cfg = vscode.workspace.getConfiguration('codeLensGraph');
   return {
-    autoRebuildOnSave:    cfg.get<boolean>('autoRebuildOnSave', true),
-    maxGraphDepth:        cfg.get<number>('maxGraphDepth', 2),
-    maxTokenBudget:       cfg.get<number>('maxTokenBudget', 2000),
-    excludePatterns:      cfg.get<string[]>('excludePatterns', ['**/node_modules/**','**/dist/**','**/build/**','**/.git/**','**/out/**']),
-    supportedExtensions:  cfg.get<string[]>('supportedExtensions', ['.ts','.tsx','.js','.jsx','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php']),
+    autoRebuildOnSave:   cfg.get<boolean>('autoRebuildOnSave', true),
+    maxGraphDepth:       cfg.get<number>('maxGraphDepth', 2),
+    maxTokenBudget:      cfg.get<number>('maxTokenBudget', 2000),
+    excludePatterns:     cfg.get<string[]>('excludePatterns',     ['**/node_modules/**','**/dist/**','**/build/**','**/.git/**','**/out/**','**/.codelens/**']),
+    supportedExtensions: cfg.get<string[]>('supportedExtensions', ['.ts','.tsx','.js','.jsx','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php']),
   };
 }
 
-function updateStatusBar(state: 'idle' | 'building' | 'ready', nodes?: number, edges?: number): void {
-  if (state === 'building') {
-    statusBarItem.text = '$(loading~spin) CodeLens: building…';
-    statusBarItem.tooltip = 'Building knowledge graph…';
-  } else if (state === 'ready' && nodes !== undefined) {
-    statusBarItem.text = `$(type-hierarchy) CodeLens: ${nodes} symbols`;
-    statusBarItem.tooltip = `CodeLens Graph: ${nodes} nodes, ${edges} edges\nClick to open graph viewer`;
-  } else {
-    statusBarItem.text = '$(type-hierarchy) CodeLens Graph';
-    statusBarItem.tooltip = 'Click to open graph viewer';
+type StatusState = 'idle' | 'scanning' | 'updating' | 'ready' | 'error';
+
+function setStatus(state: StatusState, nodes?: number, edges?: number): void {
+  switch (state) {
+    case 'scanning':
+      statusBarItem.text    = '$(loading~spin) CodeLens: scanning…';
+      statusBarItem.tooltip = 'Building knowledge graph in background…';
+      break;
+    case 'updating':
+      statusBarItem.text    = '$(loading~spin) CodeLens: updating…';
+      statusBarItem.tooltip = 'Updating graph after agent run…';
+      break;
+    case 'ready':
+      statusBarItem.text    = `$(type-hierarchy) CodeLens: ${nodes ?? '?'} symbols`;
+      statusBarItem.tooltip = `Graph ready · ${nodes} nodes · ${edges} edges\nClick to open graph viewer`;
+      break;
+    case 'error':
+      statusBarItem.text    = '$(warning) CodeLens: error';
+      statusBarItem.tooltip = 'Graph error — check Output panel for details';
+      break;
+    default:
+      statusBarItem.text    = '$(type-hierarchy) CodeLens Graph';
+      statusBarItem.tooltip = 'Click to open graph viewer';
   }
 }
