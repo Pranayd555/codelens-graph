@@ -1,0 +1,126 @@
+{
+  "name": "codelens-graph",
+  "displayName": "CodeLens Graph",
+  "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
+  "version": "0.1.0",
+  "publisher": "codelens",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codelens-graph.buildGraph",
+        "title": "CodeLens: Build Knowledge Graph"
+      },
+      {
+        "command": "codelens-graph.showGraph",
+        "title": "CodeLens: Show Graph Explorer"
+      },
+      {
+        "command": "codelens-graph.showContext",
+        "title": "CodeLens: Show Agent Context Preview"
+      },
+      {
+        "command": "codelens-graph.rebuildGraph",
+        "title": "CodeLens: Force Rebuild Graph"
+      },
+      {
+        "command": "codelens-graph.searchSymbol",
+        "title": "CodeLens: Search Symbol in Graph"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codelens-graph-sidebar",
+          "title": "CodeLens Graph",
+          "icon": "$(type-hierarchy)"
+        }
+      ]
+    },
+    "views": {
+      "codelens-graph-sidebar": [
+        {
+          "id": "codelens-graph.statsView",
+          "name": "Graph Stats",
+          "type": "webview"
+        },
+        {
+          "id": "codelens-graph.symbolTree",
+          "name": "Symbol Explorer",
+          "type": "tree"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeLens Graph",
+      "properties": {
+        "codeLensGraph.autoRebuildOnSave": {
+          "type": "boolean",
+          "default": true
+        },
+        "codeLensGraph.maxGraphDepth": {
+          "type": "number",
+          "default": 2
+        },
+        "codeLensGraph.maxTokenBudget": {
+          "type": "number",
+          "default": 2000
+        },
+        "codeLensGraph.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.git/**",
+            "**/out/**"
+          ]
+        },
+        "codeLensGraph.supportedExtensions": {
+          "type": "array",
+          "default": [
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".py",
+            ".go",
+            ".rs",
+            ".java",
+            ".cs",
+            ".cpp",
+            ".c",
+            ".rb",
+            ".php"
+          ]
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "sql.js": "^1.11.0",
+    "web-tree-sitter": "^0.22.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.3.0"
+  }
+}
