@@ -102,23 +102,7 @@ call relationship in this project.
 
 ---
 
-### 🔴 RULE: Use CodeLens Graph on EVERY task, including small ones
-
-There is NO task size threshold. Do not judge whether a task is "small enough"
-to skip the graph. The graph takes 2 seconds to query. Grep and file reading
-takes longer and costs more tokens.
-
-**This rule applies to: bug fixes, typo corrections, single-line changes,
-config edits, and refactors — not just large features.**
-
-Skipping the graph for "small" changes is the leading cause of:
-- Stale graph (next agent runs blind)
-- Missed undefinedRef warnings on the exact file you edited
-- Token waste on the NEXT task that has to re-orient
-
----
-
-### Protocol — Step 1: ALWAYS run this first (2 seconds, saves 5,000+ tokens)
+### Protocol — Step 1: ORIENT (before writing any code)
 
 Before touching any file, run this VS Code command to get the relevant subgraph
 for your current task:
@@ -163,21 +147,8 @@ vscode-command: codelens-graph.updateAfterAgentRun
 
 This re-indexes the files you changed so the next agent run has accurate context.
 Do not skip this step — a stale graph causes the next agent to hallucinate.
-This is not optional. Run it even if you only changed one line.
-The graph update takes under 3 seconds. Not running it breaks the next agent's context.
+
 ---
-
-### Fast path for small tasks
-
-For small fixes, you don't need the full context preview.
-Just run: codelens-graph.searchSymbol "<the symbol you're about to touch>"
-
-This takes 1 second, costs ~50 tokens, and tells you:
-- Exact file and line
-- Every function that calls it
-- Any undefinedRefs inside it
-
-That is all you need before making a small change.
 
 ### Codebase overview (as of ${timestamp})
 

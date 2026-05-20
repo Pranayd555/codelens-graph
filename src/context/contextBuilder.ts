@@ -1,18 +1,15 @@
-import { GraphDB } from '../graph/graphDB';
-import { GraphNode, AgentContext, GraphEdge } from '../types';
-import * as crypto from 'crypto';
+import * as path    from 'path';
+import { GraphDB }  from '../graph/graphDB';
+import { GraphNode, AgentContext, GraphEdge, Diagnosis } from '../types';
+import { SnippetExtractor } from './snippetExtractor';
+import { FileClassifier }   from './fileClassifier';
 
-// ─── Token estimator ───────────────────────────────────────────────────────────
-// Rough estimation: 1 token ≈ 4 characters for code/JSON
-
+// ─── Token estimator ──────────────────────────────────────────────────────────
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-// ─── Keyword extractor ─────────────────────────────────────────────────────────
-// Pulls meaningful words from a natural language task description.
-// Removes stop words, keeps identifiers and domain terms.
-
+// ─── Stop words ───────────────────────────────────────────────────────────────
 const STOP_WORDS = new Set([
   'the','a','an','and','or','but','in','on','at','to','for','of','with',
   'by','from','is','are','was','were','be','been','being','have','has',
@@ -31,37 +28,33 @@ function extractKeywords(text: string): string[] {
     .filter(w => w.length > 2 && !STOP_WORDS.has(w));
 }
 
-// ─── Context builder ───────────────────────────────────────────────────────────
+// ─── ContextBuilder ───────────────────────────────────────────────────────────
 
 export class ContextBuilder {
+  private snippets    = new SnippetExtractor();
+  private classifier  = new FileClassifier();
+
   constructor(private db: GraphDB) {}
 
-  // ── Main entry point ───────────────────────────────────────────────────────
-  // Given a natural-language task, produce a compressed AgentContext.
+  // ── Main build ────────────────────────────────────────────────────────────
 
   build(taskDescription: string, maxDepth = 2, maxTokenBudget = 2000): AgentContext {
-    const keywords = extractKeywords(taskDescription);
-
-    // Step 1: Find entry-point nodes matching the keywords
+    const keywords   = extractKeywords(taskDescription);
     const entryNodes = this.findEntryPoints(keywords);
+    const entryIds   = entryNodes.map(n => n.id);
 
-    // Step 2: BFS expand from entry points up to maxDepth hops
-    const entryIds = entryNodes.map(n => n.id);
     const { nodes, edges } = this.db.bfsExpand(entryIds, maxDepth);
+    const scored           = this.scoreNodes(nodes, keywords, taskDescription);
+    const { trimmedNodes, trimmedEdges } = this.trimToBudget(scored, edges, maxTokenBudget);
 
-    // Step 3: Score and rank nodes by relevance to the task
-    const scored = this.scoreNodes(nodes, keywords, taskDescription);
+    // ── IMPROVEMENT 3: rich warnings with exact location + snippet ────────────
+    const warnings   = this.generateWarnings(trimmedNodes, taskDescription);
 
-    // Step 4: Trim to token budget
-    const { trimmedNodes, trimmedEdges } = this.trimToBudget(
-      scored, edges, maxTokenBudget
-    );
+    // ── IMPROVEMENT 4: category hints so agent finds files without grep ───────
+    const existingFiles   = this.db.getAllFiles();
 
-    // Step 5: Generate warnings about existing symbols
-    const warnings = this.generateWarnings(trimmedNodes, taskDescription);
-
-    // Step 6: Collect all existing file paths (so agent knows what exists)
-    const existingFiles = this.db.getAllFiles();
+    // ── IMPROVEMENT 1+2: diagnoses include import path + undefined refs ───────
+    const diagnoses  = this.buildDiagnoses(trimmedNodes, taskDescription);
 
     const context: AgentContext = {
       taskDescription,
@@ -69,33 +62,28 @@ export class ContextBuilder {
       subgraph: { nodes: trimmedNodes, edges: trimmedEdges },
       existingFiles,
       warnings,
-      diagnoses: [],
+      diagnoses,
       tokenEstimate: 0,
       generatedAt: Date.now(),
     };
 
-    context.tokenEstimate = estimateTokens(this.serialize(context));
+    context.tokenEstimate = estimateTokens(this.buildSystemPromptInjection(context));
     return context;
   }
 
   // ── Entry point discovery ─────────────────────────────────────────────────
-  // Searches nodes by name/signature matching keywords.
 
   private findEntryPoints(keywords: string[]): GraphNode[] {
     const found = new Map<string, GraphNode>();
-
     for (const kw of keywords) {
-      const results = this.db.searchNodes(kw, 10);
-      for (const node of results) {
+      for (const node of this.db.searchNodes(kw, 10)) {
         if (!found.has(node.id)) { found.set(node.id, node); }
       }
     }
-
     return Array.from(found.values());
   }
 
   // ── Relevance scoring ─────────────────────────────────────────────────────
-  // Score each node 0–100 based on how relevant it is to the task.
 
   private scoreNodes(
     nodes: GraphNode[],
@@ -103,28 +91,22 @@ export class ContextBuilder {
     task: string
   ): Array<{ node: GraphNode; score: number }> {
     return nodes.map(node => {
-      let score = 0;
+      let score  = 0;
       const nameL = node.name.toLowerCase();
       const taskL = task.toLowerCase();
 
-      // Exact name match in task text
-      if (taskL.includes(nameL)) { score += 40; }
-
-      // Keyword matches in name
+      if (taskL.includes(nameL))          { score += 40; }
       for (const kw of keywords) {
-        if (nameL.includes(kw)) { score += 20; }
-        if (node.signature?.toLowerCase().includes(kw)) { score += 10; }
-        if (node.docComment?.toLowerCase().includes(kw)) { score += 5; }
+        if (nameL.includes(kw))                           { score += 20; }
+        if (node.signature?.toLowerCase().includes(kw))  { score += 10; }
+        if (node.docComment?.toLowerCase().includes(kw)) { score += 5;  }
       }
 
-      // Prefer functions and classes over variables and imports
       const typePriority: Record<string, number> = {
         function: 15, method: 15, class: 12, interface: 10,
         type: 8, variable: 5, property: 3, import: 1, file: 2,
       };
       score += typePriority[node.type] ?? 0;
-
-      // Exported symbols are more relevant
       if (node.modifiers?.includes('export')) { score += 8; }
 
       return { node, score };
@@ -132,7 +114,6 @@ export class ContextBuilder {
   }
 
   // ── Token budget trimming ─────────────────────────────────────────────────
-  // Keep the most relevant nodes until we hit the token budget.
 
   private trimToBudget(
     scored: Array<{ node: GraphNode; score: number }>,
@@ -140,138 +121,271 @@ export class ContextBuilder {
     budget: number
   ): { trimmedNodes: GraphNode[]; trimmedEdges: GraphEdge[] } {
     const trimmedNodes: GraphNode[] = [];
-    const includedIds = new Set<string>();
-    let tokenCount = 0;
+    const includedIds  = new Set<string>();
+    let   tokenCount   = 0;
 
     for (const { node } of scored) {
-      const nodeJson = this.serializeNode(node);
-      const nodeCost = estimateTokens(nodeJson);
-
-      if (tokenCount + nodeCost > budget) { break; }
-
+      const cost = estimateTokens(this.serializeNodeCompact(node));
+      if (tokenCount + cost > budget) { break; }
       trimmedNodes.push(node);
       includedIds.add(node.id);
-      tokenCount += nodeCost;
+      tokenCount += cost;
     }
 
-    // Only include edges where both endpoints are in the trimmed set
-    const trimmedEdges = edges.filter(
-      e => includedIds.has(e.fromId) && includedIds.has(e.toId)
-    );
-
-    return { trimmedNodes, trimmedEdges };
+    return {
+      trimmedNodes,
+      trimmedEdges: edges.filter(e => includedIds.has(e.fromId) && includedIds.has(e.toId)),
+    };
   }
 
-  // ── Warning generation ────────────────────────────────────────────────────
-  // Tell the agent what already exists to prevent duplicates.
+  // ── IMPROVEMENT 3: Warnings with exact context ────────────────────────────
+  // Now includes: exact file:line, the signature, and which callers use it.
 
   private generateWarnings(nodes: GraphNode[], task: string): string[] {
     const warnings: string[] = [];
-    const taskL = task.toLowerCase();
+    const taskL    = task.toLowerCase();
+    const keywords = extractKeywords(task);
 
     for (const node of nodes) {
-      if (node.type === 'file') { continue; }
+      if (node.type === 'file' || node.type === 'import') { continue; }
 
-      // Warn if the symbol name appears in the task (likely to be re-created)
       if (taskL.includes(node.name.toLowerCase())) {
-        const loc = `${node.filePath}:${node.line}`;
-        warnings.push(
-          `"${node.name}" (${node.type}) already exists at ${loc} — do not duplicate`
-        );
+        // Get callers from the graph for richer context
+        const callerEdges = this.db.getEdgesTo(node.id, 'calls');
+        const callerNames = callerEdges
+          .map(e => this.db.getNode(e.fromId)?.name)
+          .filter(Boolean)
+          .slice(0, 3);
+
+        const relPath  = node.filePath.replace(/\\/g, '/').split('/').slice(-3).join('/');
+        let warning    = `"${node.name}" (${node.type}) already exists at .../${relPath}:${node.line}`;
+
+        if (node.signature) {
+          warning += `\n    Signature: ${node.signature.slice(0, 120)}`;
+        }
+        if (callerNames.length > 0) {
+          warning += `\n    Called by: ${callerNames.join(', ')}`;
+        }
+        if (node.modifiers?.includes('export')) {
+          warning += `\n    Already exported — import it, do not recreate`;
+        }
+
+        warnings.push(warning);
       }
     }
 
-    // Warn about existing files in relevant directories
+    // File-level warnings with category context
     const allFiles = this.db.getAllFiles();
-    const keywords = extractKeywords(task);
     for (const fp of allFiles) {
+      const basename = path.basename(fp).toLowerCase();
       for (const kw of keywords) {
-        if (fp.toLowerCase().includes(kw)) {
-          warnings.push(`File already exists: ${fp}`);
+        if (basename.includes(kw)) {
+          const category = this.classifier.classify(fp);
+          const relPath  = fp.replace(/\\/g, '/').split('/').slice(-3).join('/');
+          warnings.push(`File already exists [${category}]: .../${relPath}`);
           break;
         }
       }
     }
 
-    return [...new Set(warnings)]; // deduplicate
+    return [...new Set(warnings)];
   }
 
-  // ── Serialization ─────────────────────────────────────────────────────────
-  // Produces the compact JSON that gets injected into the agent's system prompt.
+  // ── IMPROVEMENT 1+2: Diagnoses with snippets + import paths ──────────────
+  // Builds concrete actionable items for the agent.
 
-  serialize(context: AgentContext): string {
-    return JSON.stringify({
-      task: context.taskDescription,
-      entry_points: context.entryPoints,
-      existing_files: context.existingFiles,
-      warnings: context.warnings,
-      symbols: context.subgraph.nodes
-        .filter(n => n.type !== 'import') // imports add noise
-        .map(n => this.serializeNode(n)),
-      relationships: context.subgraph.edges.map(e => ({
-        from: e.fromId.split('::')[1] ?? e.fromId, // just the name part
-        type: e.type,
-        to:   e.toId.split('::')[1]   ?? e.toId,
-      })),
-    }, null, 2);
+  private buildDiagnoses(nodes: GraphNode[], task: string): Diagnosis[] {
+    const diagnoses: Diagnosis[] = [];
+
+    for (const node of nodes) {
+      // Undefined reference diagnosis — the genAI-style bugs
+      if (node.undefinedRefs?.length) {
+        for (const ref of node.undefinedRefs) {
+          // Try to find where this ref IS defined in the codebase
+          const definedIn = this.db.searchNodes(ref, 3)
+            .filter(n => n.type !== 'import' && n.name === ref);
+
+          const suggestion = definedIn.length > 0
+            ? `"${ref}" is defined in ${definedIn[0].filePath}:${definedIn[0].line}. ` +
+              `Add: ${this.snippets.buildImportStatement(definedIn[0], node.filePath, node.language)}`
+            : `"${ref}" is not defined anywhere in the codebase — check spelling or add the definition`;
+
+          diagnoses.push({
+            severity:  'error',
+            type:      'undefined_ref',
+            message:   `"${node.name}" uses "${ref}" which is not imported or declared`,
+            filePath:  node.filePath,
+            line:      node.line,
+            symbol:    ref,
+            suggestion,
+          });
+        }
+      }
+
+      // Duplicate symbol warning — check if something with this name exists
+      // in multiple files (common copy-paste problem)
+      const taskL = task.toLowerCase();
+      if (taskL.includes(node.name.toLowerCase()) && node.type !== 'file') {
+        const duplicates = this.db.searchNodes(node.name, 5)
+          .filter(n => n.name === node.name && n.id !== node.id && n.type === node.type);
+
+        if (duplicates.length > 0) {
+          const locations = duplicates
+            .map(d => `${d.filePath.split('/').slice(-2).join('/')}:${d.line}`)
+            .join(', ');
+
+          diagnoses.push({
+            severity:   'warning',
+            type:       'duplicate_symbol',
+            message:    `"${node.name}" (${node.type}) exists in ${duplicates.length + 1} places: ${locations}`,
+            filePath:   node.filePath,
+            line:       node.line,
+            symbol:     node.name,
+            suggestion: `Use the existing one at ${node.filePath}:${node.line} — do not create another`,
+          });
+        }
+      }
+    }
+
+    return diagnoses;
   }
 
-  private serializeNode(node: GraphNode): string {
-    // Compact representation — only include non-null fields
-    const compact: Record<string, unknown> = {
-      name: node.name,
-      type: node.type,
-      file: node.filePath,
-      line: node.line,
-    };
-    if (node.signature)   { compact['sig']      = node.signature; }
-    if (node.returnType)  { compact['returns']   = node.returnType; }
-    if (node.params?.length) { compact['params'] = node.params.map(p => `${p.name}:${p.type ?? '?'}`); }
-    if (node.modifiers?.length) { compact['mods'] = node.modifiers; }
-    if (node.docComment)  { compact['doc']       = node.docComment.slice(0, 100); }
-    return JSON.stringify(compact);
-  }
-
-  // ── System prompt injection ────────────────────────────────────────────────
-  // Returns the string to prepend to an agent's system prompt.
+  // ── IMPROVEMENT 1: System prompt injection with snippets + relations ──────
 
   buildSystemPromptInjection(context: AgentContext): string {
     const lines: string[] = [
       '## Codebase Context (CodeLens Graph)',
       `Generated: ${new Date(context.generatedAt).toISOString()}`,
-      `Token estimate: ${context.tokenEstimate}`,
+      `Token estimate: ~${context.tokenEstimate}`,
       '',
-      '### Relevant symbols in this codebase:',
     ];
+
+    // ── IMPROVEMENT 4: Category-based file map at the top ─────────────────
+    const keywords     = extractKeywords(context.taskDescription);
+    const categoryHint = this.classifier.buildCategoryHint(context.existingFiles, keywords);
+    if (categoryHint) {
+      lines.push('### File map (by category):');
+      lines.push(categoryHint);
+      lines.push('');
+    }
+
+    // ── IMPROVEMENT 1: Symbols with snippet + IMPROVEMENT 2: import path ──
+    lines.push('### Relevant symbols:');
+    lines.push('');
 
     for (const node of context.subgraph.nodes) {
       if (node.type === 'import' || node.type === 'file') { continue; }
-      lines.push(
-        `- [${node.type}] ${node.name} @ ${node.filePath}:${node.line}` +
-        (node.signature ? `  →  ${node.signature.slice(0, 120)}` : '')
-      );
-    }
 
-    if (context.subgraph.edges.length > 0) {
-      lines.push('', '### Relationships:');
-      for (const edge of context.subgraph.edges.slice(0, 30)) {
-        const from = edge.fromId.split('::')[1] ?? edge.fromId;
-        const to   = edge.toId.split('::')[1]   ?? edge.toId;
-        lines.push(`- ${from} --[${edge.type}]--> ${to}`);
+      const relPath = node.filePath.replace(/\\/g, '/').split('/').slice(-3).join('/');
+
+      // Header line: type, name, location
+      lines.push(`#### [${node.type}] \`${node.name}\``);
+      lines.push(`- **Location:** \`.../${relPath}:${node.line}\``);
+
+      // IMPROVEMENT 2: Import path — tell agent exactly how to import this
+      const importStmt = this.snippets.buildImportStatement(node, node.filePath, node.language);
+      lines.push(`- **Import as:** \`${importStmt}\``);
+
+      // Signature
+      if (node.signature) {
+        lines.push(`- **Signature:** \`${node.signature.slice(0, 150)}\``);
       }
+
+      // Return type + params
+      if (node.returnType) { lines.push(`- **Returns:** \`${node.returnType}\``); }
+      if (node.params?.length) {
+        lines.push(`- **Params:** ${node.params.map(p => `\`${p.name}: ${p.type ?? '?'}\``).join(', ')}`);
+      }
+
+      // IMPROVEMENT 1: Callers and callees in one shot ("used by / depends on")
+      const callerEdges = context.subgraph.edges.filter(e => e.toId === node.id   && e.type === 'calls');
+      const calleeEdges = context.subgraph.edges.filter(e => e.fromId === node.id && e.type === 'calls');
+
+      if (callerEdges.length > 0) {
+        const callers = callerEdges
+          .map(e => context.subgraph.nodes.find(n => n.id === e.fromId)?.name)
+          .filter(Boolean).join(', ');
+        lines.push(`- **Used by:** ${callers}`);
+      }
+      if (calleeEdges.length > 0) {
+        const callees = calleeEdges
+          .map(e => context.subgraph.nodes.find(n => n.id === e.toId)?.name)
+          .filter(Boolean).join(', ');
+        lines.push(`- **Calls:** ${callees}`);
+      }
+
+      // Undefined refs warning inline on the symbol
+      if (node.undefinedRefs?.length) {
+        lines.push(`- **⚠️ Undefined refs:** \`${node.undefinedRefs.join('`, `')}\``);
+      }
+
+      // IMPROVEMENT 1: Actual code snippet — eliminates the file read
+      const snippet = this.snippets.extractSnippet(node);
+      if (snippet) {
+        lines.push('- **Snippet:**');
+        lines.push('```' + node.language);
+        lines.push(snippet);
+        lines.push('```');
+      }
+
+      lines.push('');
     }
 
+    // ── IMPROVEMENT 3: Warnings with full context ─────────────────────────
     if (context.warnings.length > 0) {
-      lines.push('', '### ⚠️ Warnings — existing symbols (do not recreate):');
+      lines.push('### ⚠️ Existing symbols — do not recreate:');
+      lines.push('');
       for (const w of context.warnings) { lines.push(`- ${w}`); }
+      lines.push('');
     }
 
-    lines.push('', '### All files in workspace:');
-    for (const f of context.existingFiles.slice(0, 50)) { lines.push(`- ${f}`); }
-    if (context.existingFiles.length > 50) {
-      lines.push(`  ... and ${context.existingFiles.length - 50} more`);
+    // ── Diagnoses (errors the graph already found) ────────────────────────
+    const errors   = context.diagnoses.filter(d => d.severity === 'error');
+    const warnings = context.diagnoses.filter(d => d.severity === 'warning');
+
+    if (errors.length > 0) {
+      lines.push('### 🔴 Errors to fix:');
+      for (const d of errors) {
+        lines.push(`- **${d.message}**`);
+        if (d.suggestion) { lines.push(`  → Fix: ${d.suggestion}`); }
+      }
+      lines.push('');
+    }
+
+    if (warnings.length > 0) {
+      lines.push('### 🟡 Warnings:');
+      for (const d of warnings) {
+        lines.push(`- ${d.message}`);
+        if (d.suggestion) { lines.push(`  → ${d.suggestion}`); }
+      }
+      lines.push('');
+    }
+
+    // ── All files (compact, categorised) ─────────────────────────────────
+    lines.push('### All workspace files:');
+    const groups = this.classifier.groupFiles(context.existingFiles);
+    for (const [label, files] of groups) {
+      lines.push(`**${label}:** ${files.map(f => path.basename(f)).join(', ')}`);
     }
 
     return lines.join('\n');
+  }
+
+  // ── Compact node serializer (for token budget counting) ───────────────────
+
+  private serializeNodeCompact(node: GraphNode): string {
+    const compact: Record<string, unknown> = {
+      name: node.name, type: node.type, file: node.filePath, line: node.line,
+    };
+    if (node.signature)        { compact['sig']     = node.signature.slice(0, 100); }
+    if (node.returnType)       { compact['returns'] = node.returnType; }
+    if (node.params?.length)   { compact['params']  = node.params.map(p => `${p.name}:${p.type ?? '?'}`); }
+    if (node.undefinedRefs?.length) { compact['undefs'] = node.undefinedRefs; }
+    return JSON.stringify(compact);
+  }
+
+  // Keep for backward compat (used by extension.ts showContext command)
+  serialize(context: AgentContext): string {
+    return this.buildSystemPromptInjection(context);
   }
 }
