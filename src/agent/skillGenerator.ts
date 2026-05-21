@@ -1,289 +1,182 @@
-import * as fs from 'fs';
+import * as fs   from 'fs';
 import * as path from 'path';
-import { GraphDB } from '../graph/graphDB';
-import { GraphStats, GraphNode } from '../types';
-
-// ─── Target rule file locations per AI agent ──────────────────────────────────
-// Each agent reads instructions from a different file path.
-// We write ALL of them so whichever agent the user has, it just works.
-
-export interface RuleTarget {
-  name: string;           // human label
-  relPath: string;        // relative to workspace root
-  format: 'markdown' | 'plaintext';
-  commentPrefix?: string;
-}
-
-export const RULE_TARGETS: RuleTarget[] = [
-  // Cursor IDE  — reads .cursor/rules/*.mdc or .cursorrules
-  { name: 'Cursor Rules',       relPath: '.cursor/rules/codelens.mdc',             format: 'markdown' },
-  { name: 'Cursor (legacy)',    relPath: '.cursorrules',                             format: 'plaintext' },
-  // GitHub Copilot — reads .github/copilot-instructions.md
-  { name: 'GitHub Copilot',     relPath: '.github/copilot-instructions.md',         format: 'markdown' },
-  // Cline / Roo-Code — reads .clinerules or .roo/rules.md
-  { name: 'Cline',              relPath: '.clinerules',                              format: 'markdown' },
-  // VS Code Copilot Chat  — reads .vscode/*.instructions.md
-  { name: 'VS Code Copilot',    relPath: '.vscode/codelens.instructions.md',        format: 'markdown' },
-  // Aider — reads CONVENTIONS.md or .aider.conf.yml
-  { name: 'Aider',              relPath: 'CONVENTIONS.md',                          format: 'markdown' },
-];
+import { GraphDB }    from '../graph/graphDB';
+import { GraphStats } from '../types';
 
 // ─── SkillGenerator ───────────────────────────────────────────────────────────
+// Previously wrote rules files into the user's repo.
+// Now: writes only a single .codelens/mcp.json config file showing how to
+// connect the MCP server. No rules files, no repo pollution.
+//
+// The agent gets context through MCP tools natively — no skill file needed.
 
 export class SkillGenerator {
   constructor(private db: GraphDB) {}
 
-  // ── Main entry: write skill files to the workspace root ───────────────────
+  // ── Generate only the MCP config hint file ────────────────────────────────
+  // Written to .codelens/ (gitignored) — not scattered across the repo.
 
-  generateAll(workspaceRoot: string, stats: GraphStats): string[] {
+  generateAll(workspaceRoot: string, _stats: GraphStats): string[] {
     const written: string[] = [];
+    const codelensDir = path.join(workspaceRoot, '.codelens');
+    fs.mkdirSync(codelensDir, { recursive: true });
 
-    const content = this.buildSkillContent(workspaceRoot, stats);
+    // .codelens/README.md — tells developers how to connect the MCP server
+    const readmePath = path.join(codelensDir, 'README.md');
+    fs.writeFileSync(readmePath, this.buildReadme(workspaceRoot), 'utf-8');
+    written.push('.codelens/README.md');
 
-    for (const target of RULE_TARGETS) {
-      const fullPath = path.join(workspaceRoot, target.relPath);
-      try {
-        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    // .codelens/mcp.json — ready-to-paste MCP config for Claude Code / Cursor
+    const mcpConfigPath = path.join(codelensDir, 'mcp.json');
+    fs.writeFileSync(mcpConfigPath, this.buildMcpConfig(workspaceRoot), 'utf-8');
+    written.push('.codelens/mcp.json');
 
-        // If the file already exists and we wrote it before, overwrite.
-        // If it exists but was written by the user, merge (append our section).
-        const finalContent = this.mergeWithExisting(fullPath, content, target.format);
-        fs.writeFileSync(fullPath, finalContent, 'utf-8');
-        written.push(target.relPath);
-      } catch (err) {
-        console.warn(`[CodeLens] Could not write rule to ${fullPath}: ${err}`);
-      }
-    }
+    // Ensure .codelens/ is gitignored (db + context files stay local)
+    this.ensureGitignore(workspaceRoot);
 
     return written;
   }
 
-  // ── Remove CodeLens sections from all rule files (on uninstall) ───────────
+  // ── Remove all previously written rule files (cleanup) ───────────────────
 
   removeAll(workspaceRoot: string): void {
-    for (const target of RULE_TARGETS) {
-      const fullPath = path.join(workspaceRoot, target.relPath);
+    const legacyPaths = [
+      '.cursor/rules/codelens.mdc',
+      '.cursorrules',
+      '.github/copilot-instructions.md',
+      '.clinerules',
+      '.vscode/codelens.instructions.md',
+      'CONVENTIONS.md',
+    ];
+
+    for (const relPath of legacyPaths) {
+      const fullPath = path.join(workspaceRoot, relPath);
       if (!fs.existsSync(fullPath)) { continue; }
       try {
-        const existing = fs.readFileSync(fullPath, 'utf-8');
-        const cleaned  = this.removeManagedSection(existing);
-        if (cleaned.trim()) {
-          fs.writeFileSync(fullPath, cleaned, 'utf-8');
-        } else {
-          fs.unlinkSync(fullPath); // file was only our content, delete it
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        if (content.includes('CODELENS_MANAGED_START')) {
+          // Our content only — delete the file
+          const cleaned = this.removeManagedSection(content);
+          if (cleaned.trim()) {
+            fs.writeFileSync(fullPath, cleaned, 'utf-8');
+          } else {
+            fs.unlinkSync(fullPath);
+          }
         }
       } catch { /* ignore */ }
     }
   }
 
-  // ── Build the skill text ───────────────────────────────────────────────────
+  // ── MCP config JSON ───────────────────────────────────────────────────────
 
-  private buildSkillContent(workspaceRoot: string, stats: GraphStats): string {
-    const overview   = this.buildCodebaseOverview(workspaceRoot);
-    const timestamp  = new Date().toISOString();
-    const dbPath     = '[CodeLens Graph local SQLite DB]';
+  private buildMcpConfig(workspaceRoot: string): string {
+    // Find the compiled mcpEntry.js — works whether installed globally or locally
+    const entryPath = path.join(__dirname, '..', '..', 'out', 'mcp', 'mcpEntry.js');
 
-    return `
-## CodeLens Graph — AI Agent Protocol
-<!-- CODELENS_MANAGED_START -->
-> Auto-generated by CodeLens Graph extension. Do not edit this section manually.
-> Last updated: ${timestamp}
-> Graph: ${stats.totalNodes} symbols · ${stats.totalEdges} relationships · ${stats.fileCount} files
+    const config = {
+      _comment: 'CodeLens Graph MCP Server config — copy the relevant section to your agent config',
+      claude_code: {
+        _add_to: '~/.claude.json under mcpServers',
+        codelens: {
+          type:    'stdio',
+          command: 'node',
+          args:    [entryPath, workspaceRoot],
+        },
+      },
+      cursor: {
+        _add_to: '.cursor/mcp.json in your project',
+        codelens: {
+          command: 'node',
+          args:    [entryPath, workspaceRoot],
+        },
+      },
+      cline: {
+        _add_to: 'Cline MCP settings → Add Server',
+        command: 'node',
+        args:    [entryPath, workspaceRoot],
+      },
+    };
 
----
+    return JSON.stringify(config, null, 2);
+  }
 
-### 🔴 MANDATORY: Read before every task
+  // ── README for .codelens/ ─────────────────────────────────────────────────
 
-You are working in a codebase that is fully indexed by **CodeLens Graph**.
-The graph contains every file, class, function, method, variable, import, and
-call relationship in this project.
+  private buildReadme(workspaceRoot: string): string {
+    const entryPath = path.join(__dirname, '..', '..', 'out', 'mcp', 'mcpEntry.js')
+      .replace(/\\/g, '/');
 
-**You MUST follow this protocol on every task without exception:**
+    return `# CodeLens Graph
 
----
+This directory contains the CodeLens Graph index for this project.
 
-### Protocol — Step 1: ORIENT (before writing any code)
+## Files
+- \`codelens-graph.db\` — SQLite graph database (all symbols + relationships)
+- \`mcp.json\` — MCP server connection config (copy to your agent)
+- \`agent-context.md\` — Last generated agent context (written on demand)
 
-Before touching any file, run this VS Code command to get the relevant subgraph
-for your current task:
+## Connecting your AI agent
 
-\`\`\`
-vscode-command: codelens-graph.getContextForTask
-\`\`\`
-
-Or use the MCP tool if available:
+### Claude Code
+Add to \`~/.claude.json\`:
 \`\`\`json
-{ "tool": "codelens_get_context", "task": "<describe what you are about to do>" }
+{
+  "mcpServers": {
+    "codelens": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${entryPath}", "${workspaceRoot.replace(/\\/g, '/')}"]
+    }
+  }
+}
 \`\`\`
 
-The graph will return:
-- Every existing symbol relevant to your task (file + line number)
-- Call relationships between them
-- ⚠️ Warnings about symbols that already exist (DO NOT recreate these)
-- The exact files you should read — nothing more
-
-**Read ONLY the files and lines the graph tells you to. Do not read entire files.**
-
----
-
-### Protocol — Step 2: VERIFY before creating anything
-
-Before creating any new file or function, check:
-1. Search the graph: \`codelens-graph.searchSymbol "<name>"\`
-2. If it exists → modify it, do not duplicate it
-3. If it does not exist → create it, then proceed to Step 3
-
-**Never create a file without checking the graph first.**
-
----
-
-### Protocol — Step 3: UPDATE after every change
-
-After completing your changes, trigger a graph update:
-
-\`\`\`
-vscode-command: codelens-graph.updateAfterAgentRun
+### Cursor
+Add to \`.cursor/mcp.json\` in your project:
+\`\`\`json
+{
+  "mcpServers": {
+    "codelens": {
+      "command": "node",
+      "args": ["${entryPath}", "${workspaceRoot.replace(/\\/g, '/')}"]
+    }
+  }
+}
 \`\`\`
 
-This re-indexes the files you changed so the next agent run has accurate context.
-Do not skip this step — a stale graph causes the next agent to hallucinate.
+## Available MCP tools
+| Tool | Purpose |
+|------|---------|
+| \`codelens_search\` | Find any symbol by name |
+| \`codelens_context\` | Get compressed context for a task |
+| \`codelens_callers\` | Find what calls a function |
+| \`codelens_callees\` | Find what a function calls |
+| \`codelens_impact\` | Full impact radius before refactoring |
+| \`codelens_node\` | Full details + snippet for one symbol |
+| \`codelens_files\` | File structure by category |
+| \`codelens_status\` | Graph health + statistics |
 
----
-
-### Codebase overview (as of ${timestamp})
-
-${overview}
-
----
-
-### Token efficiency rules
-
-- Get context from the graph first — do not read whole files to understand the codebase
-- The graph gives you file + line numbers; jump directly to those lines
-- If you need to understand a function, read that function's lines only
-- Do not re-read files you have already read in this session
-- The graph context replaces exploratory file reading entirely
-
----
-
-### Error prevention rules (learned from this codebase)
-
-- Always check \`undefinedRefs\` in graph nodes — these are symbols used inside
-  a function that are NOT imported or declared. Fix these before running.
-- Check \`instantiates\` field — if a function does \`new X()\`, verify X is imported.
-- If you see a warning "X already exists at file:line", do not create X again.
-- Prefer modifying existing files over creating new ones.
-
-<!-- CODELENS_MANAGED_END -->
-`.trim();
+The graph updates automatically on every file save.
+No rules files. No repo pollution. The agent calls these tools natively.
+`;
   }
 
-  // ── Codebase overview — compact structural summary ─────────────────────────
-  // This is the "one-time read" that replaces the agent exploring the repo.
-  // It fits in ~400-600 tokens regardless of project size.
-
-  private buildCodebaseOverview(workspaceRoot: string): string {
-    const stats  = this.db.getStats();
-    const lines: string[] = [];
-
-    // File tree grouped by directory (top-level dirs only)
-    const allFiles = this.db.getAllFiles();
-    const dirMap   = new Map<string, string[]>();
-
-    for (const fp of allFiles) {
-      const rel = path.relative(workspaceRoot, fp).replace(/\\/g, '/');
-      const dir = rel.includes('/') ? rel.split('/')[0] : '(root)';
-      if (!dirMap.has(dir)) { dirMap.set(dir, []); }
-      dirMap.get(dir)!.push(path.basename(fp));
-    }
-
-    lines.push('**Project structure:**');
-    for (const [dir, files] of [...dirMap.entries()].sort()) {
-      lines.push(`- \`${dir}/\` — ${files.length} files (${files.slice(0, 4).join(', ')}${files.length > 4 ? '…' : ''})`);
-    }
-
-    // Top exported functions/classes — the public API of the codebase
-    lines.push('');
-    lines.push('**Key exported symbols:**');
-
-    const exportedFunctions = this.db.getNodesByType('function')
-      .filter(n => n.modifiers?.includes('export') || n.modifiers?.includes('default'))
-      .slice(0, 15);
-
-    const exportedClasses = this.db.getNodesByType('class')
-      .filter(n => n.modifiers?.includes('export') || n.modifiers?.includes('default'))
-      .slice(0, 10);
-
-    for (const n of [...exportedClasses, ...exportedFunctions]) {
-      const rel = path.relative(workspaceRoot, n.filePath).replace(/\\/g, '/');
-      lines.push(`- \`${n.name}\` (${n.type}) @ \`${rel}:${n.line}\``
-        + (n.signature ? `  — ${n.signature.slice(0, 80)}` : ''));
-    }
-
-    // Symbols with undefined references — pre-diagnosed issues
-    lines.push('');
-    lines.push('**⚠️ Pre-diagnosed issues (undefined references detected):**');
-    let issueCount = 0;
-
-    const allFunctions = [
-      ...this.db.getNodesByType('function'),
-      ...this.db.getNodesByType('method'),
-    ];
-
-    for (const fn of allFunctions) {
-      if (fn.undefinedRefs && fn.undefinedRefs.length > 0) {
-        const rel = path.relative(workspaceRoot, fn.filePath).replace(/\\/g, '/');
-        lines.push(`- \`${fn.name}\` @ \`${rel}:${fn.line}\` uses undefined: \`${fn.undefinedRefs.join('`, `')}\``);
-        issueCount++;
-        if (issueCount >= 10) {
-          lines.push(`  _(and ${allFunctions.filter(f => f.undefinedRefs?.length).length - 10} more — query graph for full list)_`);
-          break;
-        }
+  private ensureGitignore(workspaceRoot: string): void {
+    const gitignorePath = path.join(workspaceRoot, '.gitignore');
+    const entry = '\n# CodeLens Graph (local index)\n.codelens/\n';
+    try {
+      const existing = fs.existsSync(gitignorePath)
+        ? fs.readFileSync(gitignorePath, 'utf-8') : '';
+      if (!existing.includes('.codelens/')) {
+        fs.appendFileSync(gitignorePath, entry, 'utf-8');
       }
-    }
-
-    if (issueCount === 0) {
-      lines.push('- None detected ✓');
-    }
-
-    lines.push('');
-    lines.push(`**Graph stats:** ${stats.totalNodes} symbols · ${stats.totalEdges} edges · ${stats.fileCount} files`);
-
-    return lines.join('\n');
-  }
-
-  // ── Merge with existing file content ──────────────────────────────────────
-  // If the file already has user content outside our managed section, keep it.
-
-  private mergeWithExisting(filePath: string, newContent: string, format: 'markdown' | 'plaintext'): string {
-    if (!fs.existsSync(filePath)) {
-      return newContent + '\n';
-    }
-
-    const existing = fs.readFileSync(filePath, 'utf-8');
-
-    // If our managed block is already there, replace it
-    if (existing.includes('<!-- CODELENS_MANAGED_START -->')) {
-      return this.removeManagedSection(existing) + '\n' + newContent + '\n';
-    }
-
-    // Otherwise append to whatever the user already has
-    const separator = format === 'markdown' ? '\n\n---\n\n' : '\n\n';
-    return existing.trimEnd() + separator + newContent + '\n';
+    } catch { /* ignore */ }
   }
 
   private removeManagedSection(content: string): string {
-    const startMarker = '<!-- CODELENS_MANAGED_START -->';
-    const endMarker   = '<!-- CODELENS_MANAGED_END -->';
-
-    const startIdx = content.indexOf(startMarker);
-    const endIdx   = content.indexOf(endMarker);
-
-    if (startIdx === -1 || endIdx === -1) { return content; }
-
-    const before = content.slice(0, startIdx).trimEnd();
-    const after  = content.slice(endIdx + endMarker.length).trimStart();
-
-    return (before + '\n' + after).trim();
+    const start = content.indexOf('<!-- CODELENS_MANAGED_START -->');
+    const end   = content.indexOf('<!-- CODELENS_MANAGED_END -->');
+    if (start === -1 || end === -1) { return content; }
+    return (content.slice(0, start).trimEnd() + '\n' + content.slice(end + '<!-- CODELENS_MANAGED_END -->'.length).trimStart()).trim();
   }
 }

@@ -1,52 +1,44 @@
-import * as fs from 'fs';
+import * as fs   from 'fs';
 import * as path from 'path';
 import { ASTParser } from './astParser';
-import { GraphDB } from '../graph/graphDB';
+import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
 
-export interface ScanResult {
-  filesScanned: number;
-  filesSkipped: number;
-  nodesAdded: number;
-  edgesAdded: number;
-  errors: string[];
-  durationMs: number;
-}
-
 export interface ScanOptions {
-  excludePatterns: string[];
+  excludePatterns:     string[];
   supportedExtensions: string[];
-  onProgress?: (current: number, total: number, filePath: string) => void;
+  onProgress?:         (current: number, total: number, filePath: string) => void;
 }
 
-// ─── WorkspaceScanner ──────────────────────────────────────────────────────────
+export interface ScanResult {
+  filesScanned:  number;
+  filesSkipped:  number;
+  nodesAdded:    number;
+  edgesAdded:    number;
+  errors:        string[];
+  durationMs:    number;
+}
 
 export class WorkspaceScanner {
-  constructor(
-    private parser: ASTParser,
-    private db: GraphDB
-  ) {}
-
-  // ── Full workspace scan ────────────────────────────────────────────────────
-  // Walks every file in the workspace, parses it, writes to DB.
+  constructor(private parser: ASTParser, private db: GraphDB) {}
 
   async scanWorkspace(rootPaths: string[], options: ScanOptions): Promise<ScanResult> {
-    const start = Date.now();
+    const start  = Date.now();
     const result: ScanResult = { filesScanned: 0, filesSkipped: 0, nodesAdded: 0, edgesAdded: 0, errors: [], durationMs: 0 };
 
-    // Collect all candidate files
+    // Ensure tree-sitter is initialised before scanning
+    await this.parser.ensureInit();
+
     const allFiles = this.collectFiles(rootPaths, options);
-    const total = allFiles.length;
+    const total    = allFiles.length;
 
     for (let i = 0; i < allFiles.length; i++) {
       const filePath = allFiles[i];
       options.onProgress?.(i + 1, total, filePath);
 
       try {
-        const parsed = this.parser.parseFile(filePath);
-        if (parsed.parseErrors.length > 0) {
-          result.errors.push(...parsed.parseErrors);
-        }
+        const parsed = await this.parser.parseFileAsync(filePath);
+        if (parsed.parseErrors.length) { result.errors.push(...parsed.parseErrors); }
 
         if (parsed.nodes.length > 0) {
           this.db.upsertNodes(parsed.nodes);
@@ -68,84 +60,50 @@ export class WorkspaceScanner {
     return result;
   }
 
-  // ── Incremental update ─────────────────────────────────────────────────────
-  // Called when a single file changes. Re-parses just that file.
-
   async updateFile(filePath: string): Promise<ParsedFile> {
-    // Remove old data for this file
+    await this.parser.ensureInit();
     this.db.deleteNodesByFile(filePath);
-
-    // Re-parse
-    const parsed = this.parser.parseFile(filePath);
+    const parsed = await this.parser.parseFileAsync(filePath);
     if (parsed.nodes.length > 0) {
       this.db.upsertNodes(parsed.nodes);
       this.db.upsertEdges(parsed.edges);
     }
-
     this.db.persist();
     return parsed;
   }
 
-  // ── File collection ────────────────────────────────────────────────────────
-
   private collectFiles(rootPaths: string[], options: ScanOptions): string[] {
-    const files: string[] = [];
+    const files  = new Array<string>();
     const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
-
-    for (const rootPath of rootPaths) {
-      this.walkDir(rootPath, rootPath, extSet, options.excludePatterns, files);
+    for (const root of rootPaths) {
+      this.walkDir(root, root, extSet, options.excludePatterns, files);
     }
-
     return files;
   }
 
-  private walkDir(
-    dir: string,
-    root: string,
-    extensions: Set<string>,
-    excludePatterns: string[],
-    results: string[]
-  ): void {
+  private walkDir(dir: string, root: string, exts: Set<string>, excludes: string[], results: string[]): void {
     let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       const relPath  = path.relative(root, fullPath);
 
-      if (this.shouldExclude(relPath, entry.name, excludePatterns)) { continue; }
+      if (this.shouldExclude(relPath, entry.name, excludes)) { continue; }
 
       if (entry.isDirectory()) {
-        this.walkDir(fullPath, root, extensions, excludePatterns, results);
-      } else if (entry.isFile()) {
-        const ext = path.extname(entry.name).toLowerCase();
-        if (extensions.has(ext)) {
-          results.push(fullPath);
-        }
+        this.walkDir(fullPath, root, exts, excludes, results);
+      } else if (entry.isFile() && exts.has(path.extname(entry.name).toLowerCase())) {
+        results.push(fullPath);
       }
     }
   }
 
   private shouldExclude(relPath: string, name: string, patterns: string[]): boolean {
-    // Simple glob-like matching for the most common patterns
     for (const pattern of patterns) {
-      const clean = pattern.replace(/\*\*/g, '').replace(/\*/g, '').replace(/\//g, '');
-
-      if (pattern.includes('**')) {
-        // Match any segment
-        const segment = pattern.replace(/\*\*\//g, '').replace(/\/\*\*/g, '').replace(/\*/g, '');
-        if (relPath.includes(segment) || name === segment) { return true; }
-      } else if (pattern.startsWith('*')) {
-        // Extension match
-        const ext = pattern.slice(1);
-        if (name.endsWith(ext)) { return true; }
-      } else {
-        if (name === clean || relPath === clean) { return true; }
-      }
+      const seg = pattern.replace(/\*\*\//g, '').replace(/\/\*\*/g, '').replace(/\*/g, '').replace(/\//g, '');
+      if (relPath.includes(seg) || name === seg) { return true; }
     }
     return false;
   }

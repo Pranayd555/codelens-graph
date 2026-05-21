@@ -72,16 +72,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   backgroundScanner.onSkills(written => {
-    // Silent — only notify first time so user knows what happened
-    const shownKey = 'codelens.skillsNotified';
+    // Notify first time with MCP config instructions
+    const shownKey = 'codelens.mcpNotified';
     if (!context.globalState.get(shownKey)) {
       context.globalState.update(shownKey, true);
       vscode.window.showInformationMessage(
-        `CodeLens Graph: AI agent rules written to ${written.length} locations ` +
-        `(.cursor/rules, .github/copilot-instructions.md, .clinerules…). ` +
-        `Your AI agent will now use the graph automatically.`,
-        'Show Graph'
-      ).then(choice => { if (choice === 'Show Graph') { showGraphPanel(context); } });
+        `CodeLens Graph ready: ${db.getStats().totalNodes} symbols indexed. ` +
+        `Connect your AI agent via MCP — see .codelens/README.md`,
+        'Copy MCP Config', 'Show Graph'
+      ).then(choice => {
+        if (choice === 'Copy MCP Config') {
+          vscode.commands.executeCommand('codelens-graph.copyMcpConfig');
+        } else if (choice === 'Show Graph') {
+          showGraphPanel(context);
+        }
+      });
     }
   });
 
@@ -161,6 +166,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
 
       vscode.window.setStatusBarMessage('$(check) CodeLens: graph updated after agent run', 3000);
+    }),
+
+    // Copy MCP config to clipboard
+    vscode.commands.registerCommand('codelens-graph.copyMcpConfig', () => {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { return; }
+      const mcpConfigPath = require('path').join(workspaceRoot, '.codelens', 'mcp.json');
+      const fs = require('fs');
+      if (!fs.existsSync(mcpConfigPath)) {
+        vscode.window.showWarningMessage('MCP config not found — run Build Graph first.');
+        return;
+      }
+      const config = fs.readFileSync(mcpConfigPath, 'utf-8');
+      vscode.env.clipboard.writeText(config);
+      vscode.window.showInformationMessage('MCP config copied! Paste into ~/.claude.json or .cursor/mcp.json');
     }),
 
     // Regenerate just the skill files (no rescan)

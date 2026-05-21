@@ -1,496 +1,555 @@
-import * as fs from 'fs';
+import * as fs   from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { GraphNode, GraphEdge, ParsedFile, Param, NodeType } from '../types';
 
-interface LangConfig {
-  language: string;
-  wasmFile: string;
-}
+// ─── Language → WASM mapping ──────────────────────────────────────────────────
 
-const EXTENSION_MAP: Record<string, LangConfig> = {
-  '.ts':   { language: 'typescript', wasmFile: 'tree-sitter-typescript.wasm' },
-  '.tsx':  { language: 'typescript', wasmFile: 'tree-sitter-typescript.wasm' },
-  '.js':   { language: 'javascript', wasmFile: 'tree-sitter-javascript.wasm' },
-  '.jsx':  { language: 'javascript', wasmFile: 'tree-sitter-javascript.wasm' },
-  '.py':   { language: 'python',     wasmFile: 'tree-sitter-python.wasm'     },
-  '.go':   { language: 'go',         wasmFile: 'tree-sitter-go.wasm'         },
-  '.rs':   { language: 'rust',       wasmFile: 'tree-sitter-rust.wasm'       },
-  '.java': { language: 'java',       wasmFile: 'tree-sitter-java.wasm'       },
-  '.cs':   { language: 'c_sharp',    wasmFile: 'tree-sitter-c_sharp.wasm'    },
-  '.cpp':  { language: 'cpp',        wasmFile: 'tree-sitter-cpp.wasm'        },
-  '.c':    { language: 'c',          wasmFile: 'tree-sitter-c.wasm'          },
-  '.rb':   { language: 'ruby',       wasmFile: 'tree-sitter-ruby.wasm'       },
-  '.php':  { language: 'php',        wasmFile: 'tree-sitter-php.wasm'        },
+const EXTENSION_MAP: Record<string, { language: string; wasm: string }> = {
+  '.ts':   { language: 'typescript', wasm: 'tree-sitter-typescript.wasm' },
+  '.tsx':  { language: 'tsx',        wasm: 'tree-sitter-tsx.wasm'        },
+  '.js':   { language: 'javascript', wasm: 'tree-sitter-javascript.wasm' },
+  '.jsx':  { language: 'javascript', wasm: 'tree-sitter-javascript.wasm' },
+  '.mjs':  { language: 'javascript', wasm: 'tree-sitter-javascript.wasm' },
+  '.py':   { language: 'python',     wasm: 'tree-sitter-python.wasm'     },
+  '.go':   { language: 'go',         wasm: 'tree-sitter-go.wasm'         },
+  '.rs':   { language: 'rust',       wasm: 'tree-sitter-rust.wasm'       },
+  '.java': { language: 'java',       wasm: 'tree-sitter-java.wasm'       },
+  '.cs':   { language: 'c_sharp',    wasm: 'tree-sitter-c_sharp.wasm'    },
+  '.cpp':  { language: 'cpp',        wasm: 'tree-sitter-cpp.wasm'        },
+  '.cc':   { language: 'cpp',        wasm: 'tree-sitter-cpp.wasm'        },
+  '.c':    { language: 'c',          wasm: 'tree-sitter-c.wasm'          },
+  '.h':    { language: 'c',          wasm: 'tree-sitter-c.wasm'          },
+  '.rb':   { language: 'ruby',       wasm: 'tree-sitter-ruby.wasm'       },
+  '.php':  { language: 'php',        wasm: 'tree-sitter-php.wasm'        },
+  '.swift':{ language: 'swift',      wasm: 'tree-sitter-swift.wasm'      },
+  '.kt':   { language: 'kotlin',     wasm: 'tree-sitter-kotlin.wasm'     },
 };
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 export function makeNodeId(filePath: string, name: string, line: number): string {
   return `${filePath}::${name}::${line}`;
 }
-
-export function makeEdgeId(fromId: string, type: string, toId: string): string {
-  return `${fromId}--${type}-->${toId}`;
+export function makeEdgeId(from: string, type: string, to: string): string {
+  return `${from}--${type}-->${to}`;
+}
+function contentHash(s: string): string {
+  return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12);
 }
 
-function contentHash(content: string): string {
-  return crypto.createHash('sha1').update(content).digest('hex').slice(0, 12);
+// ─── Tree-sitter node type queries per language ───────────────────────────────
+// Maps language → which AST node types map to which GraphNode types,
+// and which child fields contain the name, params, return type.
+
+interface LangQuery {
+  nodeTypes:    Record<string, NodeType>;   // treeSitterType → our NodeType
+  nameField:    string;                     // field that holds the identifier
+  paramsField?: string;
+  returnField?: string;
+  bodyField?:   string;
+  importTypes:  string[];                   // AST node types that are imports
+  callTypes:    string[];                   // AST node types that are function calls
+  callNamePath: string[];                   // how to get the name from a call node
 }
 
-// ─── Scope analyser ───────────────────────────────────────────────────────────
-// Given a function body, determines:
-//   1. Which identifiers are used but NEVER defined or imported in scope
-//   2. Which local variables are declared inside the function
-//   3. Which constructors are called via `new`
-//
-// This is what catches `genAI is not defined` style bugs.
+const LANG_QUERIES: Record<string, LangQuery> = {
+  typescript: {
+    nodeTypes: {
+      function_declaration:           'function',
+      function_expression:            'function',
+      arrow_function:                 'function',
+      method_definition:              'method',
+      class_declaration:              'class',
+      abstract_class_declaration:     'class',
+      interface_declaration:          'interface',
+      type_alias_declaration:         'type',
+      enum_declaration:               'enum',
+      lexical_declaration:            'variable',
+      variable_declaration:           'variable',
+    },
+    nameField:    'name',
+    paramsField:  'parameters',
+    returnField:  'return_type',
+    bodyField:    'body',
+    importTypes:  ['import_statement', 'import_require_clause'],
+    callTypes:    ['call_expression'],
+    callNamePath: ['function'],
+  },
+  javascript: {
+    nodeTypes: {
+      function_declaration:  'function',
+      function_expression:   'function',
+      arrow_function:        'function',
+      method_definition:     'method',
+      class_declaration:     'class',
+      lexical_declaration:   'variable',
+      variable_declaration:  'variable',
+    },
+    nameField:    'name',
+    paramsField:  'parameters',
+    bodyField:    'body',
+    importTypes:  ['import_statement', 'call_expression'],
+    callTypes:    ['call_expression'],
+    callNamePath: ['function'],
+  },
+  python: {
+    nodeTypes: {
+      function_definition:   'function',
+      async_function_def:    'function',
+      class_definition:      'class',
+      assignment:            'variable',
+      augmented_assignment:  'variable',
+    },
+    nameField:    'name',
+    paramsField:  'parameters',
+    returnField:  'return_type',
+    bodyField:    'body',
+    importTypes:  ['import_statement', 'import_from_statement'],
+    callTypes:    ['call'],
+    callNamePath: ['function'],
+  },
+  go: {
+    nodeTypes: {
+      function_declaration:  'function',
+      method_declaration:    'method',
+      type_declaration:      'class',
+      var_declaration:       'variable',
+      const_declaration:     'variable',
+    },
+    nameField:    'name',
+    paramsField:  'parameters',
+    returnField:  'result',
+    bodyField:    'body',
+    importTypes:  ['import_declaration'],
+    callTypes:    ['call_expression'],
+    callNamePath: ['function'],
+  },
+  rust: {
+    nodeTypes: {
+      function_item:  'function',
+      impl_item:      'class',
+      struct_item:    'class',
+      trait_item:     'interface',
+      enum_item:      'enum',
+      let_declaration:'variable',
+    },
+    nameField:    'name',
+    paramsField:  'parameters',
+    returnField:  'return_type',
+    bodyField:    'body',
+    importTypes:  ['use_declaration'],
+    callTypes:    ['call_expression'],
+    callNamePath: ['function'],
+  },
+  java: {
+    nodeTypes: {
+      method_declaration:        'method',
+      class_declaration:         'class',
+      interface_declaration:     'interface',
+      enum_declaration:          'enum',
+      field_declaration:         'variable',
+      constructor_declaration:   'method',
+    },
+    nameField:    'name',
+    paramsField:  'formal_parameters',
+    returnField:  'type',
+    bodyField:    'body',
+    importTypes:  ['import_declaration'],
+    callTypes:    ['method_invocation'],
+    callNamePath: ['name'],
+  },
+};
 
-function analyseScope(
-  body: string,
-  params: Param[],
-  fileImportedNames: string[],         // names imported at file level
-  fileModuleLevelVars: string[],        // const/let/var at module level
-  language: string
-): { undefinedRefs: string[]; localVars: string[]; instantiates: string[] } {
+// tsx shares with typescript
+LANG_QUERIES['tsx'] = LANG_QUERIES['typescript'];
+// c_sharp, cpp, c, ruby, php, swift, kotlin — fallback to regex for now
+// (they'll use the RegexFallback parser below)
 
-  const lines = body.split('\n');
+// ─── TreeSitterParser ─────────────────────────────────────────────────────────
 
-  // Collect local declarations inside this function
-  const localVars: string[] = [];
-  const localDeclarationPatterns: RegExp[] = [];
+export class TreeSitterParser {
+  // Lazily initialised — we only load WASM when we first need it
+  private Parser: typeof import('web-tree-sitter') | null = null;
+  private languages   = new Map<string, import('web-tree-sitter')>();
+  private wasmDir: string;
+  private initialised = false;
 
-  if (language === 'javascript' || language === 'typescript') {
-    localDeclarationPatterns.push(
-      /(?:const|let|var)\s+(\w+)\s*=/g,          // const x =
-      /(?:const|let|var)\s+\{([^}]+)\}/g,         // const { a, b } =
-      /(?:const|let|var)\s+\[([^\]]+)\]/g,         // const [a, b] =
-      /for\s*\(\s*(?:const|let|var)\s+(\w+)/g,    // for (const x
-      /catch\s*\(\s*(\w+)\s*\)/g,                  // catch (err)
-    );
-  } else if (language === 'python') {
-    localDeclarationPatterns.push(
-      /^\s+(\w+)\s*=/gm,                           // x = ... (indented)
-      /for\s+(\w+)\s+in/g,                         // for x in
-      /except\s+\w+\s+as\s+(\w+)/g,               // except Exception as e
-    );
+  constructor(wasmDir?: string) {
+    // Default: look next to this file's compiled output, or in node_modules
+    this.wasmDir = wasmDir
+      ?? path.join(__dirname, '..', '..', 'node_modules', 'tree-sitter-wasms', 'out');
   }
 
-  for (const pattern of localDeclarationPatterns) {
-    let m: RegExpExecArray | null;
-    // Reset lastIndex for global patterns
-    pattern.lastIndex = 0;
-    while ((m = pattern.exec(body)) !== null) {
-      // Handle destructuring: { a, b, c } → split by comma
-      const captured = m[1];
-      if (!captured) continue;
-      if (captured.includes(',')) {
-        captured.split(',').map(s => s.trim().replace(/\s*:.*/, '').replace(/\s*=.*/, ''))
-          .filter(s => /^\w+$/.test(s))
-          .forEach(v => localVars.push(v));
-      } else if (/^\w+$/.test(captured)) {
-        localVars.push(captured);
-      }
+  async init(): Promise<void> {
+    if (this.initialised) { return; }
+    try {
+      // Dynamic require so it doesn't crash when WASM isn't present
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const Parser = require('web-tree-sitter');
+      await Parser.init();
+      this.Parser = Parser;
+      this.initialised = true;
+    } catch (e) {
+      console.warn('[CodeLens] tree-sitter init failed, falling back to regex:', e);
     }
   }
 
-  // All names that are legitimately in scope for this function
-  const inScope = new Set<string>([
-    ...params.map(p => p.name),
-    ...localVars,
-    ...fileImportedNames,
-    ...fileModuleLevelVars,
-    // JS/TS builtins
-    'console','process','require','module','exports','__dirname','__filename',
-    'setTimeout','setInterval','clearTimeout','clearInterval','Promise','Error',
-    'JSON','Math','Object','Array','String','Number','Boolean','Date','RegExp',
-    'Map','Set','WeakMap','WeakSet','Symbol','Buffer','global','window','document',
-    'undefined','null','true','false','NaN','Infinity','this','super','arguments',
-    // Node builtins
-    'fs','path','http','https','url','crypto','os','events','stream','util',
-    // Common patterns
-    'async','await','typeof','instanceof','in','of','new','delete','void','throw',
-    'return','if','else','for','while','do','switch','case','break','continue',
-    'try','catch','finally','class','extends','import','export','const','let','var',
-    'function','=>', 'yield', 'from',
-  ]);
+  isReady(): boolean { return this.initialised && this.Parser !== null; }
 
-  // Find all identifiers used in a call/access pattern that are NOT in scope
-  // Patterns: identifier(  /  new Identifier  /  identifier.method  but NOT .identifier
-  const undefinedRefs: string[] = [];
-  const seen = new Set<string>();
+  private async getLanguage(langName: string): Promise<import('web-tree-sitter') | null> {
+    if (!this.Parser) { return null; }
+    if (this.languages.has(langName)) { return this.languages.get(langName)!; }
 
-  // new ClassName() — detect instantiations
-  const instantiates: string[] = [];
-  const newPattern = /\bnew\s+([A-Z]\w*)\s*\(/g;
-  let nm: RegExpExecArray | null;
-  while ((nm = newPattern.exec(body)) !== null) {
-    instantiates.push(nm[1]);
-  }
+    // Map our language names to WASM filenames
+    const wasmName = `tree-sitter-${langName}.wasm`;
+    const wasmPath = path.join(this.wasmDir, wasmName);
 
-  // identifier used as function call or standalone (not after a dot)
-  const usagePattern = /(?<![.\w])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:\(|\.)/g;
-  let um: RegExpExecArray | null;
-  while ((um = usagePattern.exec(body)) !== null) {
-    const name = um[1];
-    if (seen.has(name)) continue;
-    seen.add(name);
-    if (!inScope.has(name) && /^[a-zA-Z_$]/.test(name) && name.length > 1) {
-      undefinedRefs.push(name);
+    if (!fs.existsSync(wasmPath)) {
+      console.warn(`[CodeLens] WASM not found: ${wasmPath}`);
+      return null;
+    }
+
+    try {
+      const lang = await (this.Parser as any).Language.load(wasmPath);
+      this.languages.set(langName, lang);
+      return lang;
+    } catch (e) {
+      console.warn(`[CodeLens] Failed to load language ${langName}:`, e);
+      return null;
     }
   }
 
-  return {
-    undefinedRefs: [...new Set(undefinedRefs)],
-    localVars:     [...new Set(localVars)],
-    instantiates:  [...new Set(instantiates)],
-  };
-}
+  // ── Main parse ────────────────────────────────────────────────────────────
 
-// ─── Regex-based parser ────────────────────────────────────────────────────────
+  async parseFile(filePath: string, content: string, language: string): Promise<ParsedFile> {
+    if (!this.Parser) {
+      return { filePath, language, nodes: [], edges: [], parseErrors: ['tree-sitter not initialised'] };
+    }
 
-class RegexParser {
+    const lang = await this.getLanguage(language);
+    if (!lang) {
+      return { filePath, language, nodes: [], edges: [], parseErrors: [`No grammar for ${language}`] };
+    }
 
-  parse(filePath: string, content: string, language: string): ParsedFile {
-    const lines = content.split('\n');
-    const nodes: GraphNode[] = [];
-    const edges: GraphEdge[] = [];
-    const now = Date.now();
-    const hash = contentHash(content);
+    const parser = new (this.Parser as any)();
+    parser.setLanguage(lang);
+
+    let tree: any;
+    try {
+      tree = parser.parse(content);
+    } catch (e) {
+      return { filePath, language, nodes: [], edges: [], parseErrors: [`Parse failed: ${e}`] };
+    }
+
+    const query = LANG_QUERIES[language];
+    if (!query) {
+      return { filePath, language, nodes: [], edges: [], parseErrors: [`No query config for ${language}`] };
+    }
+
+    const lines   = content.split('\n');
+    const now     = Date.now();
+    const nodes:  GraphNode[] = [];
+    const edges:  GraphEdge[] = [];
 
     // File node
     const fileNode: GraphNode = {
-      id: makeNodeId(filePath, '__file__', 0),
-      type: 'file',
-      name: path.basename(filePath),
+      id:           makeNodeId(filePath, '__file__', 0),
+      type:         'file',
+      name:         path.basename(filePath),
       filePath,
-      line: 0,
-      endLine: lines.length,
+      line:         0,
+      endLine:      lines.length,
       language,
-      size: Buffer.byteLength(content),
+      size:         Buffer.byteLength(content),
       lastModified: fs.statSync(filePath).mtimeMs,
-      hash,
-      updatedAt: now,
+      hash:         contentHash(content),
+      updatedAt:    now,
     };
     nodes.push(fileNode);
 
-    // ── Step 1: extract imports first so scope analysis can use them ──────────
-    const importResult = this.extractImports(filePath, content, language, fileNode.id, now);
-    nodes.push(...importResult.nodes);
-    edges.push(...importResult.edges);
+    // ── Collect file-level imports for scope analysis ─────────────────────
+    const fileImportedNames: string[] = [];
+    const fileModuleLevelVars: string[] = [];
 
-    // Names available at file scope from imports
-    const fileImportedNames = importResult.importedNames;
-
-    // ── Step 2: extract module-level variable names ───────────────────────────
-    const fileModuleLevelVars = this.extractModuleLevelVars(content, language);
-
-    // ── Step 3: parse all symbols ─────────────────────────────────────────────
-    const patterns = this.getPatterns(language);
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const lineNo = i + 1;
-
-      for (const pattern of patterns) {
-        const match = pattern.regex.exec(line);
-        if (!match) { continue; }
-
-        const name = match[pattern.nameGroup];
-        if (!name || name.trim() === '') { continue; }
-
-        const docComment = this.extractDocComment(lines, i);
-        const modifiers   = this.extractModifiers(line, language);
-        const params       = pattern.hasParams
-          ? this.extractParams(match[pattern.paramsGroup ?? 0] ?? '')
-          : undefined;
-        const endLine = this.findEndLine(lines, i, language);
-
-        // ── FIX 1: scope analysis on every function/method body ──────────────
-        let undefinedRefs: string[] | undefined;
-        let localVars: string[] | undefined;
-        let instantiates: string[] | undefined;
-
-        if (pattern.nodeType === 'function' || pattern.nodeType === 'method') {
-          const bodyLines = lines.slice(i, endLine);
-          const body = bodyLines.join('\n');
-          const scope = analyseScope(
-            body,
-            params ?? [],
-            fileImportedNames,
-            fileModuleLevelVars,
-            language
-          );
-          if (scope.undefinedRefs.length > 0)  undefinedRefs = scope.undefinedRefs;
-          if (scope.localVars.length > 0)       localVars = scope.localVars;
-          if (scope.instantiates.length > 0)    instantiates = scope.instantiates;
-        }
-
-        const node: GraphNode = {
-          id: makeNodeId(filePath, name, lineNo),
-          type: pattern.nodeType,
-          name,
-          filePath,
-          line: lineNo,
-          endLine,
-          language,
-          signature:   line.trim().slice(0, 200),
-          returnType:  pattern.returnGroup ? match[pattern.returnGroup]?.trim() : undefined,
-          params,
-          modifiers,
-          docComment,
-          undefinedRefs,
-          localVars,
-          instantiates,
-          hash: contentHash(line),
+    this.walkTree(tree.rootNode, (node: any) => {
+      if (query.importTypes.includes(node.type)) {
+        const names = this.extractImportNames(node, language);
+        fileImportedNames.push(...names);
+        const line = node.startPosition.row + 1;
+        const importId = makeNodeId(filePath, `__import__${names.join(',')}`, line);
+        nodes.push({
+          id: importId, type: 'import',
+          name: this.getImportSource(node, content) ?? names.join(','),
+          filePath, line, endLine: node.endPosition.row + 1,
+          language, signature: content.slice(node.startIndex, node.endIndex).slice(0, 120),
           updatedAt: now,
-        };
-
-        nodes.push(node);
-
-        edges.push({
-          id: makeEdgeId(fileNode.id, 'contains', node.id),
-          fromId: fileNode.id,
-          toId: node.id,
-          type: 'contains',
         });
+        edges.push({
+          id: makeEdgeId(fileNode.id, 'imports', importId),
+          fromId: fileNode.id, toId: importId, type: 'imports',
+        });
+      }
+    });
 
-        // ── FIX 2: emit undefined_ref edges so graph can traverse them ────────
-        if (undefinedRefs) {
-          for (const ref of undefinedRefs) {
-            edges.push({
-              id: makeEdgeId(node.id, 'undefined_ref', `${filePath}::${ref}::0`),
-              fromId: node.id,
-              toId:   `${filePath}::${ref}::0`,   // placeholder — resolved at query time
-              type:   'undefined_ref',
-              metadata: { symbolName: ref },
-            });
-          }
-        }
+    // ── Walk all declaration nodes ─────────────────────────────────────────
+    this.walkTree(tree.rootNode, (tsNode: any) => {
+      const ourType = query.nodeTypes[tsNode.type];
+      if (!ourType) { return; }
 
-        // ── FIX 3: emit instantiates edges ────────────────────────────────────
-        if (instantiates) {
-          for (const cls of instantiates) {
-            edges.push({
-              id: makeEdgeId(node.id, 'instantiates', `__class__::${cls}`),
-              fromId: node.id,
-              toId:   `__class__::${cls}`,
-              type:   'instantiates',
-              metadata: { className: cls },
-            });
-          }
+      // Get name
+      const name = this.getNodeName(tsNode, query.nameField, content);
+      if (!name || name === '__file__') { return; }
+
+      const line    = tsNode.startPosition.row + 1;
+      const endLine = tsNode.endPosition.row + 1;
+
+      // Get params
+      const params = query.paramsField
+        ? this.extractParams(tsNode.childForFieldName?.(query.paramsField), content)
+        : undefined;
+
+      // Get return type
+      const returnType = query.returnField
+        ? tsNode.childForFieldName?.(query.returnField)?.text?.trim()
+        : undefined;
+
+      // Get modifiers (export, async, public, etc.)
+      const modifiers = this.extractModifiers(tsNode, content);
+
+      // Get docstring from preceding comment
+      const docComment = this.extractDocComment(tsNode, lines);
+
+      // Scope analysis on function/method bodies
+      let undefinedRefs: string[] | undefined;
+      let localVars:     string[] | undefined;
+      let instantiates:  string[] | undefined;
+
+      if (ourType === 'function' || ourType === 'method') {
+        const body = query.bodyField
+          ? tsNode.childForFieldName?.(query.bodyField)?.text ?? ''
+          : content.slice(tsNode.startIndex, tsNode.endIndex);
+
+        const scope = this.analyseScope(body, params ?? [], fileImportedNames, fileModuleLevelVars, language);
+        if (scope.undefinedRefs.length)  undefinedRefs = scope.undefinedRefs;
+        if (scope.localVars.length)      localVars     = scope.localVars;
+        if (scope.instantiates.length)   instantiates  = scope.instantiates;
+      }
+
+      // Track module-level vars for scope analysis
+      if (ourType === 'variable' && tsNode.startPosition.column === 0) {
+        fileModuleLevelVars.push(name);
+      }
+
+      const nodeId = makeNodeId(filePath, name, line);
+      const graphNode: GraphNode = {
+        id: nodeId, type: ourType, name, filePath,
+        line, endLine, language,
+        signature:   content.slice(tsNode.startIndex, tsNode.startIndex + 200).split('\n')[0].trim(),
+        returnType,
+        params,
+        modifiers,
+        docComment,
+        undefinedRefs,
+        localVars,
+        instantiates,
+        hash:      contentHash(content.slice(tsNode.startIndex, tsNode.endIndex)),
+        updatedAt: now,
+      };
+
+      nodes.push(graphNode);
+      edges.push({
+        id: makeEdgeId(fileNode.id, 'contains', nodeId),
+        fromId: fileNode.id, toId: nodeId, type: 'contains',
+      });
+
+      // Emit undefined_ref edges
+      if (undefinedRefs) {
+        for (const ref of undefinedRefs) {
+          edges.push({
+            id: makeEdgeId(nodeId, 'undefined_ref', `${filePath}::${ref}::0`),
+            fromId: nodeId,
+            toId:   `${filePath}::${ref}::0`,
+            type:   'undefined_ref',
+            metadata: { symbolName: ref },
+          });
         }
       }
-    }
 
-    // ── Step 4: call relationships ─────────────────────────────────────────────
-    const callEdges = this.extractCalls(nodes, content);
-    edges.push(...callEdges);
+      // Emit instantiates edges
+      if (instantiates) {
+        for (const cls of instantiates) {
+          edges.push({
+            id: makeEdgeId(nodeId, 'instantiates', `__class__::${cls}`),
+            fromId: nodeId, toId: `__class__::${cls}`,
+            type: 'instantiates', metadata: { className: cls },
+          });
+        }
+      }
+    });
+
+    // ── Call edges: walk call_expression nodes ────────────────────────────
+    const symbolMap = new Map(nodes.filter(n => n.type !== 'file' && n.type !== 'import').map(n => [n.name, n]));
+
+    this.walkTree(tree.rootNode, (tsNode: any) => {
+      if (!query.callTypes.includes(tsNode.type)) { return; }
+
+      const calleeName = this.getCallName(tsNode, query.callNamePath, content);
+      if (!calleeName) { return; }
+
+      const callee = symbolMap.get(calleeName);
+      if (!callee) { return; }
+
+      // Find the enclosing function
+      const enclosing = this.findEnclosingFunction(tsNode, nodes);
+      if (!enclosing || enclosing.id === callee.id) { return; }
+
+      const edgeId = makeEdgeId(enclosing.id, 'calls', callee.id);
+      if (!edges.find(e => e.id === edgeId)) {
+        edges.push({ id: edgeId, fromId: enclosing.id, toId: callee.id, type: 'calls' });
+      }
+    });
 
     return { filePath, language, nodes, edges, parseErrors: [] };
   }
 
-  // ── Module-level var names ─────────────────────────────────────────────────
+  // ── Tree walking ──────────────────────────────────────────────────────────
 
-  private extractModuleLevelVars(content: string, language: string): string[] {
+  private walkTree(node: any, visit: (n: any) => void): void {
+    visit(node);
+    for (let i = 0; i < node.childCount; i++) {
+      this.walkTree(node.child(i), visit);
+    }
+  }
+
+  // ── Name extraction ───────────────────────────────────────────────────────
+
+  private getNodeName(node: any, field: string, _content: string): string | null {
+    // Try field name first
+    const named = node.childForFieldName?.(field);
+    if (named) { return named.text.trim(); }
+
+    // For variable declarations: look for first identifier
+    if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child.type === 'variable_declarator') {
+          const id = child.childForFieldName?.('name');
+          if (id) { return id.text.trim(); }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private getCallName(node: any, pathFields: string[], _content: string): string | null {
+    let current = node;
+    for (const field of pathFields) {
+      current = current.childForFieldName?.(field);
+      if (!current) { return null; }
+    }
+    // Handle member expressions: obj.method → extract "method"
+    if (current.type === 'member_expression') {
+      return current.childForFieldName?.('property')?.text?.trim() ?? null;
+    }
+    if (current.type === 'identifier') { return current.text.trim(); }
+    return null;
+  }
+
+  private findEnclosingFunction(node: any, nodes: GraphNode[]): GraphNode | null {
+    const line = node.startPosition.row + 1;
+    // Find the innermost function/method that contains this line
+    return nodes
+      .filter(n => (n.type === 'function' || n.type === 'method') && n.line <= line && n.endLine >= line)
+      .sort((a, b) => b.line - a.line)[0] ?? null;
+  }
+
+  // ── Import name extraction ────────────────────────────────────────────────
+
+  private extractImportNames(node: any, language: string): string[] {
     const names: string[] = [];
-    const lines = content.split('\n');
+    if (language === 'typescript' || language === 'javascript' || language === 'tsx') {
+      // import { A, B } from 'x'  or  import X from 'x'
+      this.walkTree(node, (n: any) => {
+        if (n.type === 'identifier' || n.type === 'import_specifier') {
+          const text = n.text.trim();
+          if (text && /^\w+$/.test(text)) { names.push(text); }
+        }
+      });
+    } else if (language === 'python') {
+      this.walkTree(node, (n: any) => {
+        if (n.type === 'dotted_name' || n.type === 'aliased_import') {
+          names.push(n.text.split(' as ').pop()?.trim() ?? n.text.trim());
+        }
+      });
+    }
+    return [...new Set(names)].filter(n => n.length > 1);
+  }
 
-    for (const line of lines) {
-      if (language === 'javascript' || language === 'typescript') {
-        // Only non-indented declarations = module level
-        const m = /^(?:export\s+)?(?:const|let|var)\s+(\w+)/.exec(line);
-        if (m) names.push(m[1]);
-        // Also grab require() assignments: const X = require(...)
-        const r = /^(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require/.exec(line);
-        if (r) {
-          r[1].split(',').map(s => s.trim().split(':')[0].trim())
-            .filter(s => /^\w+$/.test(s))
-            .forEach(n => names.push(n));
-        }
-        // function declarations at top level
-        const f = /^(?:async\s+)?function\s+(\w+)/.exec(line);
-        if (f) names.push(f[1]);
-        // class declarations
-        const c = /^(?:export\s+)?class\s+(\w+)/.exec(line);
-        if (c) names.push(c[1]);
-      } else if (language === 'python') {
-        const m = /^(\w+)\s*=/.exec(line);
-        if (m && !['if','while','for','return','raise','import','from','class','def'].includes(m[1])) {
-          names.push(m[1]);
-        }
+  private getImportSource(node: any, _content: string): string | null {
+    // Look for string literal child (the module path)
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child.type === 'string' || child.type === 'string_literal') {
+        return child.text.replace(/['"]/g, '').trim();
       }
     }
-    return [...new Set(names)];
+    return null;
   }
 
-  // ── Pattern definitions ────────────────────────────────────────────────────
+  // ── Params extraction ─────────────────────────────────────────────────────
 
-  private getPatterns(language: string): Array<{
-    regex: RegExp;
-    nodeType: NodeType;
-    nameGroup: number;
-    hasParams: boolean;
-    paramsGroup?: number;
-    returnGroup?: number;
-  }> {
-    switch (language) {
-      case 'typescript':
-      case 'javascript':
-        return [
-          { regex: /(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/, nodeType: 'class', nameGroup: 1, hasParams: false },
-          { regex: /(?:export\s+)?interface\s+(\w+)/, nodeType: 'interface', nameGroup: 1, hasParams: false },
-          { regex: /(?:export\s+)?type\s+(\w+)\s*=/, nodeType: 'type', nameGroup: 1, hasParams: false },
-          { regex: /(?:export\s+)?enum\s+(\w+)/, nodeType: 'enum', nameGroup: 1, hasParams: false },
-          { regex: /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*(?::\s*([\w<>[\]|&\s]+))?/, nodeType: 'function', nameGroup: 1, hasParams: true, paramsGroup: 2, returnGroup: 3 },
-          { regex: /(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*(?::\s*([\w<>[\]|&\s]+))?\s*=>/, nodeType: 'function', nameGroup: 1, hasParams: true, paramsGroup: 2, returnGroup: 3 },
-          { regex: /(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?function/, nodeType: 'function', nameGroup: 1, hasParams: false },
-          { regex: /^\s+(?:public\s+|private\s+|protected\s+|static\s+|async\s+|override\s+)*(\w+)\s*\(([^)]*)\)\s*(?::\s*([\w<>[\]|&\s]+))?/, nodeType: 'method', nameGroup: 1, hasParams: true, paramsGroup: 2, returnGroup: 3 },
-          { regex: /^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::\s*([\w<>[\]|&\s]+))?\s*=/, nodeType: 'variable', nameGroup: 1, hasParams: false },
-        ];
+  private extractParams(paramsNode: any, _content: string): Param[] | undefined {
+    if (!paramsNode) { return undefined; }
+    const params: Param[] = [];
 
-      case 'python':
-        return [
-          { regex: /^class\s+(\w+)/, nodeType: 'class', nameGroup: 1, hasParams: false },
-          { regex: /^def\s+(\w+)\s*\(([^)]*)\)/, nodeType: 'function', nameGroup: 1, hasParams: true, paramsGroup: 2 },
-          { regex: /^\s+def\s+(\w+)\s*\(([^)]*)\)/, nodeType: 'method', nameGroup: 1, hasParams: true, paramsGroup: 2 },
-          { regex: /^(\w+)\s*=\s*/, nodeType: 'variable', nameGroup: 1, hasParams: false },
-        ];
-
-      case 'go':
-        return [
-          { regex: /^type\s+(\w+)\s+struct/, nodeType: 'class', nameGroup: 1, hasParams: false },
-          { regex: /^type\s+(\w+)\s+interface/, nodeType: 'interface', nameGroup: 1, hasParams: false },
-          { regex: /^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(([^)]*)\)/, nodeType: 'function', nameGroup: 1, hasParams: true, paramsGroup: 2 },
-        ];
-
-      case 'rust':
-        return [
-          { regex: /^(?:pub\s+)?struct\s+(\w+)/,  nodeType: 'class',     nameGroup: 1, hasParams: false },
-          { regex: /^(?:pub\s+)?trait\s+(\w+)/,   nodeType: 'interface', nameGroup: 1, hasParams: false },
-          { regex: /^(?:pub\s+)?enum\s+(\w+)/,    nodeType: 'enum',      nameGroup: 1, hasParams: false },
-          { regex: /^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)/, nodeType: 'function', nameGroup: 1, hasParams: true, paramsGroup: 2 },
-        ];
-
-      default:
-        return [
-          { regex: /(?:function|func|def|fn)\s+(\w+)\s*\(/, nodeType: 'function', nameGroup: 1, hasParams: false },
-          { regex: /(?:class|struct|interface)\s+(\w+)/,    nodeType: 'class',    nameGroup: 1, hasParams: false },
-        ];
-    }
-  }
-
-  // ── Import extraction (now also returns imported names for scope analysis) ─
-
-  private extractImports(
-    filePath: string,
-    content: string,
-    language: string,
-    fileNodeId: string,
-    now: number
-  ): { nodes: GraphNode[]; edges: GraphEdge[]; importedNames: string[] } {
-    const nodes: GraphNode[] = [];
-    const edges: GraphEdge[] = [];
-    const importedNames: string[] = [];
-    const lines = content.split('\n');
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-
-      if (language === 'javascript' || language === 'typescript') {
-        // import { A, B } from 'x'
-        const namedImport = /^import\s+\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/.exec(line);
-        if (namedImport) {
-          namedImport[1].split(',').map(s => s.trim().split(/\s+as\s+/).pop()!.trim())
-            .filter(s => /^\w+$/.test(s))
-            .forEach(n => importedNames.push(n));
-          this.pushImportNodes(nodes, edges, filePath, namedImport[2], line, i + 1, fileNodeId, language, now);
-          continue;
-        }
-        // import X from 'x'  /  import * as X from 'x'
-        const defaultImport = /^import\s+(?:\*\s+as\s+)?(\w+)\s*(?:,\s*\{[^}]*\})?\s*from\s*['"]([^'"]+)['"]/.exec(line);
-        if (defaultImport) {
-          importedNames.push(defaultImport[1]);
-          this.pushImportNodes(nodes, edges, filePath, defaultImport[2], line, i + 1, fileNodeId, language, now);
-          continue;
-        }
-        // const X = require('x')
-        const requireDefault = /^(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(['"]([^'"]+)['"]\)/.exec(line);
-        if (requireDefault) {
-          importedNames.push(requireDefault[1]);
-          this.pushImportNodes(nodes, edges, filePath, requireDefault[2], line, i + 1, fileNodeId, language, now);
-          continue;
-        }
-        // const { A, B } = require('x')
-        const requireDestructure = /^(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(['"]([^'"]+)['"]\)/.exec(line);
-        if (requireDestructure) {
-          requireDestructure[1].split(',').map(s => s.trim().split(':')[0].trim())
-            .filter(s => /^\w+$/.test(s))
-            .forEach(n => importedNames.push(n));
-          this.pushImportNodes(nodes, edges, filePath, requireDestructure[2], line, i + 1, fileNodeId, language, now);
-        }
-      } else if (language === 'python') {
-        const imp1 = /^import\s+([\w.]+)(?:\s+as\s+(\w+))?/.exec(line);
-        if (imp1) { importedNames.push(imp1[2] ?? imp1[1].split('.').pop()!); continue; }
-        const imp2 = /^from\s+[\w.]+\s+import\s+(.+)/.exec(line);
-        if (imp2) {
-          imp2[1].split(',').map(s => s.trim().split(/\s+as\s+/).pop()!.trim())
-            .filter(s => /^\w+$/.test(s))
-            .forEach(n => importedNames.push(n));
-        }
-      }
-    }
-
-    return { nodes, edges, importedNames: [...new Set(importedNames)] };
-  }
-
-  private pushImportNodes(
-    nodes: GraphNode[], edges: GraphEdge[],
-    filePath: string, source: string, line: string,
-    lineNo: number, fileNodeId: string, language: string, now: number
-  ) {
-    const importNodeId = makeNodeId(filePath, `__import__${source}`, lineNo);
-    nodes.push({
-      id: importNodeId, type: 'import', name: source,
-      filePath, line: lineNo, endLine: lineNo, language,
-      signature: line.trim(), updatedAt: now,
-    });
-    edges.push({
-      id: makeEdgeId(fileNodeId, 'imports', importNodeId),
-      fromId: fileNodeId, toId: importNodeId, type: 'imports',
-      metadata: { source },
-    });
-  }
-
-  // ── Call extraction ────────────────────────────────────────────────────────
-
-  private extractCalls(nodes: GraphNode[], content: string): GraphEdge[] {
-    const edges: GraphEdge[] = [];
-    const functionNodes = nodes.filter(n => n.type === 'function' || n.type === 'method');
-
-    for (const caller of functionNodes) {
-      const bodyLines = content.split('\n').slice(caller.line, caller.endLine);
-      const body = bodyLines.join('\n');
-
-      for (const callee of functionNodes) {
-        if (callee.id === caller.id) { continue; }
-        const callPattern = new RegExp(`\\b${callee.name}\\s*\\(`, 'g');
-        if (callPattern.test(body)) {
-          edges.push({
-            id: makeEdgeId(caller.id, 'calls', callee.id),
-            fromId: caller.id, toId: callee.id, type: 'calls',
+    for (let i = 0; i < paramsNode.childCount; i++) {
+      const child = paramsNode.child(i);
+      if (['identifier', 'required_parameter', 'optional_parameter',
+           'rest_parameter', 'default_parameter', 'typed_parameter'].includes(child.type)) {
+        const nameNode = child.childForFieldName?.('pattern') ?? child.childForFieldName?.('name') ?? child;
+        const typeNode = child.childForFieldName?.('type');
+        const defNode  = child.childForFieldName?.('value');
+        const name     = nameNode.text.replace(/^\.\.\./, '').trim();
+        if (name && /^\w+$/.test(name)) {
+          params.push({
+            name,
+            type:         typeNode?.text?.replace(/^:\s*/, '').trim(),
+            defaultValue: defNode?.text?.trim(),
+            rest:         child.text.startsWith('...'),
           });
         }
       }
     }
-    return edges;
+    return params.length > 0 ? params : undefined;
   }
 
-  // ── Utility helpers ────────────────────────────────────────────────────────
+  // ── Modifier extraction ───────────────────────────────────────────────────
 
-  private extractDocComment(lines: string[], lineIndex: number): string | undefined {
+  private extractModifiers(node: any, _content: string): string[] {
+    const mods: string[] = [];
+    const modKeywords = new Set(['export', 'default', 'async', 'public', 'private',
+                                  'protected', 'static', 'abstract', 'readonly', 'override']);
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (modKeywords.has(child.type) || modKeywords.has(child.text)) {
+        mods.push(child.text.trim());
+      }
+    }
+    // Check parent for export
+    if (node.parent?.type === 'export_statement') { mods.push('export'); }
+    return [...new Set(mods)];
+  }
+
+  // ── Doc comment extraction ────────────────────────────────────────────────
+
+  private extractDocComment(node: any, lines: string[]): string | undefined {
+    const startLine = node.startPosition.row;
     const docLines: string[] = [];
-    let i = lineIndex - 1;
+    let i = startLine - 1;
     while (i >= 0) {
-      const l = lines[i].trim();
+      const l = lines[i]?.trim() ?? '';
       if (l.startsWith('//') || l.startsWith('*') || l.startsWith('/*') || l.startsWith('#')) {
         docLines.unshift(l.replace(/^\/\/\s?|^\*\s?|^#\s?|^\/\*\*?\s?/, ''));
         i--;
@@ -499,77 +558,187 @@ class RegexParser {
     return docLines.length > 0 ? docLines.join(' ').trim() : undefined;
   }
 
-  private extractModifiers(line: string, _language: string): string[] {
-    const modifiers: string[] = [];
-    const keywords = ['export','default','async','public','private','protected',
-                      'static','abstract','readonly','override','const','let','var'];
-    for (const kw of keywords) {
-      if (new RegExp(`\\b${kw}\\b`).test(line)) { modifiers.push(kw); }
-    }
-    return modifiers;
-  }
+  // ── Scope analysis (same logic as before, now applied to real AST bodies) ─
 
-  private extractParams(paramsStr: string): Param[] {
-    if (!paramsStr.trim()) { return []; }
-    return paramsStr.split(',').map(p => {
-      p = p.trim();
-      if (!p) { return null; }
-      const rest = p.startsWith('...');
-      if (rest) { p = p.slice(3); }
-      const [nameType, defaultValue] = p.split('=').map(s => s.trim());
-      const [name, type] = nameType.split(':').map(s => s.trim());
-      return { name: name || p, type: type?.trim(), defaultValue, rest } as Param;
-    }).filter(Boolean) as Param[];
-  }
+  private analyseScope(
+    body: string, params: Param[],
+    fileImportedNames: string[], fileModuleLevelVars: string[],
+    language: string
+  ): { undefinedRefs: string[]; localVars: string[]; instantiates: string[] } {
+    const localVars: string[] = [];
+    const localPatterns: RegExp[] = language === 'python'
+      ? [/^\s+(\w+)\s*=/gm, /for\s+(\w+)\s+in/g, /except\s+\w+\s+as\s+(\w+)/g]
+      : [/(?:const|let|var)\s+(\w+)\s*=/g, /(?:const|let|var)\s+\{([^}]+)\}/g,
+         /for\s*\(\s*(?:const|let|var)\s+(\w+)/g, /catch\s*\(\s*(\w+)\s*\)/g];
 
-  private findEndLine(lines: string[], startIndex: number, language: string): number {
-    if (['typescript','javascript','java','go','rust','cpp','c','cs'].includes(language)) {
-      let depth = 0, foundOpen = false;
-      for (let i = startIndex; i < Math.min(startIndex + 300, lines.length); i++) {
-        for (const ch of lines[i]) {
-          if (ch === '{') { depth++; foundOpen = true; }
-          if (ch === '}') { depth--; }
-        }
-        if (foundOpen && depth === 0) { return i + 1; }
+    for (const pat of localPatterns) {
+      pat.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = pat.exec(body)) !== null) {
+        const cap = m[1];
+        if (!cap) { continue; }
+        if (cap.includes(',')) {
+          cap.split(',').map(s => s.trim().replace(/[:\s=].*/, ''))
+            .filter(s => /^\w+$/.test(s)).forEach(v => localVars.push(v));
+        } else if (/^\w+$/.test(cap)) { localVars.push(cap); }
       }
     }
-    if (language === 'python') {
-      const baseIndent = lines[startIndex].match(/^\s*/)?.[0].length ?? 0;
-      for (let i = startIndex + 1; i < lines.length; i++) {
-        const l = lines[i];
-        if (l.trim() === '') { continue; }
-        if ((l.match(/^\s*/)?.[0].length ?? 0) <= baseIndent) { return i; }
-      }
+
+    const JS_BUILTINS = new Set([
+      'console','process','require','module','exports','__dirname','__filename',
+      'setTimeout','setInterval','clearTimeout','clearInterval','Promise','Error',
+      'JSON','Math','Object','Array','String','Number','Boolean','Date','RegExp',
+      'Map','Set','WeakMap','WeakSet','Symbol','Buffer','global','window','document',
+      'undefined','null','true','false','NaN','Infinity','this','super','arguments',
+      'async','await','typeof','instanceof','new','delete','void','throw','return',
+      'if','else','for','while','do','switch','case','break','continue',
+      'try','catch','finally','class','extends','import','export',
+      'const','let','var','function','yield','from','of','in',
+      'fs','path','http','https','crypto','os','events','util',
+    ]);
+
+    const inScope = new Set([
+      ...params.map(p => p.name),
+      ...localVars, ...fileImportedNames, ...fileModuleLevelVars,
+      ...JS_BUILTINS,
+    ]);
+
+    const instantiates: string[] = [];
+    const newPat = /\bnew\s+([A-Z]\w*)\s*\(/g;
+    let nm: RegExpExecArray | null;
+    while ((nm = newPat.exec(body)) !== null) { instantiates.push(nm[1]); }
+
+    const undefinedRefs: string[] = [];
+    const seen = new Set<string>();
+    const usePat = /(?<![.\w])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:\(|\.)/g;
+    let um: RegExpExecArray | null;
+    while ((um = usePat.exec(body)) !== null) {
+      const n = um[1];
+      if (seen.has(n) || inScope.has(n) || n.length <= 1) { continue; }
+      seen.add(n);
+      undefinedRefs.push(n);
     }
-    return Math.min(startIndex + 80, lines.length);
+
+    return {
+      undefinedRefs: [...new Set(undefinedRefs)],
+      localVars:     [...new Set(localVars)],
+      instantiates:  [...new Set(instantiates)],
+    };
   }
 }
 
-// ─── Public ASTParser ─────────────────────────────────────────────────────────
+// ─── Regex fallback (for languages without WASM grammars) ────────────────────
+// Kept lean — only used when tree-sitter can't parse a file.
+
+class RegexFallbackParser {
+  parse(filePath: string, content: string, language: string): ParsedFile {
+    const lines = content.split('\n');
+    const now   = Date.now();
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+
+    const fileNode: GraphNode = {
+      id: makeNodeId(filePath, '__file__', 0), type: 'file',
+      name: path.basename(filePath), filePath,
+      line: 0, endLine: lines.length, language,
+      size: Buffer.byteLength(content),
+      lastModified: fs.statSync(filePath).mtimeMs,
+      hash: contentHash(content), updatedAt: now,
+    };
+    nodes.push(fileNode);
+
+    const patterns: Array<{ r: RegExp; t: NodeType }> = [
+      { r: /(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/,                     t: 'class'     },
+      { r: /(?:export\s+)?interface\s+(\w+)/,                                  t: 'interface' },
+      { r: /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(/,                 t: 'function'  },
+      { r: /(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(.*\)\s*=>/,      t: 'function'  },
+      { r: /^\s+(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*(\w+)\s*\(/, t: 'method' },
+      { r: /^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=/,                     t: 'variable'  },
+    ];
+
+    for (let i = 0; i < lines.length; i++) {
+      for (const { r, t } of patterns) {
+        const m = r.exec(lines[i]);
+        if (!m || !m[1] || m[1] === '__file__') { continue; }
+        const nid = makeNodeId(filePath, m[1], i + 1);
+        nodes.push({
+          id: nid, type: t, name: m[1], filePath,
+          line: i + 1, endLine: i + 50, language,
+          signature: lines[i].trim().slice(0, 200),
+          hash: contentHash(lines[i]), updatedAt: now,
+        });
+        edges.push({ id: makeEdgeId(fileNode.id, 'contains', nid), fromId: fileNode.id, toId: nid, type: 'contains' });
+      }
+    }
+
+    return { filePath, language, nodes, edges, parseErrors: [] };
+  }
+}
+
+// ─── ASTParser — public API ───────────────────────────────────────────────────
 
 export class ASTParser {
-  private regexParser = new RegexParser();
+  private treeSitter  = new TreeSitterParser();
+  private regexFallback = new RegexFallbackParser();
+  private initPromise: Promise<void> | null = null;
+
+  async ensureInit(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.treeSitter.init();
+    }
+    return this.initPromise;
+  }
 
   getSupportedExtensions(): string[] { return Object.keys(EXTENSION_MAP); }
-  getLanguageForFile(fp: string): string | null { return EXTENSION_MAP[path.extname(fp).toLowerCase()]?.language ?? null; }
-  canParse(fp: string): boolean { return this.getLanguageForFile(fp) !== null; }
 
+  getLanguageForFile(filePath: string): string | null {
+    return EXTENSION_MAP[path.extname(filePath).toLowerCase()]?.language ?? null;
+  }
+
+  canParse(filePath: string): boolean {
+    return this.getLanguageForFile(filePath) !== null;
+  }
+
+  async parseFileAsync(filePath: string): Promise<ParsedFile> {
+    const language = this.getLanguageForFile(filePath);
+    if (!language) {
+      return { filePath, language: 'unknown', nodes: [], edges: [], parseErrors: ['Unsupported extension'] };
+    }
+
+    let content: string;
+    try { content = fs.readFileSync(filePath, 'utf-8'); }
+    catch (e) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Cannot read: ${e}`] }; }
+
+    if (!content.trim() || content.length > 1_000_000) {
+      return { filePath, language, nodes: [], edges: [], parseErrors: [] };
+    }
+
+    await this.ensureInit();
+
+    // Try tree-sitter first — fall back to regex if language not supported
+    if (this.treeSitter.isReady() && LANG_QUERIES[language]) {
+      try {
+        return await this.treeSitter.parseFile(filePath, content, language);
+      } catch (e) {
+        console.warn(`[CodeLens] tree-sitter failed for ${filePath}, using regex fallback:`, e);
+      }
+    }
+
+    return this.regexFallback.parse(filePath, content, language);
+  }
+
+  // Synchronous wrapper for backward compat (uses regex only)
   parseFile(filePath: string): ParsedFile {
     const language = this.getLanguageForFile(filePath);
     if (!language) {
-      return { filePath, language: 'unknown', nodes: [], edges: [], parseErrors: [`Unsupported: ${filePath}`] };
+      return { filePath, language: 'unknown', nodes: [], edges: [], parseErrors: ['Unsupported'] };
     }
     let content: string;
     try { content = fs.readFileSync(filePath, 'utf-8'); }
-    catch (err) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Cannot read: ${err}`] }; }
-    if (!content.trim() || content.length > 500_000) {
+    catch (e) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Cannot read: ${e}`] }; }
+    if (!content.trim() || content.length > 1_000_000) {
       return { filePath, language, nodes: [], edges: [], parseErrors: [] };
     }
-    try { return this.regexParser.parse(filePath, content, language); }
-    catch (err) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Parse error: ${err}`] }; }
-  }
-
-  parseFiles(filePaths: string[]): ParsedFile[] {
-    return filePaths.map(fp => this.parseFile(fp));
+    return this.regexFallback.parse(filePath, content, language);
   }
 }

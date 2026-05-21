@@ -17,3 +17,6 @@ Thumbs.db
 
 # Env
 .env
+
+# CodeLens Graph (local index)
+.codelens/
