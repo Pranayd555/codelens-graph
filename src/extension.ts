@@ -11,6 +11,7 @@ import { GraphDiffer }        from './graph/differ';
 import { SkillGenerator }     from './agent/skillGenerator';
 import { BackgroundScanner }  from './agent/backgroundScanner';
 import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
+import { StatsViewProvider }   from './ui/statsView';
 import { GraphStats }         from './types';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
@@ -24,8 +25,9 @@ let differ:            GraphDiffer;
 let skillGenerator:    SkillGenerator;
 let backgroundScanner: BackgroundScanner;
 
-let graphPanel:    vscode.WebviewPanel | undefined;
-let statusBarItem: vscode.StatusBarItem;
+let graphPanel:       vscode.WebviewPanel | undefined;
+let statusBarItem:    vscode.StatusBarItem;
+let statsViewProvider: StatsViewProvider;
 
 // ─── activate ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +55,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  // ── 3. Background scanner callbacks ───────────────────────────────────────
+  // ── 3. Register stats sidebar provider ───────────────────────────────────
+  statsViewProvider = new StatsViewProvider(db, context);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(StatsViewProvider.viewId, statsViewProvider)
+  );
+
+  // ── 4. Background scanner callbacks (was 3) ──────────────────────────────
 
   backgroundScanner.onStatus(state => {
     if (state === 'scanning')  { setStatus('scanning'); }
@@ -62,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const s = db.getStats();
       setStatus('ready', s.totalNodes, s.totalEdges);
       refreshGraphPanel();
+      statsViewProvider?.refresh();
     }
     if (state === 'error')     { setStatus('error'); }
   });
@@ -69,6 +78,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   backgroundScanner.onComplete(stats => {
     setStatus('ready', stats.totalNodes, stats.totalEdges);
     refreshGraphPanel();
+    statsViewProvider?.refresh();
   });
 
   backgroundScanner.onSkills(written => {
@@ -90,7 +100,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
-  // ── 4. Commands ───────────────────────────────────────────────────────────
+  // ── 5. Commands ───────────────────────────────────────────────────────────
 
   context.subscriptions.push(
 
@@ -194,7 +204,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
-  // ── 5. File system watcher → incremental graph updates ────────────────────
+  // ── 6. File system watcher → incremental graph updates ────────────────────
 
   const cfg = getConfig();
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
@@ -228,7 +238,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(fsWatcher);
   }
 
-  // ── 6. Auto-scan on activation (the core of autonomous operation) ─────────
+  // ── 7. Auto-scan on activation (the core of autonomous operation) ─────────
 
   if (workspaceRoot) {
     const stats = db.getStats();
@@ -297,6 +307,7 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
 
     setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
     refreshGraphPanel();
+    statsViewProvider?.refresh();
 
     // Generate / update skill files
     const written = skillGenerator.generateAll(workspaceRoot, stats);

@@ -30,7 +30,7 @@ Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
 ### From source (for development)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/codelens-graph.git
+git clone https://github.com/pranayd555/codelens-graph.git
 cd codelens-graph
 npm install
 ```
