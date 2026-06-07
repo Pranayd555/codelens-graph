@@ -147,17 +147,32 @@ Add to \`.cursor/mcp.json\` in your project:
 ## Available MCP tools
 | Tool | Purpose |
 |------|---------|
-| \`codelens_search\` | Find any symbol by name |
-| \`codelens_context\` | Get compressed context for a task |
-| \`codelens_callers\` | Find what calls a function |
-| \`codelens_callees\` | Find what a function calls |
-| \`codelens_impact\` | Full impact radius before refactoring |
-| \`codelens_node\` | Full details + snippet for one symbol |
-| \`codelens_files\` | File structure by category |
-| \`codelens_status\` | Graph health + statistics |
+| \`codelens_search\` | Search all indexed symbols when the location is unknown |
+| \`codelens_context\` | Retrieve broad, cross-file context on demand |
+| \`codelens_callers\` | Find direct consumers of a shared symbol |
+| \`codelens_callees\` | Find a symbol's direct dependencies |
+| \`codelens_impact\` | Measure transitive impact before a refactor |
+| \`codelens_node\` | Get compact metadata for one known symbol |
+| \`codelens_files\` | Search project structure by category or filename |
+| \`codelens_status\` | Diagnose a missing or stale index |
 
-The graph updates automatically on every file save.
-No rules files. No repo pollution. The agent calls these tools natively.
+## Agent usage policy
+
+CodeLens is an on-demand codebase index, not startup context.
+
+- Do not call CodeLens automatically at the beginning of every task.
+- Use it when full-codebase search, architecture discovery, call relationships,
+  duplicate detection, or change-impact analysis would be more efficient than
+  opening files one by one.
+- For targeted work with known files or symbols, read those files directly.
+- Start with the smallest useful query. Prefer \`codelens_search\` or a focused
+  relationship tool before \`codelens_context\`.
+- Request snippets only when they are likely to replace a file read.
+- After CodeLens identifies relevant locations, inspect only the files needed
+  to verify behavior and make the change.
+
+The graph updates automatically on every file save. No startup context is
+injected, and the agent calls these tools only when needed.
 `;
   }
 

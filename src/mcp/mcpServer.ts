@@ -19,13 +19,24 @@ export class MCPServer {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { z } = require('zod');
 
-    this.server = new McpServer({ name: 'codelens-graph', version: '0.1.0' });
+    this.server = new McpServer(
+      { name: 'codelens-graph', version: '0.1.0' },
+      {
+        instructions:
+          'CodeLens Graph is an on-demand full-codebase index. Do not call its tools automatically ' +
+          'at the start of a task and do not request broad context when the relevant files or symbols ' +
+          'are already known. Use it for codebase-wide symbol or file discovery, architecture search, ' +
+          'call relationships, duplicate detection, and refactor impact analysis. Begin with the ' +
+          'smallest focused query, then inspect only the source files needed to complete the task.',
+      }
+    );
 
     // ── codelens_search ───────────────────────────────────────────────────
     this.server.tool(
       'codelens_search',
-      'Search for any symbol (function, class, variable, method) by name. ' +
-      'Always call this BEFORE reading files. Returns exact file:line locations.',
+      'Search the full indexed codebase for symbols when the definition or file is unknown, ' +
+      'or when checking whether functionality already exists. Returns compact file:line matches. ' +
+      'Do not call for a file or symbol whose exact location is already known.',
       { query: z.string(), limit: z.number().optional().default(15) },
       async ({ query, limit }: { query: string; limit?: number }) => {
         const results = this.db.searchNodes(query, limit ?? 15);
@@ -41,9 +52,10 @@ export class MCPServer {
     // ── codelens_context ──────────────────────────────────────────────────
     this.server.tool(
       'codelens_context',
-      'Get compressed codebase context for a task. Returns relevant symbols with ' +
-      'snippets, import paths, relationships, file categories, warnings and pre-diagnosed errors. ' +
-      'Call at the START of every task — replaces reading multiple files.',
+      'On-demand context search across the codebase. Use only for broad exploration, unfamiliar ' +
+      'architecture, cross-cutting work, or tasks whose relevant files and symbols are unknown. ' +
+      'Do not call automatically at task start or for targeted questions about known files or symbols. ' +
+      'Prefer codelens_search for discovery and focused graph tools for relationships or impact.',
       { task: z.string(), max_depth: z.number().optional().default(2), max_tokens: z.number().optional().default(3000) },
       async ({ task, max_depth, max_tokens }: { task: string; max_depth?: number; max_tokens?: number }) => {
         const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 3000);
@@ -56,7 +68,8 @@ export class MCPServer {
     // ── codelens_callers ──────────────────────────────────────────────────
     this.server.tool(
       'codelens_callers',
-      'Find all functions that call a given symbol. Use before modifying any function.',
+      'Query the full graph for direct callers of a symbol. Use when call-site coverage matters, ' +
+      'especially before changing a shared API. Do not call for isolated edits with known consumers.',
       { symbol: z.string() },
       async ({ symbol }: { symbol: string }) => {
         const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
@@ -80,7 +93,8 @@ export class MCPServer {
     // ── codelens_callees ──────────────────────────────────────────────────
     this.server.tool(
       'codelens_callees',
-      'Find all functions that a symbol calls (its dependencies).',
+      'Query the full graph for a symbol\'s direct dependencies. Use when its dependency chain is ' +
+      'needed; do not call merely to inspect an already-known implementation.',
       { symbol: z.string() },
       async ({ symbol }: { symbol: string }) => {
         const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
@@ -104,7 +118,8 @@ export class MCPServer {
     // ── codelens_impact ───────────────────────────────────────────────────
     this.server.tool(
       'codelens_impact',
-      'Full impact radius of changing a symbol — what else breaks. Call BEFORE refactoring.',
+      'Search the graph for the transitive impact radius of changing a symbol. Use for refactors, ' +
+      'public API changes, or shared behavior; avoid it for small local edits.',
       { symbol: z.string(), depth: z.number().optional().default(3) },
       async ({ symbol, depth }: { symbol: string; depth?: number }) => {
         const targets = this.db.searchNodes(symbol, 3).filter(n => n.name === symbol);
@@ -132,8 +147,9 @@ export class MCPServer {
     // ── codelens_node ─────────────────────────────────────────────────────
     this.server.tool(
       'codelens_node',
-      'Full details + snippet for one symbol. Use instead of reading the file.',
-      { symbol: z.string(), with_snippet: z.boolean().optional().default(true) },
+      'Get compact indexed details for one known symbol. Request with_snippet=true only when a short ' +
+      'source excerpt can avoid a file read; otherwise keep the default metadata-only response.',
+      { symbol: z.string(), with_snippet: z.boolean().optional().default(false) },
       async ({ symbol, with_snippet }: { symbol: string; with_snippet?: boolean }) => {
         const results = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!results.length) {
@@ -157,7 +173,7 @@ export class MCPServer {
           if (node.undefinedRefs?.length) {
             lines.push(`- **⚠️ Undefined refs:** \`${node.undefinedRefs.join('`, `')}\``);
           }
-          if (with_snippet !== false) {
+          if (with_snippet === true) {
             const snippet = this.readSnippet(node);
             if (snippet) { lines.push('', '```' + node.language, snippet, '```'); }
           }
@@ -170,8 +186,9 @@ export class MCPServer {
     // ── codelens_files ────────────────────────────────────────────────────
     this.server.tool(
       'codelens_files',
-      'File structure grouped by category (routes, services, models, templates, utils…). ' +
-      'Use instead of ls/find to understand project layout.',
+      'Search the indexed file structure by category or filename across the full codebase. Use when ' +
+      'project layout or candidate files are unknown. Supply filter whenever possible and do not call ' +
+      'to list files already known from the task or prior results.',
       { filter: z.string().optional() },
       async ({ filter }: { filter?: string }) => {
         const classifier = new FileClassifier();
@@ -193,7 +210,8 @@ export class MCPServer {
     // ── codelens_status ───────────────────────────────────────────────────
     this.server.tool(
       'codelens_status',
-      'Check CodeLens graph health and statistics.',
+      'Check index freshness and graph health when CodeLens results appear missing or stale. ' +
+      'Do not call during normal task execution.',
       {},
       async () => {
         const stats    = this.db.getStats();

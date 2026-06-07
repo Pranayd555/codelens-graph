@@ -1,6 +1,6 @@
 # CodeLens Graph
 
-> A VS Code extension that builds a live knowledge graph of your codebase — so AI agents understand everything before acting. No hallucinations. No duplicate files. No wasted tokens.
+> A VS Code extension that gives AI agents an on-demand, full-codebase search and relationship graph. No automatic context dump, duplicate implementations, or wasted tokens.
 
 ---
 
@@ -13,7 +13,7 @@ Every time you (or an AI agent) saves a file, CodeLens Graph parses it and updat
 - **Function**, **Method**, **Variable**, **Property**
 - **Import** and **call relationships** between them
 
-Before any AI agent runs, you can generate a **compressed context** — a precise JSON summary of only the symbols relevant to the current task — and inject it into the agent's prompt. This cuts token usage by ~90% while giving the agent perfect structural awareness of the codebase.
+AI agents query the graph only when they need codebase-wide discovery, architectural context, call relationships, duplicate detection, or change-impact analysis. CodeLens narrows the search to relevant symbols and files; the agent then reads only the source needed for the task.
 
 ---
 
@@ -53,12 +53,12 @@ Then press **F5** in VS Code to launch the Extension Development Host.
 
 1. Open your project in VS Code
 2. Run **Build Knowledge Graph** once (auto-runs on first open)
-3. Before prompting an AI agent, run **Show Agent Context Preview**
-4. Type your task description
-5. Copy the generated system prompt injection
-6. Paste it at the top of your agent's system prompt
+3. Connect the CodeLens MCP server using `.codelens/mcp.json`
+4. Give the agent its task normally; no context is injected at startup
+5. The agent calls CodeLens only when it needs full-codebase search or graph analysis
+6. After CodeLens identifies relevant locations, the agent reads only the required files
 
-The agent will know exactly what already exists, where it lives, and what calls what — before writing a single line.
+For targeted work where the file and symbol are already known, the agent should read them directly. For unfamiliar or cross-cutting work, it should start with the smallest useful CodeLens query and expand only when needed.
 
 ---
 
@@ -126,7 +126,7 @@ npx tsc --noEmit
 ## Roadmap
 
 - [ ] Tree-sitter WASM grammars (full AST precision, replaces regex parser)
-- [ ] Agent run hooks (auto-inject context into Copilot/Cline/Cursor)
+- [ ] Deeper agent integrations that preserve on-demand context retrieval
 - [ ] Snapshot diff viewer (before/after agent run graph comparison)
 - [ ] Vector embeddings for semantic symbol search
 - [ ] Team sync (shared graph via cloud backend)
