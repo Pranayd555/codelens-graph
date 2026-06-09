@@ -31,6 +31,18 @@ export class WorkspaceScanner {
 
     const allFiles = this.collectFiles(rootPaths, options);
     const total    = allFiles.length;
+    const indexedFiles = new Set(allFiles.map(filePath => path.normalize(filePath)));
+
+    // Remove files that disappeared since the previous full scan.
+    for (const indexedFile of this.db.getAllFiles()) {
+      const belongsToScannedRoot = rootPaths.some(root => {
+        const relative = path.relative(root, indexedFile);
+        return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+      });
+      if (belongsToScannedRoot && !indexedFiles.has(path.normalize(indexedFile))) {
+        this.db.deleteNodesByFile(indexedFile);
+      }
+    }
 
     for (let i = 0; i < allFiles.length; i++) {
       const filePath = allFiles[i];
@@ -41,8 +53,10 @@ export class WorkspaceScanner {
         if (parsed.parseErrors.length) { result.errors.push(...parsed.parseErrors); }
 
         if (parsed.nodes.length > 0) {
+          this.db.deleteNodesByFile(filePath);
           this.db.upsertNodes(parsed.nodes);
           this.db.upsertEdges(parsed.edges);
+          this.db.upsertCallRefs(parsed.callRefs);
           result.nodesAdded += parsed.nodes.length;
           result.edgesAdded += parsed.edges.length;
           result.filesScanned++;
@@ -55,20 +69,35 @@ export class WorkspaceScanner {
       }
     }
 
+    this.db.resolveWorkspaceRelationships();
     this.db.persist();
+    result.edgesAdded = this.db.getStats().totalEdges;
     result.durationMs = Date.now() - start;
     return result;
   }
 
-  async updateFile(filePath: string): Promise<ParsedFile> {
+  async updateFile(filePath: string, resolveRelationships = true): Promise<ParsedFile> {
     await this.parser.ensureInit();
+    const previousSymbols = this.db.getNodesByFile(filePath)
+      .filter(node => node.type !== 'file' && node.type !== 'import')
+      .map(node => node.name);
     this.db.deleteNodesByFile(filePath);
     const parsed = await this.parser.parseFileAsync(filePath);
     if (parsed.nodes.length > 0) {
       this.db.upsertNodes(parsed.nodes);
       this.db.upsertEdges(parsed.edges);
+      this.db.upsertCallRefs(parsed.callRefs);
     }
-    this.db.persist();
+    if (resolveRelationships) {
+      const currentSymbols = parsed.nodes
+        .filter(node => node.type !== 'file' && node.type !== 'import')
+        .map(node => node.name);
+      this.db.resolveWorkspaceRelationships(
+        filePath,
+        [...new Set([...previousSymbols, ...currentSymbols])]
+      );
+      this.db.persist();
+    }
     return parsed;
   }
 

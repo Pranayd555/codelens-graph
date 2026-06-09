@@ -5,16 +5,14 @@ import { GraphStats } from '../types';
 
 // ─── SkillGenerator ───────────────────────────────────────────────────────────
 // Previously wrote rules files into the user's repo.
-// Now: writes only a single .codelens/mcp.json config file showing how to
-// connect the MCP server. No rules files, no repo pollution.
+// Now: writes MCP connection files for supported agents.
 //
 // The agent gets context through MCP tools natively — no skill file needed.
 
 export class SkillGenerator {
   constructor(private db: GraphDB) {}
 
-  // ── Generate only the MCP config hint file ────────────────────────────────
-  // Written to .codelens/ (gitignored) — not scattered across the repo.
+  // ── Generate MCP connection files ────────────────────────────────────────
 
   generateAll(workspaceRoot: string, _stats: GraphStats): string[] {
     const written: string[] = [];
@@ -26,10 +24,15 @@ export class SkillGenerator {
     fs.writeFileSync(readmePath, this.buildReadme(workspaceRoot), 'utf-8');
     written.push('.codelens/README.md');
 
-    // .codelens/mcp.json — ready-to-paste MCP config for Claude Code / Cursor
+    // .codelens/mcp.json — ready-to-paste MCP config examples
     const mcpConfigPath = path.join(codelensDir, 'mcp.json');
     fs.writeFileSync(mcpConfigPath, this.buildMcpConfig(workspaceRoot), 'utf-8');
     written.push('.codelens/mcp.json');
+
+    // .vscode/mcp.json — VS Code reads this project-level config directly
+    if (this.writeVsCodeMcpConfig(workspaceRoot)) {
+      written.push('.vscode/mcp.json');
+    }
 
     // Ensure .codelens/ is gitignored (db + context files stay local)
     this.ensureGitignore(workspaceRoot);
@@ -70,41 +73,85 @@ export class SkillGenerator {
   // ── MCP config JSON ───────────────────────────────────────────────────────
 
   private buildMcpConfig(workspaceRoot: string): string {
-    // Find the compiled mcpEntry.js — works whether installed globally or locally
-    const entryPath = path.join(__dirname, '..', '..', 'out', 'mcp', 'mcpEntry.js');
+    const entryPath = this.getMcpEntryPath();
+    const projectPath = this.toConfigPath(workspaceRoot);
 
     const config = {
       _comment: 'CodeLens Graph MCP Server config — copy the relevant section to your agent config',
+      vscode: {
+        _add_to: '.vscode/mcp.json in your project',
+        servers: {
+          codelens: {
+            command: 'node',
+            args:    [entryPath, projectPath],
+          },
+        },
+      },
       claude_code: {
         _add_to: '~/.claude.json under mcpServers',
         codelens: {
           type:    'stdio',
           command: 'node',
-          args:    [entryPath, workspaceRoot],
+          args:    [entryPath, projectPath],
         },
       },
       cursor: {
         _add_to: '.cursor/mcp.json in your project',
         codelens: {
           command: 'node',
-          args:    [entryPath, workspaceRoot],
+          args:    [entryPath, projectPath],
         },
       },
       cline: {
         _add_to: 'Cline MCP settings → Add Server',
         command: 'node',
-        args:    [entryPath, workspaceRoot],
+        args:    [entryPath, projectPath],
       },
     };
 
     return JSON.stringify(config, null, 2);
   }
 
+  private writeVsCodeMcpConfig(workspaceRoot: string): boolean {
+    const vscodeDir = path.join(workspaceRoot, '.vscode');
+    const configPath = path.join(vscodeDir, 'mcp.json');
+    let config: { servers?: Record<string, unknown>; [key: string]: unknown } = {};
+
+    try {
+      if (fs.existsSync(configPath)) {
+        config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      }
+
+      config.servers = {
+        ...(config.servers ?? {}),
+        codelens: {
+          command: 'node',
+          args: [this.getMcpEntryPath(), this.toConfigPath(workspaceRoot)],
+        },
+      };
+
+      fs.mkdirSync(vscodeDir, { recursive: true });
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+      return true;
+    } catch {
+      // Preserve an existing config if it cannot be parsed or written.
+      return false;
+    }
+  }
+
+  private getMcpEntryPath(): string {
+    return this.toConfigPath(path.resolve(__dirname, '..', 'mcp', 'mcpEntry.js'));
+  }
+
+  private toConfigPath(filePath: string): string {
+    return filePath.replace(/\\/g, '/');
+  }
+
   // ── README for .codelens/ ─────────────────────────────────────────────────
 
   private buildReadme(workspaceRoot: string): string {
-    const entryPath = path.join(__dirname, '..', '..', 'out', 'mcp', 'mcpEntry.js')
-      .replace(/\\/g, '/');
+    const entryPath = this.getMcpEntryPath();
+    const projectPath = this.toConfigPath(workspaceRoot);
 
     return `# CodeLens Graph
 
@@ -117,6 +164,19 @@ This directory contains the CodeLens Graph index for this project.
 
 ## Connecting your AI agent
 
+### VS Code
+CodeLens creates \`.vscode/mcp.json\` with:
+\`\`\`json
+{
+  "servers": {
+    "codelens": {
+      "command": "node",
+      "args": ["${entryPath}", "${projectPath}"]
+    }
+  }
+}
+\`\`\`
+
 ### Claude Code
 Add to \`~/.claude.json\`:
 \`\`\`json
@@ -125,7 +185,7 @@ Add to \`~/.claude.json\`:
     "codelens": {
       "type": "stdio",
       "command": "node",
-      "args": ["${entryPath}", "${workspaceRoot.replace(/\\/g, '/')}"]
+      "args": ["${entryPath}", "${projectPath}"]
     }
   }
 }
@@ -138,7 +198,7 @@ Add to \`.cursor/mcp.json\` in your project:
   "mcpServers": {
     "codelens": {
       "command": "node",
-      "args": ["${entryPath}", "${workspaceRoot.replace(/\\/g, '/')}"]
+      "args": ["${entryPath}", "${projectPath}"]
     }
   }
 }

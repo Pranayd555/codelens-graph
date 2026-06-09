@@ -78,6 +78,18 @@ export interface GraphEdge {
   metadata?: Record<string, string>;
 }
 
+// A source-level call retained independently from its resolved graph edge.
+// Keeping this durable lets the graph repair relationships when a callee is
+// added, removed, renamed, or moved without reparsing every caller.
+export interface CallReference {
+  id: string;
+  fromId: string;
+  filePath: string;
+  symbolName: string;
+  qualifier?: string;
+  line: number;
+}
+
 // ─── Snapshot ──────────────────────────────────────────────────────────────────
 
 export interface GraphSnapshot {
@@ -98,6 +110,7 @@ export interface ParsedFile {
   language: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  callRefs: CallReference[];
   parseErrors: string[];
 }
 

@@ -1,7 +1,7 @@
 import * as fs   from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { GraphNode, GraphEdge, ParsedFile, Param, NodeType } from '../types';
+import { GraphNode, GraphEdge, ParsedFile, Param, NodeType, CallReference } from '../types';
 
 // ─── Language → WASM mapping ──────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ const LANG_QUERIES: Record<string, LangQuery> = {
     nameField:    'name',
     paramsField:  'parameters',
     bodyField:    'body',
-    importTypes:  ['import_statement', 'call_expression'],
+    importTypes:  ['import_statement'],
     callTypes:    ['call_expression'],
     callNamePath: ['function'],
   },
@@ -224,12 +224,12 @@ export class TreeSitterParser {
 
   async parseFile(filePath: string, content: string, language: string): Promise<ParsedFile> {
     if (!this.Parser) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: ['tree-sitter not initialised'] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: ['tree-sitter not initialised'] };
     }
 
     const lang = await this.getLanguage(language);
     if (!lang) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: [`No grammar for ${language}`] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [`No grammar for ${language}`] };
     }
 
     const parser = new (this.Parser as any)();
@@ -239,18 +239,19 @@ export class TreeSitterParser {
     try {
       tree = parser.parse(content);
     } catch (e) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: [`Parse failed: ${e}`] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [`Parse failed: ${e}`] };
     }
 
     const query = LANG_QUERIES[language];
     if (!query) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: [`No query config for ${language}`] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [`No query config for ${language}`] };
     }
 
     const lines   = content.split('\n');
     const now     = Date.now();
     const nodes:  GraphNode[] = [];
     const edges:  GraphEdge[] = [];
+    const callRefs: CallReference[] = [];
 
     // File node
     const fileNode: GraphNode = {
@@ -388,29 +389,35 @@ export class TreeSitterParser {
       }
     });
 
-    // ── Call edges: walk call_expression nodes ────────────────────────────
-    const symbolMap = new Map(nodes.filter(n => n.type !== 'file' && n.type !== 'import').map(n => [n.name, n]));
-
+    // Retain every call as a durable reference. The workspace-level resolver
+    // links these to definitions after all files have been indexed.
     this.walkTree(tree.rootNode, (tsNode: any) => {
       if (!query.callTypes.includes(tsNode.type)) { return; }
 
       const calleeName = this.getCallName(tsNode, query.callNamePath, content);
       if (!calleeName) { return; }
 
-      const callee = symbolMap.get(calleeName);
-      if (!callee) { return; }
-
-      // Find the enclosing function
       const enclosing = this.findEnclosingFunction(tsNode, nodes);
-      if (!enclosing || enclosing.id === callee.id) { return; }
+      if (!enclosing) { return; }
 
-      const edgeId = makeEdgeId(enclosing.id, 'calls', callee.id);
-      if (!edges.find(e => e.id === edgeId)) {
-        edges.push({ id: edgeId, fromId: enclosing.id, toId: callee.id, type: 'calls' });
-      }
+      const callTarget = tsNode.childForFieldName?.(query.callNamePath[0]);
+      const qualifier = callTarget?.type === 'member_expression'
+        ? callTarget.childForFieldName?.('object')?.text?.trim()
+        : undefined;
+      const line = tsNode.startPosition.row + 1;
+      const column = tsNode.startPosition.column;
+
+      callRefs.push({
+        id: `${enclosing.id}::call::${calleeName}::${line}:${column}`,
+        fromId: enclosing.id,
+        filePath,
+        symbolName: calleeName,
+        qualifier,
+        line,
+      });
     });
 
-    return { filePath, language, nodes, edges, parseErrors: [] };
+    return { filePath, language, nodes, edges, callRefs, parseErrors: [] };
   }
 
   // ── Tree walking ──────────────────────────────────────────────────────────
@@ -495,6 +502,12 @@ export class TreeSitterParser {
         return child.text.replace(/['"]/g, '').trim();
       }
     }
+
+    const text = node.text?.trim?.() ?? '';
+    const pythonFrom = /^from\s+([.\w]+)\s+import\b/.exec(text);
+    if (pythonFrom) { return pythonFrom[1]; }
+    const pythonImport = /^import\s+([.\w]+)/.exec(text);
+    if (pythonImport) { return pythonImport[1]; }
     return null;
   }
 
@@ -636,6 +649,7 @@ class RegexFallbackParser {
     const now   = Date.now();
     const nodes: GraphNode[] = [];
     const edges: GraphEdge[] = [];
+    const callRefs: CallReference[] = [];
 
     const fileNode: GraphNode = {
       id: makeNodeId(filePath, '__file__', 0), type: 'file',
@@ -671,7 +685,7 @@ class RegexFallbackParser {
       }
     }
 
-    return { filePath, language, nodes, edges, parseErrors: [] };
+    return { filePath, language, nodes, edges, callRefs, parseErrors: [] };
   }
 }
 
@@ -702,15 +716,15 @@ export class ASTParser {
   async parseFileAsync(filePath: string): Promise<ParsedFile> {
     const language = this.getLanguageForFile(filePath);
     if (!language) {
-      return { filePath, language: 'unknown', nodes: [], edges: [], parseErrors: ['Unsupported extension'] };
+      return { filePath, language: 'unknown', nodes: [], edges: [], callRefs: [], parseErrors: ['Unsupported extension'] };
     }
 
     let content: string;
     try { content = fs.readFileSync(filePath, 'utf-8'); }
-    catch (e) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Cannot read: ${e}`] }; }
+    catch (e) { return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [`Cannot read: ${e}`] }; }
 
     if (!content.trim() || content.length > 1_000_000) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: [] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [] };
     }
 
     await this.ensureInit();
@@ -731,13 +745,13 @@ export class ASTParser {
   parseFile(filePath: string): ParsedFile {
     const language = this.getLanguageForFile(filePath);
     if (!language) {
-      return { filePath, language: 'unknown', nodes: [], edges: [], parseErrors: ['Unsupported'] };
+      return { filePath, language: 'unknown', nodes: [], edges: [], callRefs: [], parseErrors: ['Unsupported'] };
     }
     let content: string;
     try { content = fs.readFileSync(filePath, 'utf-8'); }
-    catch (e) { return { filePath, language, nodes: [], edges: [], parseErrors: [`Cannot read: ${e}`] }; }
+    catch (e) { return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [`Cannot read: ${e}`] }; }
     if (!content.trim() || content.length > 1_000_000) {
-      return { filePath, language, nodes: [], edges: [], parseErrors: [] };
+      return { filePath, language, nodes: [], edges: [], callRefs: [], parseErrors: [] };
     }
     return this.regexFallback.parse(filePath, content, language);
   }

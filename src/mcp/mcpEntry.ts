@@ -14,7 +14,17 @@
 //   }
 // }
 //
-// Add to Cursor (~/cursor/mcp.json or project .cursor/mcp.json):
+// Add to VS Code (project .vscode/mcp.json):
+// {
+//   "servers": {
+//     "codelens": {
+//       "command": "node",
+//       "args": ["/path/to/extension/out/mcp/mcpEntry.js", "/path/to/your/project"]
+//     }
+//   }
+// }
+//
+// Add to Cursor (~/.cursor/mcp.json or project .cursor/mcp.json):
 // {
 //   "mcpServers": {
 //     "codelens": {

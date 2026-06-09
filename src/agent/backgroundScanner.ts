@@ -137,10 +137,12 @@ export class BackgroundScanner {
 
     for (const fp of changedFiles) {
       try {
-        await this.scanner.updateFile(fp);
+        await this.scanner.updateFile(fp, false);
       } catch { /* ignore individual file errors */ }
     }
 
+    this.db.resolveWorkspaceRelationships();
+    this.db.persist();
     const dbStats = this.db.getStats();
     const stats: GraphStats = {
       ...dbStats,

@@ -36,7 +36,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ── 1. Boot all services ──────────────────────────────────────────────────
 
-  db             = new GraphDB(context.globalStorageUri.fsPath);
+  const activeWorkspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  const graphStoragePath = activeWorkspaceRoot
+    ? path.join(activeWorkspaceRoot, '.codelens')
+    : context.globalStorageUri.fsPath;
+
+  db             = new GraphDB(graphStoragePath);
   parser         = new ASTParser();
   scanner        = new WorkspaceScanner(parser, db);
   fileWatcher    = new FileWatcher(scanner);
@@ -190,7 +195,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const config = fs.readFileSync(mcpConfigPath, 'utf-8');
       vscode.env.clipboard.writeText(config);
-      vscode.window.showInformationMessage('MCP config copied! Paste into ~/.claude.json or .cursor/mcp.json');
+      vscode.window.showInformationMessage(
+        'MCP config copied! Use the relevant section for .vscode/mcp.json, ~/.claude.json, or .cursor/mcp.json'
+      );
     }),
 
     // Regenerate just the skill files (no rescan)
@@ -230,7 +237,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
 
     fsWatcher.onDidDelete(uri => {
+      const removedSymbols = db.getNodesByFile(uri.fsPath)
+        .filter(node => node.type !== 'file' && node.type !== 'import')
+        .map(node => node.name);
       db.deleteNodesByFile(uri.fsPath);
+      db.resolveWorkspaceRelationships(uri.fsPath, removedSymbols);
       db.persist();
       refreshGraphPanel();
     });
