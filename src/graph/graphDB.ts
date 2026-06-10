@@ -85,7 +85,15 @@ export class GraphDB {
   }
 
   async init(): Promise<void> {
-    this.SQL = await initSqlJs();
+    // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
+    const wasmDir = (() => {
+      const distWasm = require('path').join(__dirname, 'wasm');
+      const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
+      return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
+    })();
+    this.SQL = await initSqlJs({
+      locateFile: (file: string) => require('path').join(wasmDir, file),
+    });
     if (fs.existsSync(this.dbPath)) {
       const data = fs.readFileSync(this.dbPath);
       this.db = new this.SQL.Database(data);

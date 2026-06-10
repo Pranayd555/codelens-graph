@@ -1,6 +1,21 @@
-.vscode/**
+# Everything excluded by default, then we whitelist what's needed
+
+# Source and build artifacts not needed at runtime
 src/**
-.gitignore
+out/**
+.vscode-test/**
+.github/**
+esbuild.js
 tsconfig.json
-**/*.ts
-!out/**
+*.vsix
+*.map
+.eslintrc*
+.prettierrc*
+
+# Exclude ALL of node_modules — the dist/ bundles include everything needed
+node_modules/**
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log

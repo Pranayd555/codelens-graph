@@ -146,16 +146,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const agentCtx = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget);
       const injection = contextBuilder.buildSystemPromptInjection(agentCtx);
 
-      // Write to a temp file the agent can read
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-      if (workspaceRoot) {
-        const outPath = path.join(workspaceRoot, '.codelens', 'agent-context.md');
-        const fs = require('fs');
-        fs.mkdirSync(path.dirname(outPath), { recursive: true });
-        fs.writeFileSync(outPath, injection, 'utf-8');
-      }
-
-      // Also show in editor so agent can read it inline
+      // Show in editor — context is returned directly, no file write needed
       const doc = await vscode.workspace.openTextDocument({
         language: 'markdown',
         content: injection,
@@ -198,6 +189,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.window.showInformationMessage(
         'MCP config copied! Use the relevant section for .vscode/mcp.json, ~/.claude.json, or .cursor/mcp.json'
       );
+    }),
+
+    // Regenerate skill files
+    vscode.commands.registerCommand('codelens-graph.regenerateSkills', () => {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { return; }
+      const dbStats = db.getStats();
+      const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
+      const written = skillGenerator.generateAll(workspaceRoot, stats);
+      vscode.window.showInformationMessage('CodeLens: Skills regenerated to ' + written.join(', '));
     }),
 
     // Regenerate just the skill files (no rescan)

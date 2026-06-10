@@ -5,6 +5,39 @@ import { ContextBuilder } from '../context/contextBuilder';
 import { FileClassifier } from '../context/fileClassifier';
 import { GraphNode }      from '../types';
 
+// ─── Task tier classifier ─────────────────────────────────────────────────────
+// Determines the minimum CodeLens tooling required for a task, preventing
+// agents from pulling full context for trivial edits.
+
+interface TierResult {
+  tier: 1 | 2 | 3 | 4;
+  label: string;
+  cost: string;
+  nextTool: string | null;
+  instruction: string;
+}
+
+function classifyTask(task: string): TierResult {
+  const t = task.toLowerCase();
+
+  if (/fix.*typo|spelling|add.*comment|format|indent|rename.*variable.*this|change.*string|update.*text|^what (is|does)|^explain|^describe/.test(t)) {
+    return { tier: 1, label: 'Local edit', cost: '0 tokens', nextTool: null,
+      instruction: 'No CodeLens call needed. Work directly on the open file.' };
+  }
+  if (/where is|find.*function|find.*class|locate|which file|what.*returns|signature of|definition of|import path/.test(t)) {
+    return { tier: 2, label: 'Symbol lookup', cost: '~50 tokens', nextTool: 'codelens_search',
+      instruction: 'Call codelens_search only. After it returns, read ONLY that file:line range — not the whole file.' };
+  }
+  if (/refactor|rename.*everywhere|move.*to|extract|delete|remove|change.*signature|update.*all.*call|migrate|replace.*across/.test(t)) {
+    return { tier: 4, label: 'Cross-file refactor', cost: '~600-1200 tokens', nextTool: 'codelens_context+codelens_impact',
+      instruction: 'Call codelens_context then codelens_impact. Read only files the graph specifies.' };
+  }
+  return { tier: 3, label: 'Feature / bug fix', cost: '~200-500 tokens', nextTool: 'codelens_context',
+    instruction: 'Call codelens_context with your task. Read only the file:line locations it returns. Do not call codelens_impact.' };
+}
+
+// ─── MCPServer ────────────────────────────────────────────────────────────────
+
 export class MCPServer {
   private server: any;
   private transport: any;
@@ -23,58 +56,110 @@ export class MCPServer {
       { name: 'codelens-graph', version: '0.1.0' },
       {
         instructions:
-          'CodeLens Graph is an on-demand full-codebase index. Do not call its tools automatically ' +
-          'at the start of a task and do not request broad context when the relevant files or symbols ' +
-          'are already known. Use it for codebase-wide symbol or file discovery, architecture search, ' +
-          'call relationships, duplicate detection, and refactor impact analysis. Begin with the ' +
-          'smallest focused query, then inspect only the source files needed to complete the task.',
+          'MANDATORY: Use CodeLens Graph tools for ALL codebase discovery. ' +
+          'NEVER use grep, find, ls, or read_file to discover symbols, file structure, ' +
+          'or call relationships — CodeLens provides this instantly and at a fraction of the token cost. ' +
+          'WORKFLOW: (1) call codelens_triage first for every task — it tells you the minimum tool needed. ' +
+          '(2) Use only the tool codelens_triage recommends. ' +
+          '(3) Read ONLY the specific file:line locations CodeLens returns — never whole files. ' +
+          '(4) Before creating any file or function, call codelens_search to verify it does not already exist. ' +
+          'Token budget: codelens_triage=10, codelens_search=50, codelens_context=200-500, codelens_impact=600-1200. ' +
+          'Skipping CodeLens for "small" tasks is forbidden — triage costs only 10 tokens and prevents all duplicates.',
       }
     );
 
-    // ── codelens_search ───────────────────────────────────────────────────
+    // ── codelens_triage ───────────────────────────────────────────────────────
+    this.server.tool(
+      'codelens_triage',
+      'CALL THIS FIRST before any file operation or other CodeLens tool. ' +
+      'Classifies the task into 4 tiers and returns the single minimum tool needed — or confirms ' +
+      'no CodeLens call is required at all. Costs ~10 tokens. ' +
+      'Tier 1 (typo/comment/format): no CodeLens needed. ' +
+      'Tier 2 (find a symbol): codelens_search only. ' +
+      'Tier 3 (feature/bugfix): codelens_context only. ' +
+      'Tier 4 (refactor/rename/cross-file): codelens_context + codelens_impact.',
+      { task: z.string().describe('What you are about to do, in plain English') },
+      async ({ task }: { task: string }) => {
+        const r     = classifyTask(task);
+        const stats = this.db.getStats();
+        const lines = [
+          `## CodeLens Triage`,
+          `Task: "${task}"`,
+          `Tier ${r.tier} — ${r.label} | Cost: ${r.cost}`,
+          `Action: ${r.instruction}`,
+          '',
+          r.tier === 1
+            ? '✅ No CodeLens call needed. Proceed directly.'
+            : `→ Next call: \`${r.nextTool}\``,
+          '',
+          `Graph: ${stats.totalNodes} symbols · ${stats.fileCount} files`,
+        ];
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+      }
+    );
+
+    // ── codelens_search ───────────────────────────────────────────────────────
     this.server.tool(
       'codelens_search',
-      'Search the full indexed codebase for symbols when the definition or file is unknown, ' +
-      'or when checking whether functionality already exists. Returns compact file:line matches. ' +
-      'Do not call for a file or symbol whose exact location is already known.',
-      { query: z.string(), limit: z.number().optional().default(15) },
+      'Search the full codebase for any symbol by name. ' +
+      'Use for Tier 2 tasks or to verify a symbol does not already exist before creating it. ' +
+      'Returns exact file:line + signature. ' +
+      'After this, read ONLY the specific line range returned — never the whole file.',
+      { query: z.string(), limit: z.number().optional().default(10) },
       async ({ query, limit }: { query: string; limit?: number }) => {
-        const results = this.db.searchNodes(query, limit ?? 15);
+        this.db.refreshFromDiskIfChanged();
+        const results = this.db.searchNodes(query, limit ?? 10);
         if (!results.length) {
-          return { content: [{ type: 'text' as const, text: `No symbols found matching "${query}"` }] };
+          return { content: [{ type: 'text' as const, text: `No symbols found matching "${query}". Safe to create.` }] };
         }
-        const text = [`Found ${results.length} symbols:`, '',
-          ...results.map(n => this.fmtNode(n, workspaceRoot))].join('\n');
+        const text = [
+          `Found ${results.length} symbol(s) matching "${query}":`,
+          '',
+          ...results.map(n => this.fmtNode(n, workspaceRoot)),
+          '',
+          '→ Read only the specific line(s) above.',
+        ].join('\n');
         return { content: [{ type: 'text' as const, text }] };
       }
     );
 
-    // ── codelens_context ──────────────────────────────────────────────────
+    // ── codelens_context ──────────────────────────────────────────────────────
     this.server.tool(
       'codelens_context',
-      'On-demand context search across the codebase. Use only for broad exploration, unfamiliar ' +
-      'architecture, cross-cutting work, or tasks whose relevant files and symbols are unknown. ' +
-      'Do not call automatically at task start or for targeted questions about known files or symbols. ' +
-      'Prefer codelens_search for discovery and focused graph tools for relationships or impact.',
-      { task: z.string(), max_depth: z.number().optional().default(2), max_tokens: z.number().optional().default(3000) },
+      'Get compressed codebase context for a feature or bugfix task (Tier 3). ' +
+      'Returns: relevant symbols with code snippets, exact file:line, import paths, ' +
+      'call relationships, file categories, duplicate warnings, and pre-diagnosed errors. ' +
+      'ONE call replaces reading 3-10 files. ' +
+      'After this, read ONLY the file:line locations specified — nothing more.',
+      {
+        task:       z.string(),
+        max_depth:  z.number().optional().default(2),
+        max_tokens: z.number().optional().default(2500),
+      },
       async ({ task, max_depth, max_tokens }: { task: string; max_depth?: number; max_tokens?: number }) => {
-        const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 3000);
+        this.db.refreshFromDiskIfChanged();
+        const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500);
         const output = this.contextBuilder.buildSystemPromptInjection(ctx);
-        const header = `## CodeLens: "${task}"\nSymbols: ${ctx.subgraph.nodes.length} | ~${ctx.tokenEstimate} tokens\n\n`;
+        const header = [
+          `## CodeLens Context: "${task}"`,
+          `Symbols: ${ctx.subgraph.nodes.length} | ~${ctx.tokenEstimate} tokens`,
+          `⚠ Read ONLY the file:line combinations listed — not whole files.`,
+          '',
+        ].join('\n');
         return { content: [{ type: 'text' as const, text: header + output }] };
       }
     );
 
-    // ── codelens_callers ──────────────────────────────────────────────────
+    // ── codelens_callers ──────────────────────────────────────────────────────
     this.server.tool(
       'codelens_callers',
-      'Query the full graph for direct callers of a symbol. Use when call-site coverage matters, ' +
-      'especially before changing a shared API. Do not call for isolated edits with known consumers.',
+      'Find all callers of a function. Use for Tier 4 tasks before modifying a shared API.',
       { symbol: z.string() },
       async ({ symbol }: { symbol: string }) => {
+        this.db.refreshFromDiskIfChanged();
         const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!targets.length) {
-          return { content: [{ type: 'text' as const, text: `"${symbol}" not found` }] };
+          return { content: [{ type: 'text' as const, text: `"${symbol}" not found in graph` }] };
         }
         const lines: string[] = [];
         for (const t of targets) {
@@ -83,20 +168,20 @@ export class MCPServer {
           lines.push(`## ${t.name} @ ${this.rel(t.filePath, workspaceRoot)}:${t.line}`);
           lines.push(callers.length
             ? callers.map(c => `  - ${this.fmtNode(c, workspaceRoot)}`).join('\n')
-            : '  No callers found.');
+            : '  No callers found in indexed codebase.');
           lines.push('');
         }
         return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
       }
     );
 
-    // ── codelens_callees ──────────────────────────────────────────────────
+    // ── codelens_callees ──────────────────────────────────────────────────────
     this.server.tool(
       'codelens_callees',
-      'Query the full graph for a symbol\'s direct dependencies. Use when its dependency chain is ' +
-      'needed; do not call merely to inspect an already-known implementation.',
+      'Find all functions a symbol calls. Use for Tier 4 or when understanding dependencies.',
       { symbol: z.string() },
       async ({ symbol }: { symbol: string }) => {
+        this.db.refreshFromDiskIfChanged();
         const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!targets.length) {
           return { content: [{ type: 'text' as const, text: `"${symbol}" not found` }] };
@@ -115,13 +200,13 @@ export class MCPServer {
       }
     );
 
-    // ── codelens_impact ───────────────────────────────────────────────────
+    // ── codelens_impact ───────────────────────────────────────────────────────
     this.server.tool(
       'codelens_impact',
-      'Search the graph for the transitive impact radius of changing a symbol. Use for refactors, ' +
-      'public API changes, or shared behavior; avoid it for small local edits.',
+      'Full impact radius of changing a symbol. Use for Tier 4 refactors ONLY — not bugfixes.',
       { symbol: z.string(), depth: z.number().optional().default(3) },
       async ({ symbol, depth }: { symbol: string; depth?: number }) => {
+        this.db.refreshFromDiskIfChanged();
         const targets = this.db.searchNodes(symbol, 3).filter(n => n.name === symbol);
         if (!targets.length) {
           return { content: [{ type: 'text' as const, text: `"${symbol}" not found` }] };
@@ -144,13 +229,14 @@ export class MCPServer {
       }
     );
 
-    // ── codelens_node ─────────────────────────────────────────────────────
+    // ── codelens_node ─────────────────────────────────────────────────────────
     this.server.tool(
       'codelens_node',
-      'Get compact indexed details for one known symbol. Request with_snippet=true only when a short ' +
-      'source excerpt can avoid a file read; otherwise keep the default metadata-only response.',
+      'Get full details + code snippet for one symbol. ' +
+      'Use instead of read_file when you need to inspect a single function body.',
       { symbol: z.string(), with_snippet: z.boolean().optional().default(false) },
       async ({ symbol, with_snippet }: { symbol: string; with_snippet?: boolean }) => {
+        this.db.refreshFromDiskIfChanged();
         const results = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!results.length) {
           return { content: [{ type: 'text' as const, text: `"${symbol}" not found` }] };
@@ -168,8 +254,8 @@ export class MCPServer {
           if (importStmt) { lines.push(`- **Import as:** \`${importStmt}\``); }
           const callerCount = this.db.getEdgesTo(node.id, 'calls').length;
           const calleeCount = this.db.getEdgesFrom(node.id, 'calls').length;
-          if (callerCount) { lines.push(`- **Callers:** ${callerCount} (run codelens_callers)`); }
-          if (calleeCount) { lines.push(`- **Callees:** ${calleeCount} (run codelens_callees)`); }
+          if (callerCount) { lines.push(`- **Callers:** ${callerCount} (run codelens_callers for list)`); }
+          if (calleeCount) { lines.push(`- **Callees:** ${calleeCount} (run codelens_callees for list)`); }
           if (node.undefinedRefs?.length) {
             lines.push(`- **⚠️ Undefined refs:** \`${node.undefinedRefs.join('`, `')}\``);
           }
@@ -183,22 +269,24 @@ export class MCPServer {
       }
     );
 
-    // ── codelens_files ────────────────────────────────────────────────────
+    // ── codelens_files ────────────────────────────────────────────────────────
     this.server.tool(
       'codelens_files',
-      'Search the indexed file structure by category or filename across the full codebase. Use when ' +
-      'project layout or candidate files are unknown. Supply filter whenever possible and do not call ' +
-      'to list files already known from the task or prior results.',
+      'File structure grouped by category (routes, services, models, templates, utils…). ' +
+      'Use instead of ls/find/directory scanning. Supply filter to narrow results.',
       { filter: z.string().optional() },
       async ({ filter }: { filter?: string }) => {
+        this.db.refreshFromDiskIfChanged();
         const classifier = new FileClassifier();
         const allFiles   = this.db.getAllFiles();
         const groups     = classifier.groupFiles(allFiles);
         const stats      = this.db.getStats();
-        const lines      = [`## Workspace (${allFiles.length} files, ${stats.totalNodes} symbols)`, ''];
+        const lines      = [`## Workspace (${allFiles.length} files · ${stats.totalNodes} symbols)`, ''];
         for (const [label, files] of groups) {
           if (filter && !label.toLowerCase().includes(filter.toLowerCase()) &&
-              !files.some(f => path.basename(f).toLowerCase().includes(filter.toLowerCase()))) { continue; }
+              !files.some(f => path.basename(f).toLowerCase().includes(filter.toLowerCase()))) {
+            continue;
+          }
           lines.push(`### ${label} (${files.length})`);
           lines.push(...files.map(f => `  - ${this.rel(f, workspaceRoot)}`));
           lines.push('');
@@ -207,16 +295,16 @@ export class MCPServer {
       }
     );
 
-    // ── codelens_status ───────────────────────────────────────────────────
+    // ── codelens_status ───────────────────────────────────────────────────────
     this.server.tool(
       'codelens_status',
-      'Check index freshness and graph health when CodeLens results appear missing or stale. ' +
-      'Do not call during normal task execution.',
+      'Graph health and statistics. Call when results seem missing or stale.',
       {},
       async () => {
-        const stats    = this.db.getStats();
-        const issues   = this.db.getNodesWithUndefinedRefs().length;
-        const text = [
+        this.db.refreshFromDiskIfChanged();
+        const stats  = this.db.getStats();
+        const issues = this.db.getNodesWithUndefinedRefs().length;
+        const text   = [
           `## CodeLens Status`,
           `- Files indexed: ${stats.fileCount}`,
           `- Total symbols: ${stats.totalNodes}`,
@@ -230,12 +318,14 @@ export class MCPServer {
 
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
-    console.error('[CodeLens MCP] Server ready on stdio');
+    console.error('[CodeLens MCP] Server ready — 9 tools on stdio');
   }
 
   async stop(): Promise<void> {
     try { await this.server?.close(); } catch { /* ignore */ }
   }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
   private rel(fp: string, root: string): string {
     return path.relative(root, fp).replace(/\\/g, '/');

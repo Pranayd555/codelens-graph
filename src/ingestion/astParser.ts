@@ -176,18 +176,29 @@ export class TreeSitterParser {
   private initialised = false;
 
   constructor(wasmDir?: string) {
-    // Default: look next to this file's compiled output, or in node_modules
-    this.wasmDir = wasmDir
-      ?? path.join(__dirname, '..', '..', 'node_modules', 'tree-sitter-wasms', 'out');
+    if (wasmDir) {
+      this.wasmDir = wasmDir;
+    } else {
+      // When bundled with esbuild: __dirname = dist/, WASM files are in dist/wasm/
+      // When running from tsc: __dirname = out/ingestion/, fall back to node_modules
+      const distWasm = path.join(__dirname, 'wasm');
+      const nodeModulesWasm = path.join(__dirname, '..', '..', 'node_modules', 'tree-sitter-wasms', 'out');
+      this.wasmDir = require('fs').existsSync(distWasm) ? distWasm : nodeModulesWasm;
+    }
   }
 
   async init(): Promise<void> {
     if (this.initialised) { return; }
     try {
-      // Dynamic require so it doesn't crash when WASM isn't present
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const Parser = require('web-tree-sitter');
-      await Parser.init();
+      // Resolve tree-sitter.wasm — in dist/wasm/ when bundled, otherwise node_modules
+      const treeSitterWasm = require('path').join(this.wasmDir, 'tree-sitter.wasm');
+      const fallbackWasm   = require('path').join(
+        require('path').dirname(require.resolve('web-tree-sitter')), 'tree-sitter.wasm'
+      );
+      const wasmPath = require('fs').existsSync(treeSitterWasm) ? treeSitterWasm : fallbackWasm;
+      await Parser.init({ locateFile: () => wasmPath });
       this.Parser = Parser;
       this.initialised = true;
     } catch (e) {

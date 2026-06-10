@@ -1,22 +1,8 @@
-# Compiled output
 out/
+dist/
 *.vsix
-
-# Dependencies
 node_modules/
-
-# VS Code extension test output
 .vscode-test/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Local DB (each developer gets their own)
 *.db
-
-# Env
 .env
-
-# CodeLens Graph (local index)
 .codelens/

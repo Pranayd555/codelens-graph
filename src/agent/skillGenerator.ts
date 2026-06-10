@@ -140,7 +140,9 @@ export class SkillGenerator {
   }
 
   private getMcpEntryPath(): string {
-    return this.toConfigPath(path.resolve(__dirname, '..', 'mcp', 'mcpEntry.js'));
+    // __dirname at runtime = the dist/ folder (esbuild output)
+    // dist/mcp.js is the bundled MCP entry point
+    return this.toConfigPath(path.resolve(__dirname, 'mcp.js'));
   }
 
   private toConfigPath(filePath: string): string {
