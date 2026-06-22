@@ -69,6 +69,10 @@
       {
         "command": "codelens-graph.copyMcpConfig",
         "title": "CodeLens: Copy MCP Config to Clipboard"
+      },
+      {
+        "command": "codelens-graph.showMcpUsage",
+        "title": "CodeLens: Show MCP Usage Report"
       }
     ],
     "viewsContainers": {
@@ -115,9 +119,47 @@
             "**/node_modules/**",
             "**/dist/**",
             "**/build/**",
+            "**/out/**",
+            "**/output/**",
+            "**/bundle/**",
+            "**/.next/**",
+            "**/.nuxt/**",
+            "**/.svelte-kit/**",
+            "**/.vite/**",
+            "**/.turbo/**",
+            "**/.parcel-cache/**",
+            "**/.cache/**",
+            "**/.angular/**",
+            "**/coverage/**",
+            "**/.nyc_output/**",
+            "**/playwright-report/**",
+            "**/test-results/**",
+            "**/__pycache__/**",
+            "**/.venv/**",
+            "**/venv/**",
+            "**/.pytest_cache/**",
+            "**/.mypy_cache/**",
+            "**/site-packages/**",
+            "**/*.egg-info/**",
+            "**/vendor/**",
+            "**/target/**",
+            "**/.gradle/**",
+            "**/.m2/**",
+            "**/obj/**",
             "**/.git/**",
-            "**/.codelens/**"
-          ]
+            "**/.hg/**",
+            "**/.svn/**",
+            "**/.idea/**",
+            "**/.vs/**",
+            "**/.vscode/**",
+            "**/.cursor/**",
+            "**/.trae/**",
+            "**/.codelens/**",
+            "**/DerivedData/**",
+            "**/xcuserdata/**",
+            "**/.build/**"
+          ],
+          "description": "Glob patterns for directories and files to exclude from graph indexing."
         },
         "codeLensGraph.supportedExtensions": {
           "type": "array",
@@ -149,7 +191,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.43",
     "@types/sql.js": "^1.4.9",
     "@types/vscode": "^1.95.0",
     "esbuild": "^0.25.0",

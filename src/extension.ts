@@ -11,6 +11,7 @@ import { GraphDiffer }        from './graph/differ';
 import { SkillGenerator }     from './agent/skillGenerator';
 import { BackgroundScanner }  from './agent/backgroundScanner';
 import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
+import { readRecentLogs, formatUsageReport } from './mcp/mcpLogger';
 import { StatsViewProvider }   from './ui/statsView';
 import { GraphStats }         from './types';
 
@@ -86,17 +87,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statsViewProvider?.refresh();
   });
 
-  backgroundScanner.onSkills(written => {
-    // Notify first time with MCP config instructions
-    const shownKey = 'codelens.mcpNotified';
-    if (!context.globalState.get(shownKey)) {
+  backgroundScanner.onSkills(_written => {
+    // Show MCP setup notification on first install (when graph was empty before scan)
+    const shownKey = 'codelens.mcpNotified.v2';
+    const stats = db.getStats();
+    if (!context.globalState.get(shownKey) && stats.totalNodes > 0) {
       context.globalState.update(shownKey, true);
       vscode.window.showInformationMessage(
-        `CodeLens Graph ready: ${db.getStats().totalNodes} symbols indexed. ` +
-        `Connect your AI agent via MCP — see .codelens/README.md`,
-        'Copy MCP Config', 'Show Graph'
+        `CodeLens Graph: ${stats.totalNodes} symbols indexed across ${stats.fileCount} files. ` +
+        `MCP server config written to .vscode/mcp.json`,
+        'Copy Full Config', 'Show Graph'
       ).then(choice => {
-        if (choice === 'Copy MCP Config') {
+        if (choice === 'Copy Full Config') {
           vscode.commands.executeCommand('codelens-graph.copyMcpConfig');
         } else if (choice === 'Show Graph') {
           showGraphPanel(context);
@@ -191,17 +193,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     }),
 
-    // Regenerate skill files
-    vscode.commands.registerCommand('codelens-graph.regenerateSkills', () => {
+    // View MCP usage report — shows how agents are using CodeLens tools
+    vscode.commands.registerCommand('codelens-graph.viewMcpUsage', async () => {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-      if (!workspaceRoot) { return; }
-      const dbStats = db.getStats();
-      const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
-      const written = skillGenerator.generateAll(workspaceRoot, stats);
-      vscode.window.showInformationMessage('CodeLens: Skills regenerated to ' + written.join(', '));
+      if (!workspaceRoot) {
+        vscode.window.showWarningMessage('No workspace folder open.');
+        return;
+      }
+      const logs   = readRecentLogs(workspaceRoot, 200);
+      const report = formatUsageReport(logs);
+      const doc    = await vscode.workspace.openTextDocument({ language: 'markdown', content: report });
+      await vscode.window.showTextDocument(doc);
     }),
 
-    // Regenerate just the skill files (no rescan)
+    // Show MCP usage report — how agent used the server, token savings
+    vscode.commands.registerCommand('codelens-graph.showMcpUsage', async () => {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { vscode.window.showWarningMessage('No workspace open.'); return; }
+      const logs   = readRecentLogs(workspaceRoot, 200);
+      const report = formatUsageReport(logs);
+      const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: report });
+      await vscode.window.showTextDocument(doc);
+    }),
+
+    // Regenerate skill/MCP config files (no rescan)
     vscode.commands.registerCommand('codelens-graph.regenerateSkills', () => {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
       if (!workspaceRoot) { return; }
@@ -221,9 +236,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (cfg.autoRebuildOnSave && workspaceRoot) {
     const fsWatcher = vscode.workspace.createFileSystemWatcher(`**/*{${supported}}`);
 
+    // Guard: skip any path inside an excluded directory so hot-saves in
+    // node_modules / dist / .angular etc never trigger a re-index.
+    const isExcludedPath = (fsPath: string): boolean => {
+      const rel = path.relative(workspaceRoot, fsPath).replace(/\\/g, '/');
+      const FAST_EXCLUDE = /node_modules|[/\\]\.codelens[/\\]|[/\\]\.angular[/\\]|[/\\]\.next[/\\]|[/\\]\.nuxt[/\\]|[/\\]\.vite[/\\]|[/\\]\.turbo[/\\]|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]|[/\\]\.trae[/\\]|[/\\]\.cursor[/\\]|__pycache__|[/\\]\.venv[/\\]|[/\\]target[/\\]|[/\\]vendor[/\\]/;
+      return FAST_EXCLUDE.test(rel);
+    };
+
     fsWatcher.onDidChange(async uri => {
-      // Skip files inside .codelens/ to avoid self-triggering
-      if (uri.fsPath.includes('.codelens')) { return; }
+      if (isExcludedPath(uri.fsPath)) { return; }
       await backgroundScanner.handleFileChanged(uri.fsPath, workspaceRoot, {
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
@@ -232,7 +254,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
 
     fsWatcher.onDidCreate(async uri => {
-      if (uri.fsPath.includes('.codelens')) { return; }
+      if (isExcludedPath(uri.fsPath)) { return; }
       await fileWatcher.handleFileCreate(uri.fsPath);
       refreshGraphPanel();
     });
@@ -256,14 +278,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const stats = db.getStats();
 
     if (stats.totalNodes === 0) {
-      // First time: scan immediately (with a small delay to not block VS Code startup)
+      // First install: show scanning status immediately so user knows it's working
+      setStatus('scanning');
       backgroundScanner.scheduleInitialScan(workspaceRoot, {
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
       }, context);
     } else {
-      // Already have a graph: just regenerate skills (fast, no rescan needed)
+      // Already have a graph — refresh skills and show ready
       setStatus('ready', stats.totalNodes, stats.totalEdges);
+      statsViewProvider?.refresh();
       const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
       skillGenerator.generateAll(workspaceRoot, fullStats);
       console.log(`[CodeLens] Existing graph loaded: ${stats.totalNodes} nodes. Skills refreshed.`);
@@ -333,21 +357,38 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
 
 // ─── showGraphPanel ───────────────────────────────────────────────────────────
 
+function buildGraphWebviewData() {
+  const allFiles = db.getAllFiles();
+  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
+  const edgeMap  = new Map<string, import('./types').GraphEdge>();
+  for (const n of allNodes) {
+    for (const e of db.getEdgesFrom(n.id)) { edgeMap.set(e.id, e); }
+    for (const e of db.getEdgesTo(n.id))   { edgeMap.set(e.id, e); }
+  }
+  return toWebviewData(allNodes, [...edgeMap.values()]);
+}
+
 function showGraphPanel(context: vscode.ExtensionContext): void {
-  if (graphPanel) { graphPanel.reveal(); return; }
+  if (graphPanel) {
+    graphPanel.reveal(vscode.ViewColumn.Beside, false);
+    return;
+  }
 
   graphPanel = vscode.window.createWebviewPanel(
     'codelens-graph', 'CodeLens Graph',
-    vscode.ViewColumn.Beside,
-    { enableScripts: true, retainContextWhenHidden: true }
+    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+    {
+      enableScripts: true,
+      // retainContextWhenHidden keeps JS state (zoom, position, filter)
+      // when the panel is hidden — critical for re-focus not losing data
+      retainContextWhenHidden: true,
+      localResourceRoots: [context.extensionUri],
+    }
   );
 
-  const allFiles = db.getAllFiles();
-  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
-  const allEdges = allNodes.flatMap(n => db.getEdgesFrom(n.id));
-  const nonce    = crypto.randomBytes(16).toString('hex');
-
-  graphPanel.webview.html = getGraphPanelHtml(toWebviewData(allNodes, allEdges), nonce);
+  const nonce   = crypto.randomBytes(16).toString('hex');
+  const initial = buildGraphWebviewData();
+  graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
 
   graphPanel.webview.onDidReceiveMessage(msg => {
     if (msg.command === 'openFile' && msg.filePath) {
@@ -358,17 +399,35 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
         )
       });
     }
+    if (msg.command === 'buildGraph') {
+      vscode.commands.executeCommand('codelens-graph.buildGraph');
+    }
+    if (msg.command === 'ready') {
+      // Webview JS finished loading and registered its listener.
+      // Push fresh data — this is the reliable handshake pattern.
+      const data = buildGraphWebviewData();
+      graphPanel?.webview.postMessage({ command: 'updateGraph', ...data });
+    }
+  });
+
+  // Re-push data whenever panel becomes visible (tab switch, editor layout change)
+  graphPanel.onDidChangeViewState(e => {
+    if (e.webviewPanel.visible) {
+      setTimeout(() => {
+        if (!graphPanel) { return; }
+        const data = buildGraphWebviewData();
+        graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
+      }, 120);
+    }
   });
 
   graphPanel.onDidDispose(() => { graphPanel = undefined; });
 }
 
 function refreshGraphPanel(): void {
-  if (!graphPanel) { return; }
-  const allFiles = db.getAllFiles();
-  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
-  const allEdges = allNodes.flatMap(n => db.getEdgesFrom(n.id));
-  graphPanel.webview.postMessage({ command: 'updateGraph', ...toWebviewData(allNodes, allEdges) });
+  if (!graphPanel?.visible) { return; }
+  const data = buildGraphWebviewData();
+  graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
 }
 
 // ─── showContextPreview ───────────────────────────────────────────────────────
@@ -453,14 +512,31 @@ async function detectRecentlyChangedFiles(workspaceRoot: string): Promise<string
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Hard-coded fallback used when user has not customised the setting.
+// Kept in sync with ALWAYS_EXCLUDE_DIRS in workspaceScanner.ts so the
+// VS Code file-watcher also ignores the same paths.
+const DEFAULT_EXCLUDE_PATTERNS = [
+  '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
+  '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
+  '**/.turbo/**', '**/.parcel-cache/**', '**/.cache/**', '**/.angular/**',
+  '**/coverage/**', '**/.nyc_output/**', '**/playwright-report/**', '**/test-results/**',
+  '**/__pycache__/**', '**/.venv/**', '**/venv/**', '**/.pytest_cache/**',
+  '**/.mypy_cache/**', '**/site-packages/**', '**/*.egg-info/**',
+  '**/vendor/**', '**/target/**', '**/.gradle/**', '**/.m2/**', '**/obj/**',
+  '**/.git/**', '**/.hg/**', '**/.svn/**', '**/.idea/**', '**/.vs/**',
+  '**/.vscode/**', '**/.cursor/**', '**/.trae/**', '**/.codelens/**',
+  '**/DerivedData/**', '**/xcuserdata/**', '**/.build/**',
+];
+
 function getConfig() {
   const cfg = vscode.workspace.getConfiguration('codeLensGraph');
   return {
     autoRebuildOnSave:   cfg.get<boolean>('autoRebuildOnSave', true),
     maxGraphDepth:       cfg.get<number>('maxGraphDepth', 2),
     maxTokenBudget:      cfg.get<number>('maxTokenBudget', 2000),
-    excludePatterns:     cfg.get<string[]>('excludePatterns',     ['**/node_modules/**','**/dist/**','**/build/**','**/.git/**','**/out/**','**/.codelens/**']),
-    supportedExtensions: cfg.get<string[]>('supportedExtensions', ['.ts','.tsx','.js','.jsx','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php']),
+    excludePatterns:     cfg.get<string[]>('excludePatterns', DEFAULT_EXCLUDE_PATTERNS),
+    supportedExtensions: cfg.get<string[]>('supportedExtensions',
+      ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt']),
   };
 }
 

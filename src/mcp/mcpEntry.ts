@@ -65,9 +65,27 @@ async function main() {
     const parser  = new ASTParser();
     const scanner = new WorkspaceScanner(parser, db);
 
+    // Use the same comprehensive exclude list as the VS Code extension.
+    // The ALWAYS_EXCLUDE_DIRS set in workspaceScanner handles dot-dirs and
+    // build folders automatically — these patterns add explicit belt+braces.
     await scanner.scanWorkspace([workspaceRoot], {
-      excludePatterns:     ['**/node_modules/**','**/dist/**','**/build/**','**/.git/**','**/out/**','**/.codelens/**'],
-      supportedExtensions: ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt'],
+      excludePatterns: [
+        '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
+        '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
+        '**/.turbo/**', '**/.parcel-cache/**', '**/.cache/**', '**/.angular/**',
+        '**/coverage/**', '**/.nyc_output/**', '**/playwright-report/**', '**/test-results/**',
+        '**/__pycache__/**', '**/.venv/**', '**/venv/**', '**/.pytest_cache/**',
+        '**/.mypy_cache/**', '**/site-packages/**', '**/*.egg-info/**',
+        '**/vendor/**', '**/target/**', '**/.gradle/**', '**/.m2/**', '**/obj/**',
+        '**/.git/**', '**/.hg/**', '**/.svn/**', '**/.idea/**', '**/.vs/**',
+        '**/.vscode/**', '**/.cursor/**', '**/.trae/**', '**/.codelens/**',
+        '**/DerivedData/**', '**/xcuserdata/**', '**/.build/**',
+      ],
+      supportedExtensions: [
+        '.ts','.tsx','.js','.jsx','.mjs',
+        '.py','.go','.rs','.java','.cs',
+        '.cpp','.c','.rb','.php','.swift','.kt',
+      ],
     });
 
     const newStats = db.getStats();

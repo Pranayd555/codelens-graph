@@ -1,12 +1,39 @@
-const esbuild  = require('esbuild');
-const path     = require('path');
-const fs       = require('fs');
+const esbuild = require('esbuild');
+const path    = require('path');
+const fs      = require('fs');
 
 const production = process.argv.includes('--production');
 const watch      = process.argv.includes('--watch');
 
-// ─── Shared options ───────────────────────────────────────────────────────────
-const sharedOptions = {
+// ── Copy WASM files to dist/wasm/ ─────────────────────────────────────────────
+function copyWasmFiles() {
+  const dest = path.join(__dirname, 'dist', 'wasm');
+  fs.mkdirSync(dest, { recursive: true });
+
+  const sources = [
+    path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm'),
+    path.join(__dirname, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm'),
+  ];
+
+  const grammarDir = path.join(__dirname, 'node_modules', 'tree-sitter-wasms', 'out');
+  if (fs.existsSync(grammarDir)) {
+    for (const f of fs.readdirSync(grammarDir)) {
+      if (f.endsWith('.wasm')) { sources.push(path.join(grammarDir, f)); }
+    }
+  }
+
+  let copied = 0;
+  for (const src of sources) {
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, path.join(dest, path.basename(src)));
+      copied++;
+    }
+  }
+  console.log(`Copied ${copied} WASM files → dist/wasm/`);
+}
+
+// ── Shared build options ──────────────────────────────────────────────────────
+const shared = {
   bundle:    true,
   platform:  'node',
   target:    'node20',
@@ -16,103 +43,57 @@ const sharedOptions = {
   logLevel:  'info',
 };
 
-// ─── Copy WASM files needed at runtime ───────────────────────────────────────
-// sql.js, web-tree-sitter, and tree-sitter-wasms all load .wasm files from
-// disk at runtime — esbuild cannot inline them. We copy them into dist/ so
-// the packaged extension finds them relative to the bundle.
+// ── Post-build: make mcp.js executable ────────────────────────────────────────
+// esbuild banner adds shebang INSIDE the JS which breaks require().
+// Instead we write a tiny launcher wrapper after the bundle is built.
+function writeMcpLauncher() {
+  const mcpBundle  = path.join(__dirname, 'dist', 'mcp.js');
+  const mcpWrapper = path.join(__dirname, 'dist', 'mcp-run.js');
 
-function copyWasmFiles() {
-  const wasmTargetDir = path.join(__dirname, 'dist', 'wasm');
-  fs.mkdirSync(wasmTargetDir, { recursive: true });
-
-  const copies = [
-    // sql.js wasm
-    {
-      src: path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm'),
-      dest: path.join(wasmTargetDir, 'sql-wasm.wasm'),
-    },
-    // web-tree-sitter wasm
-    {
-      src: path.join(__dirname, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm'),
-      dest: path.join(wasmTargetDir, 'tree-sitter.wasm'),
-    },
-  ];
-
-  // Copy all tree-sitter language grammars
-  const grammarSrc = path.join(__dirname, 'node_modules', 'tree-sitter-wasms', 'out');
-  if (fs.existsSync(grammarSrc)) {
-    for (const file of fs.readdirSync(grammarSrc)) {
-      if (file.endsWith('.wasm')) {
-        copies.push({ src: path.join(grammarSrc, file), dest: path.join(wasmTargetDir, file) });
-      }
-    }
-  }
-
-  let copied = 0;
-  for (const { src, dest } of copies) {
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, dest);
-      copied++;
-    }
-  }
-  console.log(`Copied ${copied} WASM files to dist/wasm/`);
+  // The bundle itself has no shebang — it's a plain CJS module.
+  // The launcher is the executable entry point that just requires it.
+  const wrapper = `#!/usr/bin/env node\nrequire('./mcp.js');\n`;
+  fs.writeFileSync(mcpWrapper, wrapper, { mode: 0o755 });
+  console.log('MCP launcher written → dist/mcp-run.js');
 }
-
-// ─── WASM path resolver plugin ────────────────────────────────────────────────
-// Intercepts require('sql.js') and require('web-tree-sitter') at bundle time
-// so they look for WASM files relative to __dirname (dist/wasm/) instead of
-// their original node_modules location.
-
-const wasmPathPlugin = {
-  name: 'wasm-path',
-  setup(build) {
-    // Rewrite sql.js to a thin wrapper that sets locateFile to our dist/wasm/
-    build.onResolve({ filter: /^sql\.js$/ }, () => ({
-      path: require.resolve('./node_modules/sql.js/dist/sql-wasm.js'),
-    }));
-  },
-};
 
 async function buildAll() {
   copyWasmFiles();
 
-  const builds = [
-    // ── 1. VS Code extension (does NOT include vscode module) ────────────────
-    {
-      ...sharedOptions,
-      entryPoints: ['src/extension.ts'],
-      outfile:     'dist/extension.js',
-      external:    ['vscode'],
-      define: {
-        // Tell sql.js where to find its wasm file at runtime
-        'process.env.SQL_WASM_PATH': JSON.stringify(''),
-      },
-      plugins: [wasmPathPlugin],
-    },
-    // ── 2. MCP standalone binary (no vscode) ─────────────────────────────────
-    {
-      ...sharedOptions,
-      entryPoints: ['src/mcp/mcpEntry.ts'],
-      outfile:     'dist/mcp.js',
-      external:    [],          // bundle everything — no vscode dep
-      banner:      { js: '#!/usr/bin/env node' },
-      plugins:     [wasmPathPlugin],
-    },
-  ];
+  // 1. VS Code extension bundle (vscode excluded, no shebang)
+  await esbuild.build({
+    ...shared,
+    entryPoints: ['src/extension.ts'],
+    outfile:     'dist/extension.js',
+    external:    ['vscode'],
+  });
 
-  if (watch) {
-    // Watch mode — only for extension (faster dev cycle)
-    const ctx = await esbuild.context({ ...builds[0], logLevel: 'info' });
-    await ctx.watch();
-    console.log('Watching extension…');
-  } else {
-    for (const opts of builds) {
-      await esbuild.build(opts);
-    }
-  }
+  // 2. MCP server bundle — plain CJS, NO shebang banner
+  //    VS Code runs it as: node /path/to/dist/mcp.js <workspace>
+  //    so it must be a valid CJS file, not a shell script.
+  await esbuild.build({
+    ...shared,
+    entryPoints: ['src/mcp/mcpEntry.ts'],
+    outfile:     'dist/mcp.js',
+    external:    [],
+    // NO banner — shebang in the middle of minified JS causes SyntaxError
+  });
+
+  writeMcpLauncher();
 }
 
-buildAll().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+async function buildWatch() {
+  copyWasmFiles();
+  const ctx = await esbuild.context({
+    ...shared,
+    entryPoints: ['src/extension.ts'],
+    outfile:     'dist/extension.js',
+    external:    ['vscode'],
+    logLevel:    'info',
+  });
+  await ctx.watch();
+  console.log('Watching extension…');
+}
+
+if (watch) { buildWatch().catch(e => { console.error(e); process.exit(1); }); }
+else       { buildAll().catch(e => { console.error(e); process.exit(1); }); }
