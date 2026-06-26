@@ -89,12 +89,14 @@
         {
           "id": "codelens-graph.statsView",
           "name": "Graph Stats",
-          "type": "webview"
+          "type": "webview",
+          "icon": "$(type-hierarchy)"
         },
         {
           "id": "codelens-graph.symbolTree",
           "name": "Symbol Explorer",
-          "type": "tree"
+          "type": "tree",
+          "icon": "$(type-hierarchy)"
         }
       ]
     },
