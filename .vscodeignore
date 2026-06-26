@@ -16,6 +16,9 @@ tsconfig.json
 node_modules/**
 
 # Misc
-.DS_Store
+.codelens/**
+.agents/**
+.vscode/**
+knowledge.md
 Thumbs.db
 *.log
