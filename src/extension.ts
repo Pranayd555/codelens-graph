@@ -85,6 +85,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     setStatus('ready', stats.totalNodes, stats.totalEdges);
     refreshGraphPanel();
     statsViewProvider?.refresh();
+    refreshSavings();
   });
 
   backgroundScanner.onSkills(_written => {
@@ -294,6 +295,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   }
 
+
+  // Refresh savings display every 30s — updates while agent is actively working
+  const savingsTimer = setInterval(refreshSavings, 30_000);
+  context.subscriptions.push({ dispose: () => clearInterval(savingsTimer) });
+
   context.subscriptions.push({ dispose: () => backgroundScanner.dispose() });
   console.log('[CodeLens Graph] Activated ✓');
 }
@@ -388,7 +394,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
 
   const nonce   = crypto.randomBytes(16).toString('hex');
   const initial = buildGraphWebviewData();
-  graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
+  graphPanel.webview.html = getGraphPanelHtml(initial, nonce, context.extensionPath);
 
   graphPanel.webview.onDidReceiveMessage(msg => {
     if (msg.command === 'openFile' && msg.filePath) {
@@ -403,10 +409,10 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
       vscode.commands.executeCommand('codelens-graph.buildGraph');
     }
     if (msg.command === 'ready') {
-      // Webview JS finished loading and registered its listener.
-      // Push fresh data — this is the reliable handshake pattern.
+      // Webview JS finished loading — push fresh data and savings
       const data = buildGraphWebviewData();
       graphPanel?.webview.postMessage({ command: 'updateGraph', ...data });
+      refreshSavings();
     }
   });
 
@@ -422,6 +428,34 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
   });
 
   graphPanel.onDidDispose(() => { graphPanel = undefined; });
+}
+
+
+// Push current MCP token savings into the stats sidebar and graph panel
+function refreshSavings(): void {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (!workspaceRoot) { return; }
+  try {
+    const logs  = readRecentLogs(workspaceRoot, 500);
+    if (logs.length === 0) { return; }
+    // Savings = estimated tokens a naive agent would spend reading files
+    // minus what CodeLens tools actually cost.
+    // Each codelens_context call replaces ~2000 tokens of file reads.
+    // Each codelens_search call replaces ~400 tokens of grep + file reads.
+    const toolCounts = logs.reduce((m, l) => { m[l.tool] = (m[l.tool] || 0) + 1; return m; }, {} as Record<string, number>);
+    const saved = (toolCounts['codelens_context'] ?? 0) * 1800
+                + (toolCounts['codelens_search']  ?? 0) * 400
+                + (toolCounts['codelens_callers'] ?? 0) * 300
+                + (toolCounts['codelens_callees'] ?? 0) * 300
+                + (toolCounts['codelens_impact']  ?? 0) * 500
+                + (toolCounts['codelens_node']    ?? 0) * 200
+                + (toolCounts['codelens_files']   ?? 0) * 600;
+    const calls = logs.length;
+    statsViewProvider?.updateSavings(saved, calls);
+    if (graphPanel?.visible) {
+      graphPanel.webview.postMessage({ command: 'updateSavings', tokens: saved, calls });
+    }
+  } catch { /* non-fatal */ }
 }
 
 function refreshGraphPanel(): void {

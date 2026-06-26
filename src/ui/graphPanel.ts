@@ -200,28 +200,7 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── Right panel (node detail) ───────────────────────────────────────────── */
-#detail-panel {
-  position: fixed; top: 48px; right: 0; bottom: 28px;
-  width: 280px; background: #0d1117; border-left: 1px solid #21262d;
-  padding: 14px; overflow-y: auto; font-size: 12px;
-  transform: translateX(100%); transition: transform 0.2s;
-  z-index: 30;
-}
-#detail-panel.open { transform: translateX(0); }
-#detail-panel h3 { font-size: 14px; color: #e6edf3; margin-bottom: 8px; word-break: break-word; }
-#detail-panel .dp-type { color: #8b949e; font-size: 11px; margin-bottom: 10px; }
-#detail-panel .dp-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid #21262d; }
-#detail-panel .dp-label { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-#detail-panel .dp-value { color: #cdd9e5; font-family: monospace; font-size: 11px; word-break: break-word; }
-#detail-panel .dp-link  { color: #58a6ff; cursor: pointer; }
-#detail-panel .dp-link:hover { text-decoration: underline; }
-#detail-close {
-  position: absolute; top: 10px; right: 10px;
-  background: none; border: none; color: #8b949e;
-  cursor: pointer; font-size: 16px; line-height: 1;
-}
-#detail-close:hover { color: #e6edf3; }
+
 </style>
 </head>
 <body>
@@ -239,10 +218,7 @@ body {
 
 <svg id="canvas"></svg>
 
-<div id="detail-panel">
-  <button id="detail-close">✕</button>
-  <div id="detail-content"></div>
-</div>
+
 
 <div id="empty-state">
   <div class="icon">⬡</div>
@@ -463,7 +439,6 @@ function render() {
     .on('mouseout',  hideTooltip)
     .on('click', (ev, d) => {
       ev.stopPropagation();
-      showDetail(d);
       send('openFile', { filePath: d.file, line: d.line });
     });
 
@@ -577,68 +552,7 @@ function moveTooltip(ev) {
 }
 function hideTooltip() { tip.style.display = 'none'; }
 
-// ── Detail panel ───────────────────────────────────────────────────────────────
-function showDetail(d) {
-  const panel   = document.getElementById('detail-panel');
-  const content = document.getElementById('detail-content');
-  const relFile = (d.file||'').split(/[\\/\\\\]/).slice(-3).join('/');
 
-  const callerEdges = RAW.edges.filter(e => {
-    const tgt = typeof e.target === 'object' ? e.target.id : e.target;
-    return tgt === d.id && e.type === 'calls';
-  });
-  const calleeEdges = RAW.edges.filter(e => {
-    const src = typeof e.source === 'object' ? e.source.id : e.source;
-    return src === d.id && e.type === 'calls';
-  });
-
-  let html = \`
-    <h3>\${escHtml(d.name)}</h3>
-    <div class="dp-type">\${d.type}</div>
-    <div class="dp-section">
-      <div class="dp-label">Location</div>
-      <div class="dp-value dp-link" onclick="send('openFile',{filePath:'\${escAttr(d.file)}',line:\${d.line}})">\${escHtml(relFile)}:\${d.line}</div>
-    </div>\`;
-
-  if (callerEdges.length > 0) {
-    html += \`<div class="dp-section"><div class="dp-label">Called by (\${callerEdges.length})</div>\`;
-    callerEdges.slice(0, 6).forEach(e => {
-      const srcId  = typeof e.source === 'object' ? e.source.id : e.source;
-      const caller = RAW.nodes.find(n => n.id === srcId);
-      if (caller) {
-        html += \`<div class="dp-value dp-link" onclick="send('openFile',{filePath:'\${escAttr(caller.file)}',line:\${caller.line}})">\${escHtml(caller.name)}</div>\`;
-      }
-    });
-    html += '</div>';
-  }
-
-  if (calleeEdges.length > 0) {
-    html += \`<div class="dp-section"><div class="dp-label">Calls (\${calleeEdges.length})</div>\`;
-    calleeEdges.slice(0, 6).forEach(e => {
-      const tgtId = typeof e.target === 'object' ? e.target.id : e.target;
-      const callee = RAW.nodes.find(n => n.id === tgtId);
-      if (callee) {
-        html += \`<div class="dp-value dp-link" onclick="send('openFile',{filePath:'\${escAttr(callee.file)}',line:\${callee.line}})">\${escHtml(callee.name)}</div>\`;
-      }
-    });
-    html += '</div>';
-  }
-
-  if (d.undefinedRefs?.length) {
-    html += \`<div class="dp-section"><div class="dp-label" style="color:#f85149">⚠ Undefined refs</div>
-      <div class="dp-value" style="color:#f85149">\${escHtml(d.undefinedRefs.join(', '))}</div></div>\`;
-  }
-
-  content.innerHTML = html;
-  panel.classList.add('open');
-}
-
-document.getElementById('detail-close').onclick = () => {
-  document.getElementById('detail-panel').classList.remove('open');
-};
-svg.on('click', () => {
-  document.getElementById('detail-panel').classList.remove('open');
-});
 
 // ── Controls ───────────────────────────────────────────────────────────────────
 document.querySelectorAll('.filter-btn').forEach(btn => {
