@@ -8,3 +8,4 @@ node_modules/
 .codelens/
 knowledge.md
 .vscode/mcp.json
+.agents

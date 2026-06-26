@@ -2,6 +2,8 @@
 
 > A VS Code extension that builds a live knowledge graph of your codebase and exposes it as an MCP server — so AI agents find the right symbols instantly, use the minimum tokens needed, and never hallucinate about what already exists.
 
+![CodeLens Graph Demo](assets/codelens-graph.gif)
+
 **GitHub:** [github.com/pranayd555/codelens-graph](https://github.com/pranayd555/codelens-graph)
 
 ---
@@ -57,34 +59,22 @@ Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
 
 ### Connect your AI agent (one-time per project)
 
-After the extension builds the graph, click **"Copy MCP Config"** in the notification or run `CodeLens: Copy MCP Config to Clipboard`.
+CodeLens Graph features an automatic configuration engine that sets up MCP settings and inserts mandatory search rules for your favorite AI assistants:
 
-**Claude Code** — paste into `~/.claude.json`:
-```json
-{
-  "mcpServers": {
-    "codelens": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/extension/out/mcp/mcpEntry.js", "/path/to/your/project"]
-    }
-  }
-}
-```
+1. **Automatic Setup (Recommended):**
+   Upon initial scan or by running the `CodeLens: Regenerate AI Agent Skill Files` command, the extension will prompt you to select your target IDEs/assistants:
+   - **VS Code (Copilot / Trae)**: Writes MCP server configuration to `.vscode/mcp.json` and instruction rules to `.vscode/codelens.instructions.md`.
+   - **Cursor**: Writes instruction rules to `.cursor/rules/codelens.mdc`.
+   - **Antigravity**: Integrates instruction rules into `.agents/AGENTS.md`.
+   - **Claude Code**: Integrates instruction rules into `CLAUDE.md`.
+   - **Windsurf (Cascade)**: Integrates instruction rules into `.windsurfrules`.
 
-**Cursor** — paste into `.cursor/mcp.json` in your project:
-```json
-{
-  "mcpServers": {
-    "codelens": {
-      "command": "node",
-      "args": ["/path/to/extension/out/mcp/mcpEntry.js", "${workspaceFolder}"]
-    }
-  }
-}
-```
-
-The exact paths are pre-filled in the copied config.
+2. **Manual Configuration:**
+   If you want to configure your global/user MCP settings manually:
+   - Click **"Copy MCP Config"** in the notification, or run the `CodeLens: Copy MCP Config to Clipboard` command.
+   - Paste the config into your global config file:
+     - **Claude Code (global)**: paste into `~/.claude.json`.
+     - **Cursor (local)**: paste into `.cursor/mcp.json`.
 
 > **Important:** The graph database lives in `.codelens/` inside your project. Both the extension and the MCP server use the same database — no external directory lookups, no permission popups.
 
@@ -95,12 +85,15 @@ The exact paths are pre-filled in the copied config.
 | Command | Purpose |
 |---------|---------|
 | `CodeLens: Build Knowledge Graph` | Full scan of workspace |
+| `CodeLens: Force Rebuild Graph` | Clear and rescan |
 | `CodeLens: Show Graph Explorer` | Interactive D3 force graph |
 | `CodeLens: Show Agent Context Preview` | Preview context for a task |
 | `CodeLens: Search Symbol in Graph` | Find any symbol instantly |
 | `CodeLens: Copy MCP Config to Clipboard` | Get ready-to-paste agent config |
-| `CodeLens: Force Rebuild Graph` | Clear and rescan |
+| `CodeLens: Get Context for Task (Agent)` | Fetch task context (CLI command for agents) |
 | `CodeLens: Update Graph After Agent Run` | Re-index after agent changes |
+| `CodeLens: Regenerate AI Agent Skill Files` | Regenerate rules/MCP configs and prompt for IDE preferences |
+| `CodeLens: Show MCP Usage Report` | Show total agent tool calls and token savings |
 
 ---
 

@@ -6,7 +6,10 @@ import { GraphStats } from '../types';
 export class SkillGenerator {
   constructor(private db: GraphDB) {}
 
-  generateAll(workspaceRoot: string, _stats: GraphStats): string[] {
+  generateAll(workspaceRoot: string, _stats: GraphStats, selectedIdes: string[] = []): string[] {
+    // First, clean up existing configurations/rules so we don't leave stale ones
+    this.removeAll(workspaceRoot);
+
     const written: string[] = [];
     const codelensDir = path.join(workspaceRoot, '.codelens');
     fs.mkdirSync(codelensDir, { recursive: true });
@@ -17,73 +20,103 @@ export class SkillGenerator {
     fs.writeFileSync(path.join(codelensDir, 'mcp.json'), this.buildMcpConfig(workspaceRoot), 'utf-8');
     written.push('.codelens/mcp.json');
 
-    if (this.writeVsCodeMcpConfig(workspaceRoot)) { written.push('.vscode/mcp.json'); }
+    // Write manual reference instructions
+    fs.writeFileSync(path.join(codelensDir, 'instructions.md'), this.buildInstructionsMd(_stats), 'utf-8');
+    written.push('.codelens/instructions.md');
 
-    // KEY FIX: write agent instruction files that the agents actually read automatically
-    this.writeAgentInstructions(workspaceRoot, written);
+    if (selectedIdes.includes('vscode')) {
+      if (this.writeVsCodeMcpConfig(workspaceRoot)) { written.push('.vscode/mcp.json'); }
+    } else {
+      this.removeVsCodeMcpConfig(workspaceRoot);
+    }
+
+    // Write agent instruction rules for selected IDEs
+    this.writeAgentInstructions(workspaceRoot, written, selectedIdes, _stats);
 
     this.ensureGitignore(workspaceRoot);
     return written;
   }
 
   removeAll(workspaceRoot: string): void {
-    const legacy = ['.cursor/rules/codelens.mdc','.cursorrules',
-      '.github/copilot-instructions.md','.clinerules',
-      '.vscode/codelens.instructions.md','CONVENTIONS.md'];
+    const legacy = [
+      '.cursor/rules/codelens.mdc',
+      '.cursorrules',
+      '.github/copilot-instructions.md',
+      '.clinerules',
+      '.vscode/codelens.instructions.md',
+      'CONVENTIONS.md',
+      'CLAUDE.md',
+      '.windsurfrules',
+      '.agents/AGENTS.md'
+    ];
     for (const rel of legacy) {
       const fp = path.join(workspaceRoot, rel);
       if (!fs.existsSync(fp)) { continue; }
       try {
-        const c = fs.readFileSync(fp,'utf-8');
+        const c = fs.readFileSync(fp, 'utf-8');
         if (c.includes('CODELENS_MANAGED_START')) {
           const cleaned = this.removeManagedSection(c);
-          if (cleaned.trim()) { fs.writeFileSync(fp, cleaned,'utf-8'); }
-          else { fs.unlinkSync(fp); }
+          const trimmed = cleaned.trim();
+          
+          // For .vscode/codelens.instructions.md, if only frontmatter remains, delete the file
+          const isOnlyFrontmatter = rel === '.vscode/codelens.instructions.md' &&
+            /^---\r?\napplyTo:\s*"[^"]*"\r?\n---$/i.test(trimmed);
+
+          if (trimmed && !isOnlyFrontmatter) {
+            fs.writeFileSync(fp, cleaned, 'utf-8');
+          } else {
+            fs.unlinkSync(fp);
+          }
         }
       } catch { /* ignore */ }
     }
   }
 
   // ── Agent instruction files ───────────────────────────────────────────────
-  // Each agent reads from a different path. We write ALL of them so whatever
-  // agent the user has, it automatically picks up the instructions.
 
-  private writeAgentInstructions(workspaceRoot: string, written: string[]): void {
-    const stats       = this.db.getStats();
+  private writeAgentInstructions(workspaceRoot: string, written: string[], selectedIdes: string[], stats: GraphStats): void {
     const instruction = this.buildAgentInstruction(stats);
 
-    // ── VS Code Copilot (.github/copilot-instructions.md) ────────────────────
-    // Read automatically by GitHub Copilot Chat as workspace instructions
-    const ghDir = path.join(workspaceRoot, '.github');
-    fs.mkdirSync(ghDir, { recursive: true });
-    const copilotPath = path.join(ghDir, 'copilot-instructions.md');
-    this.mergeInstructions(copilotPath, instruction);
-    written.push('.github/copilot-instructions.md');
+    if (selectedIdes.includes('vscode')) {
+      const vscodeDir = path.join(workspaceRoot, '.vscode');
+      fs.mkdirSync(vscodeDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(vscodeDir, 'codelens.instructions.md'),
+        '---\napplyTo: "**"\n---\n\n' + instruction,
+        'utf-8'
+      );
+      written.push('.vscode/codelens.instructions.md');
+    }
 
-    // ── Cursor (.cursor/rules/codelens.mdc) ───────────────────────────────────
-    const cursorRulesDir = path.join(workspaceRoot, '.cursor', 'rules');
-    fs.mkdirSync(cursorRulesDir, { recursive: true });
-    const cursorPath = path.join(cursorRulesDir, 'codelens.mdc');
-    fs.writeFileSync(cursorPath,
-      '---\ndescription: CodeLens Graph — mandatory codebase search protocol\nalwaysApply: true\n---\n\n'
-      + instruction, 'utf-8');
-    written.push('.cursor/rules/codelens.mdc');
+    if (selectedIdes.includes('cursor')) {
+      const cursorRulesDir = path.join(workspaceRoot, '.cursor', 'rules');
+      fs.mkdirSync(cursorRulesDir, { recursive: true });
+      const cursorPath = path.join(cursorRulesDir, 'codelens.mdc');
+      fs.writeFileSync(cursorPath,
+        '---\ndescription: CodeLens Graph — mandatory codebase search protocol\nalwaysApply: true\n---\n\n'
+        + instruction, 'utf-8');
+      written.push('.cursor/rules/codelens.mdc');
+    }
 
-    // ── Cline / Roo Code (.clinerules) ───────────────────────────────────────
-    const clinePath = path.join(workspaceRoot, '.clinerules');
-    this.mergeInstructions(clinePath, instruction);
-    written.push('.clinerules');
+    if (selectedIdes.includes('antigravity')) {
+      const agentsDir = path.join(workspaceRoot, '.agents');
+      fs.mkdirSync(agentsDir, { recursive: true });
+      const agentsPath = path.join(agentsDir, 'AGENTS.md');
+      this.mergeInstructions(agentsPath, instruction);
+      written.push('.agents/AGENTS.md');
+    }
 
-    // ── Trae / generic (.vscode/codelens.instructions.md) ────────────────────
-    // VS Code reads .vscode/*.instructions.md as chat instructions
-    const vscodeDir = path.join(workspaceRoot, '.vscode');
-    fs.mkdirSync(vscodeDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(vscodeDir, 'codelens.instructions.md'),
-      '---\napplyTo: "**"\n---\n\n' + instruction,
-      'utf-8'
-    );
-    written.push('.vscode/codelens.instructions.md');
+    if (selectedIdes.includes('Claude')) {
+      const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
+      this.mergeInstructions(claudePath, instruction);
+      written.push('CLAUDE.md');
+    }
+
+    if (selectedIdes.includes('Winsurf')) {
+      const windsurfPath = path.join(workspaceRoot, '.windsurfrules');
+      this.mergeInstructions(windsurfPath, instruction);
+      written.push('.windsurfrules');
+    }
   }
 
   private buildAgentInstruction(stats: Omit<GraphStats, "lastBuilt" | "buildDurationMs"> & Partial<Pick<GraphStats, "lastBuilt" | "buildDurationMs">>): string {
@@ -155,31 +188,91 @@ For large agent runs, call \`codelens_status\` to verify the index is current.
     } catch { return false; }
   }
 
+  private removeVsCodeMcpConfig(workspaceRoot: string): void {
+    const configPath = path.join(workspaceRoot, '.vscode', 'mcp.json');
+    if (!fs.existsSync(configPath)) { return; }
+    try {
+      const existing = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (existing && existing.servers && existing.servers.codelens) {
+        delete existing.servers.codelens;
+        if (Object.keys(existing.servers).length === 0) {
+          delete existing.servers;
+        }
+        if (Object.keys(existing).length === 0) {
+          fs.unlinkSync(configPath);
+        } else {
+          fs.writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
   // ── .codelens/mcp.json ────────────────────────────────────────────────────
 
   private buildMcpConfig(workspaceRoot: string): string {
     const e = this.getMcpEntryPath();
     const p = this.toFwd(workspaceRoot);
     return JSON.stringify({
-      _comment: 'CodeLens Graph MCP config — .vscode/mcp.json is auto-written, no action needed',
+      _comment: 'CodeLens Graph MCP config',
       vscode:      { servers: { codelens: { command: 'node', args: [e, p] } } },
-      claude_code: { _add_to: '~/.claude.json', codelens: { type: 'stdio', command: 'node', args: [e, p] } },
       cursor:      { _add_to: '~/.cursor/mcp.json', codelens: { command: 'node', args: [e, p] } },
-      cline:       { _add_to: 'Cline MCP Settings → Stdio', command: 'node', args: [e, p] },
+      Claude:      { _add_to: '~/.claude.json', codelens: { type: 'stdio', command: 'node', args: [e, p] } },
+      Winsurf:     { _add_to: '~/.codeium/windsurf/mcp_config.json', codelens: { command: 'node', args: [e, p] } },
     }, null, 2);
   }
 
   // ── .codelens/README.md ───────────────────────────────────────────────────
 
   private buildReadme(workspaceRoot: string): string {
-    const e = this.getMcpEntryPath();
-    const p = this.toFwd(workspaceRoot);
     return `# CodeLens Graph\n\nLocal codebase index. Auto-updated on every file save.\n\n`
-      + `## MCP Config\n\`.vscode/mcp.json\` is written automatically — VS Code picks it up.\n\n`
-      + `### Claude Code (~/.claude.json)\n\`\`\`json\n`
-      + `{"mcpServers":{"codelens":{"type":"stdio","command":"node","args":["${e}","${p}"]}}}\n\`\`\`\n\n`
-      + `### Cursor (.cursor/mcp.json)\n\`\`\`json\n`
-      + `{"mcpServers":{"codelens":{"command":"node","args":["${e}","${p}"]}}}\n\`\`\`\n`;
+      + `## Configuration & Rules\n`
+      + `Please refer to the following files in this directory for setting up your AI agent:\n`
+      + `- [instructions.md](file:///${this.toFwd(workspaceRoot)}/.codelens/instructions.md) — Custom instruction rules for different IDEs.\n`
+      + `- [mcp.json](file:///${this.toFwd(workspaceRoot)}/.codelens/mcp.json) — MCP server configurations for all supported IDEs.\n`;
+  }
+
+  // ── .codelens/instructions.md ─────────────────────────────────────────────
+
+  private buildInstructionsMd(stats: GraphStats): string {
+    const instruction = this.buildAgentInstruction(stats);
+    return `# CodeLens Graph — AI Agent Instructions
+
+This file contains the mandatory search protocol and rules for AI agents using the CodeLens Graph MCP server.
+You can copy the contents of the rules section below and add them to your IDE's custom instructions or rules file.
+
+## Manual Rule Setup Guide
+
+- **VS Code (Copilot / Trae)**: Create a file at \`.vscode/codelens.instructions.md\` with:
+  \`\`\`markdown
+  ---
+  applyTo: "**"
+  ---
+
+  <Paste the Rules Section here>
+  \`\`\`
+
+- **Cursor**: Create a rule file at \`.cursor/rules/codelens.mdc\` with:
+  \`\`\`markdown
+  ---
+  description: CodeLens Graph — mandatory codebase search protocol
+  alwaysApply: true
+  ---
+
+  <Paste the Rules Section here>
+  \`\`\`
+
+- **Antigravity**: Append/merge the Rules Section into \`.agents/AGENTS.md\` in your project root.
+
+- **Claude Code**: Append/merge the Rules Section into \`CLAUDE.md\` in your project root.
+
+- **Windsurf (Cascade)**: Append/merge the Rules Section into \`.windsurfrules\` in your project root.
+
+---
+
+## Rules Section
+
+${instruction}
+`;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

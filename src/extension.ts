@@ -49,7 +49,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   contextBuilder = new ContextBuilder(db);
   differ         = new GraphDiffer(db);
   skillGenerator = new SkillGenerator(db);
-  backgroundScanner = new BackgroundScanner(db, scanner, skillGenerator);
+  backgroundScanner = new BackgroundScanner(db, scanner, skillGenerator, () => {
+    return context.workspaceState.get<string[]>('selectedIdes') ?? [];
+  });
 
   await db.init();
 
@@ -218,12 +220,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     // Regenerate skill/MCP config files (no rescan)
-    vscode.commands.registerCommand('codelens-graph.regenerateSkills', () => {
+    vscode.commands.registerCommand('codelens-graph.regenerateSkills', async () => {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
       if (!workspaceRoot) { return; }
       const dbStats = db.getStats();
       const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
-      const written = skillGenerator.generateAll(workspaceRoot, stats);
+      const ides = await getOrPromptSelectedIdes(context, true); // Force prompt so user can change preferences
+      const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
       vscode.window.showInformationMessage(`CodeLens: Skills regenerated → ${written.join(', ')}`);
     }),
   );
@@ -285,12 +288,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
       }, context);
+
+      // Prompt the user for IDE preferences on first install/activation
+      if (context.workspaceState.get('selectedIdes') === undefined) {
+        vscode.window.showInformationMessage(
+          'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
+          'Select IDEs',
+          'Skip'
+        ).then(async choice => {
+          if (choice === 'Select IDEs') {
+            await getOrPromptSelectedIdes(context, true);
+          } else {
+            await context.workspaceState.update('selectedIdes', []);
+          }
+          // Regenerate skills immediately with choice if scanner finished
+          const dbStats = db.getStats();
+          if (dbStats.totalNodes > 0) {
+            const fullStats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
+            const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
+            skillGenerator.generateAll(workspaceRoot, fullStats, ides);
+          }
+        });
+      }
     } else {
       // Already have a graph — refresh skills and show ready
       setStatus('ready', stats.totalNodes, stats.totalEdges);
       statsViewProvider?.refresh();
       const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
-      skillGenerator.generateAll(workspaceRoot, fullStats);
+      const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
+      skillGenerator.generateAll(workspaceRoot, fullStats, ides);
       console.log(`[CodeLens] Existing graph loaded: ${stats.totalNodes} nodes. Skills refreshed.`);
     }
   }
@@ -352,7 +378,8 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
     statsViewProvider?.refresh();
 
     // Generate / update skill files
-    const written = skillGenerator.generateAll(workspaceRoot, stats);
+    const ides = await getOrPromptSelectedIdes(context);
+    const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
 
     vscode.window.showInformationMessage(
       `CodeLens Graph: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.durationMs}ms` +
@@ -394,7 +421,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
 
   const nonce   = crypto.randomBytes(16).toString('hex');
   const initial = buildGraphWebviewData();
-  graphPanel.webview.html = getGraphPanelHtml(initial, nonce, context.extensionPath);
+  graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
 
   graphPanel.webview.onDidReceiveMessage(msg => {
     if (msg.command === 'openFile' && msg.filePath) {
@@ -598,4 +625,38 @@ function setStatus(state: StatusState, nodes?: number, edges?: number): void {
       statusBarItem.text    = '$(type-hierarchy) CodeLens Graph';
       statusBarItem.tooltip = 'Click to open graph viewer';
   }
+}
+
+async function getOrPromptSelectedIdes(context: vscode.ExtensionContext, forcePrompt = false): Promise<string[]> {
+  const selected = context.workspaceState.get<string[]>('selectedIdes');
+  if (selected !== undefined && !forcePrompt) {
+    return selected;
+  }
+
+  const items: vscode.QuickPickItem[] = [
+    { label: 'vscode', description: 'VS Code rules & project mcp.json' },
+    { label: 'cursor', description: 'Cursor rules (.cursor/rules/codelens.mdc)' },
+    { label: 'antigravity', description: 'Antigravity rules (.agents/AGENTS.md)' },
+    { label: 'Claude', description: 'Claude Code rules (CLAUDE.md)' },
+    { label: 'Winsurf', description: 'Windsurf rules (.windsurfrules)' }
+  ];
+
+  const choice = await vscode.window.showQuickPick(items, {
+    title: 'CodeLens Graph: Select IDE Configurations to Install Automatically',
+    placeHolder: 'Select IDEs (Press Space to select, Enter to confirm, Escape to skip/cancel)',
+    canPickMany: true,
+    ignoreFocusOut: true
+  });
+
+  if (choice === undefined) {
+    if (selected === undefined) {
+      await context.workspaceState.update('selectedIdes', []);
+      return [];
+    }
+    return selected;
+  }
+
+  const result = choice.map(item => item.label);
+  await context.workspaceState.update('selectedIdes', result);
+  return result;
 }

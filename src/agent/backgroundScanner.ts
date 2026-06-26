@@ -24,6 +24,7 @@ export class BackgroundScanner {
   private isScanning       = false;
   private skillRegenTimer: ReturnType<typeof setTimeout> | null = null;
   private changesSinceRegen: Set<string> = new Set();
+
   private lastScanStats:   GraphStats | null = null;
 
   private onScanComplete?: (stats: GraphStats) => void;
@@ -34,6 +35,7 @@ export class BackgroundScanner {
     private db:             GraphDB,
     private scanner:        WorkspaceScanner,
     private skillGenerator: SkillGenerator,
+    private getSelectedIdes: () => string[]
   ) {}
 
   // ── Register callbacks ─────────────────────────────────────────────────────
@@ -160,7 +162,8 @@ export class BackgroundScanner {
 
   private async generateSkills(workspaceRoot: string, stats: GraphStats): Promise<void> {
     try {
-      const written = this.skillGenerator.generateAll(workspaceRoot, stats);
+      const selectedIdes = this.getSelectedIdes();
+      const written = this.skillGenerator.generateAll(workspaceRoot, stats, selectedIdes);
       console.log(`[CodeLens] Skills written to: ${written.join(', ')}`);
       this.onSkillsWritten?.(written);
       this.changesSinceRegen.clear();
