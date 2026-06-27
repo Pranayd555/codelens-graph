@@ -2,6 +2,7 @@ import * as fs   from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { GraphNode, GraphEdge, ParsedFile, Param, NodeType, CallReference } from '../types';
+import { isConfigPath, isNodeModulePath } from '../utils';
 
 // ─── Language → WASM mapping ──────────────────────────────────────────────────
 
@@ -25,6 +26,15 @@ const EXTENSION_MAP: Record<string, { language: string; wasm: string }> = {
   '.swift':{ language: 'swift',      wasm: 'tree-sitter-swift.wasm'      },
   '.kt':   { language: 'kotlin',     wasm: 'tree-sitter-kotlin.wasm'     },
 };
+
+const KEYWORDS = new Set([
+  'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'default', 'delete', 'do',
+  'else', 'export', 'extends', 'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof',
+  'new', 'return', 'super', 'switch', 'this', 'throw', 'try', 'typeof', 'var', 'void', 'while',
+  'with', 'yield', 'let', 'static', 'enum', 'await', 'implements', 'package', 'protected',
+  'interface', 'private', 'public', 'def', 'elif', 'except', 'func', 'fn', 'struct', 'impl', 'mut',
+  'pub', 'use', 'type', 'and', 'or', 'not'
+]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -312,6 +322,7 @@ export class TreeSitterParser {
       // Get name
       const name = this.getNodeName(tsNode, query.nameField, content);
       if (!name || name === '__file__') { return; }
+      if (KEYWORDS.has(name.toLowerCase())) { return; }
 
       const line    = tsNode.startPosition.row + 1;
       const endLine = tsNode.endPosition.row + 1;
@@ -670,7 +681,22 @@ class RegexFallbackParser {
       lastModified: fs.statSync(filePath).mtimeMs,
       hash: contentHash(content), updatedAt: now,
     };
+
+    if (path.basename(filePath).toLowerCase() === 'package.json') {
+      try {
+        const pkgObj = JSON.parse(content);
+        if (pkgObj.name) {
+          fileNode.signature = `${pkgObj.name}@${pkgObj.version || '0.0.0'}`;
+        }
+      } catch { /* ignore invalid JSON */ }
+    }
+
     nodes.push(fileNode);
+
+    // If it's a simple config/metadata file, return just the file node
+    if (['json', 'markdown', 'yaml', 'config'].includes(language)) {
+      return { filePath, language, nodes, edges, callRefs, parseErrors: [] };
+    }
 
     const patterns: Array<{ r: RegExp; t: NodeType }> = [
       { r: /(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/,                     t: 'class'     },
@@ -685,6 +711,7 @@ class RegexFallbackParser {
       for (const { r, t } of patterns) {
         const m = r.exec(lines[i]);
         if (!m || !m[1] || m[1] === '__file__') { continue; }
+        if (KEYWORDS.has(m[1].toLowerCase())) { continue; }
         const nid = makeNodeId(filePath, m[1], i + 1);
         nodes.push({
           id: nid, type: t, name: m[1], filePath,
@@ -725,7 +752,18 @@ export class ASTParser {
   }
 
   async parseFileAsync(filePath: string): Promise<ParsedFile> {
-    const language = this.getLanguageForFile(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const isConfig = isConfigPath(filePath);
+    const isNm = isNodeModulePath(filePath);
+
+    let language = this.getLanguageForFile(filePath);
+    if (!language) {
+      if (ext === '.json') { language = 'json'; }
+      else if (ext === '.md') { language = 'markdown'; }
+      else if (ext === '.yml' || ext === '.yaml') { language = 'yaml'; }
+      else if (isConfig || isNm) { language = 'config'; }
+    }
+
     if (!language) {
       return { filePath, language: 'unknown', nodes: [], edges: [], callRefs: [], parseErrors: ['Unsupported extension'] };
     }
@@ -739,6 +777,10 @@ export class ASTParser {
     }
 
     await this.ensureInit();
+
+    if (['json', 'markdown', 'yaml', 'config'].includes(language)) {
+      return this.regexFallback.parse(filePath, content, language);
+    }
 
     // Try tree-sitter first — fall back to regex if language not supported
     if (this.treeSitter.isReady() && LANG_QUERIES[language]) {
@@ -754,7 +796,18 @@ export class ASTParser {
 
   // Synchronous wrapper for backward compat (uses regex only)
   parseFile(filePath: string): ParsedFile {
-    const language = this.getLanguageForFile(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const isConfig = isConfigPath(filePath);
+    const isNm = isNodeModulePath(filePath);
+
+    let language = this.getLanguageForFile(filePath);
+    if (!language) {
+      if (ext === '.json') { language = 'json'; }
+      else if (ext === '.md') { language = 'markdown'; }
+      else if (ext === '.yml' || ext === '.yaml') { language = 'yaml'; }
+      else if (isConfig || isNm) { language = 'config'; }
+    }
+
     if (!language) {
       return { filePath, language: 'unknown', nodes: [], edges: [], callRefs: [], parseErrors: ['Unsupported'] };
     }

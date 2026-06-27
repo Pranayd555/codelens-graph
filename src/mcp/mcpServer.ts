@@ -5,6 +5,7 @@ import { ContextBuilder } from '../context/contextBuilder';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
+import { isConfigPath, isNodeModulePath } from '../utils';
 
 // ─── Task tier classifier ─────────────────────────────────────────────────────
 
@@ -135,15 +136,19 @@ export class MCPServer {
       + 'Use for Tier 2 tasks or to verify a symbol does not exist before creating it. '
       + 'Returns exact file:line + signature. '
       + 'After this call, read ONLY that specific line range — never the whole file.',
-      { query: z.string(), limit: z.number().optional().default(10) },
-      async ({ query, limit }: { query: string; limit?: number }) => {
+      {
+        query: z.string(),
+        limit: z.number().optional().default(10),
+        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace')
+      },
+      async ({ query, limit, scope }: { query: string; limit?: number; scope?: 'workspace' | 'deps' | 'all' }) => {
         this.db.refreshFromDiskIfChanged();
-        const results = this.db.searchNodes(query, limit ?? 10);
+        const results = this.db.searchNodes(query, limit ?? 10, scope ?? 'workspace');
         if (!results.length) {
-          return txt('No symbols found matching "' + query + '". Safe to create.');
+          return txt('No symbols found matching "' + query + '" within scope ' + (scope ?? 'workspace') + '. Safe to create.');
         }
         const lines = [
-          'Found ' + results.length + ' symbol(s) matching "' + query + '":',
+          'Found ' + results.length + ' symbol(s) matching "' + query + '" inside scope ' + (scope ?? 'workspace') + ':',
           '',
           ...results.map(n => this.fmtNode(n, workspaceRoot)),
           '',
@@ -158,7 +163,7 @@ export class MCPServer {
     tool(
       'codelens_context',
       'Compressed codebase context for a feature/bugfix task (Tier 3). '
-      + 'Returns relevant symbols with snippets, file:line, import paths, '
+      + 'Returns relevant symbols with optional snippets, file:line, import paths, '
       + 'call relationships, duplicate warnings, and pre-diagnosed errors. '
       + 'ONE call replaces reading 3-10 files. '
       + 'After this, read ONLY the file:line locations specified.',
@@ -166,13 +171,14 @@ export class MCPServer {
         task:       z.string(),
         max_depth:  z.number().optional().default(2),
         max_tokens: z.number().optional().default(2500),
+        mode:       z.enum(['short', 'deep']).optional().default('short'),
       },
-      async ({ task, max_depth, max_tokens }: { task: string; max_depth?: number; max_tokens?: number }) => {
+      async ({ task, max_depth, max_tokens, mode }: { task: string; max_depth?: number; max_tokens?: number; mode: 'short' | 'deep' }) => {
         this.db.refreshFromDiskIfChanged();
-        const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500);
-        const output = this.contextBuilder.buildSystemPromptInjection(ctx);
+        const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500, mode);
+        const output = this.contextBuilder.buildSystemPromptInjection(ctx, mode);
         const header = [
-          '## CodeLens Context: "' + task + '"',
+          '## CodeLens Context: "' + task + '" (' + mode + ' mode)',
           'Symbols: ' + ctx.subgraph.nodes.length + ' | ~' + ctx.tokenEstimate + ' tokens',
           'READ ONLY the file:line combinations listed — not whole files.',
           '',
@@ -305,14 +311,16 @@ export class MCPServer {
       'codelens_files',
       'File structure grouped by category (routes, services, models, templates, utils...). '
       + 'Use instead of ls/find/directory scanning. Supply filter to narrow results.',
-      { filter: z.string().optional() },
-      async ({ filter }: { filter?: string }) => {
+      {
+        filter: z.string().optional(),
+        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace')
+      },
+      async ({ filter, scope }: { filter?: string; scope?: 'workspace' | 'deps' | 'all' }) => {
         this.db.refreshFromDiskIfChanged();
         const classifier = new FileClassifier();
-        const allFiles   = this.db.getAllFiles();
+        const allFiles   = this.db.getAllFiles(scope ?? 'workspace');
         const groups     = classifier.groupFiles(allFiles);
-        const stats      = this.db.getStats();
-        const lines      = ['## Workspace (' + allFiles.length + ' files, ' + stats.totalNodes + ' symbols)', ''];
+        const lines      = ['## Workspace (' + allFiles.length + ' files, scope: ' + (scope ?? 'workspace') + ')', ''];
         for (const [label, files] of groups) {
           if (filter
             && !label.toLowerCase().includes(filter.toLowerCase())
@@ -324,6 +332,130 @@ export class MCPServer {
           lines.push('');
         }
         return txt(lines.join('\n'));
+      }
+    );
+
+    // ── codelens_dependencies ─────────────────────────────────────────────────
+
+    tool(
+      'codelens_dependencies',
+      'Query installed packages and their metadata. Use when the task involves dependencies, versions, types, or package configuration.',
+      {
+        packageName: z.string().optional().describe('Specific package to look up, e.g. "lodash" or "@types/react". Omit to list all top-level packages.'),
+        queryType: z.enum(['info', 'exports', 'types', 'dependents']).optional().default('info').describe('What to retrieve: package info, exported symbols, type definitions, or files that import this package.')
+      },
+      async ({ packageName, queryType }: { packageName?: string; queryType?: 'info' | 'exports' | 'types' | 'dependents' }) => {
+        this.db.refreshFromDiskIfChanged();
+        
+        if (packageName) {
+          const matches = this.db.getNodesByType('file').filter(n => 
+            isNodeModulePath(n.filePath) && 
+            n.filePath.replace(/\\/g, '/').toLowerCase().includes('/' + packageName.toLowerCase() + '/')
+          );
+
+          if (!matches.length) {
+            return txt('Package "' + packageName + '" is not indexed or found in node_modules.');
+          }
+
+          const lines: string[] = ['## Package: ' + packageName, ''];
+
+          if (queryType === 'info') {
+            const pkgJsonNode = matches.find(n => n.name === 'package.json');
+            if (pkgJsonNode) {
+              lines.push('- Version: ' + (pkgJsonNode.signature || 'unknown'));
+              lines.push('- Path: ' + this.rel(pkgJsonNode.filePath, workspaceRoot));
+            }
+            const readmeNode = matches.find(n => n.name.toLowerCase() === 'readme.md');
+            if (readmeNode) {
+              lines.push('- Readme: ' + this.rel(readmeNode.filePath, workspaceRoot));
+            }
+            const typeDefs = matches.filter(n => n.name.endsWith('.d.ts'));
+            if (typeDefs.length) {
+              lines.push('- Type definitions: ' + typeDefs.map(t => this.rel(t.filePath, workspaceRoot)).join(', '));
+            }
+          } else if (queryType === 'exports') {
+            const symbols = matches.flatMap(m => 
+              this.db.getNodesByFile(m.filePath).filter(n => n.type !== 'file' && n.type !== 'import')
+            );
+            if (!symbols.length) {
+              lines.push('No exported symbols found in the type definitions for this package.');
+            } else {
+              lines.push('Exported symbols:');
+              lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ ' + this.rel(s.filePath, workspaceRoot) + ':' + s.line));
+            }
+          } else if (queryType === 'types') {
+            const typeDefs = matches.filter(n => n.name.endsWith('.d.ts'));
+            if (!typeDefs.length) {
+              lines.push('No type definition files found for this package.');
+            } else {
+              lines.push('Type definition files:');
+              for (const td of typeDefs) {
+                lines.push('### ' + this.rel(td.filePath, workspaceRoot));
+                const symbols = this.db.getNodesByFile(td.filePath).filter(n => n.type !== 'file' && n.type !== 'import');
+                lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ line ' + s.line + ' ' + (s.signature ? '`' + s.signature.slice(0, 100) + '`' : '')));
+                lines.push('');
+              }
+            }
+          } else if (queryType === 'dependents') {
+            const dependents = new Set<string>();
+            for (const fileNode of matches) {
+              const edges = this.db.getEdgesTo(fileNode.id, 'depends-on' as any);
+              for (const edge of edges) {
+                const node = this.db.getNode(edge.fromId);
+                if (node) {
+                  dependents.add(this.rel(node.filePath, workspaceRoot));
+                }
+              }
+            }
+            if (!dependents.size) {
+              lines.push('No indexed workspace files import or depend on "' + packageName + '".');
+            } else {
+              lines.push('Workspace files importing/depending on this package:');
+              lines.push(...Array.from(dependents).map(d => '  - ' + d));
+            }
+          }
+
+          return txt(lines.join('\n'));
+        } else {
+          // List all top-level packages and configs
+          const allDeps = this.db.getAllFiles('deps');
+          const lines = ['## Index Dependencies & Configuration Files', ''];
+          const packages = new Set<string>();
+          const configs: string[] = [];
+
+          for (const fp of allDeps) {
+            if (isNodeModulePath(fp)) {
+              const match = /\/node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(fp.replace(/\\/g, '/'));
+              if (match && match[1]) {
+                packages.add(match[1]);
+              }
+            } else {
+              configs.push(this.rel(fp, workspaceRoot));
+            }
+          }
+
+          if (packages.size > 0) {
+            lines.push('### Packages:');
+            for (const pkg of Array.from(packages).sort()) {
+              // Try to find package version
+              const pkgJsonNode = this.db.getNodesByType('file').find(n => 
+                isNodeModulePath(n.filePath) && 
+                n.filePath.toLowerCase().endsWith('/node_modules/' + pkg.toLowerCase() + '/package.json')
+              );
+              const version = pkgJsonNode?.signature ? ` (${pkgJsonNode.signature})` : '';
+              lines.push('  - ' + pkg + version);
+            }
+            lines.push('');
+          }
+
+          if (configs.length > 0) {
+            lines.push('### Configurations:');
+            lines.push(...configs.sort().map(c => '  - ' + c));
+            lines.push('');
+          }
+
+          return txt(lines.join('\n'));
+        }
       }
     );
 
@@ -352,7 +484,7 @@ export class MCPServer {
 
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
-    console.error('[CodeLens MCP] Server ready — 9 tools on stdio');
+    console.error('[CodeLens MCP] Server ready — 10 tools on stdio');
   }
 
   async stop(): Promise<void> {

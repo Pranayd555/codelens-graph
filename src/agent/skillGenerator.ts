@@ -134,7 +134,7 @@ Before ANY file operation, call \`codelens_triage\` with your task description.
 It costs ~10 tokens and tells you the exact minimum tool needed.
 - Tier 1 (typo/format): no tool needed
 - Tier 2 (find a symbol): \`codelens_search\` only
-- Tier 3 (feature/fix): \`codelens_context\` only  
+- Tier 3 (feature/fix): \`codelens_context\` (defaults to \`short\` mode. If you need complete implementations/snippets, call with \`mode: "deep"\` to pull large context instead of reading files one-by-one)
 - Tier 4 (refactor): \`codelens_context\` + \`codelens_impact\`
 
 ### RULE 2 — Never read files to discover structure
@@ -143,13 +143,13 @@ Use CodeLens tools instead of \`read_file\`, \`grep\`, \`find\`, or \`ls\`:
 |---|---|
 | \`grep -r "functionName"\` | \`codelens_search\` |
 | \`ls src/\` or \`find . -name\` | \`codelens_files\` |
-| Reading whole files to understand | \`codelens_context\` |
+| Reading whole files to understand | \`codelens_context\` (use \`mode: "deep"\` to pull full code snippets instead of reading files one-by-one) |
 | Finding callers before refactor | \`codelens_callers\` |
 | Checking what breaks | \`codelens_impact\` |
 
 ### RULE 3 — Read only what CodeLens points to
 When CodeLens returns \`file:line\`, read only that specific line range.
-Never read whole files. Never read files not listed in the graph response.
+Never read whole files unless you pull them via \`codelens_context\` with \`mode: "deep"\`. Never read files not listed in the graph response.
 
 ### RULE 4 — Check before creating
 Before creating any new file or function, call \`codelens_search\` to verify
@@ -159,8 +159,12 @@ it does not already exist. Creating duplicates is the #1 source of bugs.
 After making changes, the graph updates automatically on file save.
 For large agent runs, call \`codelens_status\` to verify the index is current.
 
+### RULE 6 — Querying dependencies & configurations
+Only look for dependencies, versions, type definitions, or config files (e.g. package.json, tsconfig.json, vite.config.ts) when asked or if context is missing.
+Use \`codelens_search\` or \`codelens_files\` with \`scope: "deps"\` or \`codelens_dependencies\` to find them. Do NOT use regular search/files workspace scope.
+
 ### Available tools (MCP server: codelens)
-\`codelens_triage\` · \`codelens_search\` · \`codelens_context\`
+\`codelens_triage\` · \`codelens_search\` · \`codelens_context\` · \`codelens_dependencies\`
 \`codelens_callers\` · \`codelens_callees\` · \`codelens_impact\`
 \`codelens_node\` · \`codelens_files\` · \`codelens_status\`
 <!-- CODELENS_MANAGED_END -->`;

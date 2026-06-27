@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ASTParser } from './astParser';
 import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
+import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile } from '../utils';
 
 export interface ScanOptions {
   excludePatterns:     string[];
@@ -28,7 +29,6 @@ export interface ScanResult {
 
 const ALWAYS_EXCLUDE_DIRS = new Set([
   // ── JavaScript / TypeScript ───────────────────────────────────────────────
-  'node_modules',       // npm / yarn / pnpm packages
   '.npm',               // npm cache
   '.yarn',              // yarn cache
   '.pnpm-store',        // pnpm store
@@ -126,7 +126,6 @@ const ALWAYS_EXCLUDE_DIRS = new Set([
 
 // Files that should never be indexed even if extension matches
 const ALWAYS_EXCLUDE_FILES = new Set([
-  'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
   'Gemfile.lock',
@@ -161,13 +160,20 @@ export class WorkspaceScanner {
     const indexedSet  = new Set(allFiles.map(f => path.normalize(f)));
 
     // Remove stale entries for files that disappeared
-    for (const indexed of this.db.getAllFiles()) {
+    for (const indexed of this.db.getAllFiles('all')) {
       const belongsToRoot = rootPaths.some(root => {
         const rel = path.relative(root, indexed);
         return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
       });
       if (belongsToRoot && !indexedSet.has(path.normalize(indexed))) {
-        this.db.deleteNodesByFile(indexed);
+        const isDep = isNodeModulePath(indexed) || isConfigPath(indexed);
+        if (isDep) {
+          if (!fs.existsSync(indexed)) {
+            this.db.deleteNodesByFile(indexed);
+          }
+        } else {
+          this.db.deleteNodesByFile(indexed);
+        }
       }
     }
 
@@ -228,13 +234,54 @@ export class WorkspaceScanner {
     return parsed;
   }
 
+  isFileAllowed(filePath: string, workspaceRoot: string, options: ScanOptions): boolean {
+    const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath);
+    const ext = path.extname(absolutePath).toLowerCase();
+    const filename = path.basename(absolutePath);
+    const relPath = path.relative(workspaceRoot, absolutePath).replace(/\\/g, '/');
+
+    if (ALWAYS_EXCLUDE_FILES.has(filename)) { return false; }
+
+    for (const pattern of options.excludePatterns) {
+      if (this.matchesGlob(relPath, filename, pattern)) { return false; }
+    }
+
+    const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
+    const isConfig = isConfigPath(absolutePath);
+    const isNm = isNodeModulePath(absolutePath);
+
+    if (isNm) {
+      // Limit node_modules files to depth 3 relative to node_modules
+      const parts = relPath.split('/');
+      if (parts.length > 5) { return false; }
+      return shouldIndexNodeModuleFile(absolutePath);
+    }
+
+    if (isConfig && CONFIG_EXTS.has(ext)) {
+      return true;
+    }
+
+    const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
+    if (!extSet.has(ext)) { return false; }
+
+    const segments = relPath.split('/');
+    let currentRelPath = '';
+    for (let i = 0; i < segments.length - 1; i++) {
+      const segment = segments[i];
+      currentRelPath = currentRelPath ? `${currentRelPath}/${segment}` : segment;
+      if (this.shouldExcludeDir(segment, currentRelPath, options.excludePatterns)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   // ── File collection ────────────────────────────────────────────────────────
 
   private collectFiles(rootPaths: string[], options: ScanOptions): string[] {
     const files  = new Array<string>();
     const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
-
-    // Merge user patterns with the hard-coded never-index set
     const userPatterns = options.excludePatterns;
 
     for (const root of rootPaths) {
@@ -248,23 +295,54 @@ export class WorkspaceScanner {
     root: string,
     exts: Set<string>,
     userPatterns: string[],
-    results: string[]
+    results: string[],
+    inNodeModules = false,
+    nodeModulesDepth = 0
   ): void {
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
     catch { return; }
 
+    const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
+
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       const relPath  = path.relative(root, fullPath).replace(/\\/g, '/');
 
+      const isNodeModulesDir = entry.name === 'node_modules';
+
       if (entry.isDirectory()) {
+        const nextInNodeModules = inNodeModules || isNodeModulesDir;
+        const nextDepth = isNodeModulesDir ? 0 : (nextInNodeModules ? nodeModulesDepth + 1 : 0);
+
+        // Limit depth inside node_modules to 3
+        if (nextInNodeModules && nextDepth > 3) {
+          continue;
+        }
+
         if (this.shouldExcludeDir(entry.name, relPath, userPatterns)) { continue; }
-        this.walkDir(fullPath, root, exts, userPatterns, results);
+        this.walkDir(fullPath, root, exts, userPatterns, results, nextInNodeModules, nextDepth);
       } else if (entry.isFile()) {
-        if (this.shouldExcludeFile(entry.name, relPath, userPatterns)) { continue; }
-        if (exts.has(path.extname(entry.name).toLowerCase())) {
-          results.push(fullPath);
+        if (this.shouldExcludeFile(entry.name, relPath, userPatterns)) {
+          const isConfig = isConfigPath(fullPath);
+          const isNm = inNodeModules;
+          const allowed = (isNm && shouldIndexNodeModuleFile(fullPath)) || (isConfig && CONFIG_EXTS.has(path.extname(entry.name).toLowerCase()));
+          if (!allowed) {
+            continue;
+          }
+        }
+        
+        const ext = path.extname(entry.name).toLowerCase();
+        const isConfig = isConfigPath(fullPath);
+        
+        if (inNodeModules) {
+          if (shouldIndexNodeModuleFile(fullPath)) {
+            results.push(fullPath);
+          }
+        } else {
+          if (exts.has(ext) || (isConfig && CONFIG_EXTS.has(ext))) {
+            results.push(fullPath);
+          }
         }
       }
     }
@@ -275,6 +353,13 @@ export class WorkspaceScanner {
   // Handles dotfile dirs (e.g. .angular, .trae) and nested paths.
 
   private shouldExcludeDir(name: string, relPath: string, userPatterns: string[]): boolean {
+    const isNm = name === 'node_modules' || relPath.includes('node_modules/') || relPath.split('/').includes('node_modules');
+    if (isNm) {
+      if (ALWAYS_EXCLUDE_DIRS.has(name)) { return true; }
+      if (name.startsWith('.') && name !== '.github') { return true; }
+      return false;
+    }
+
     // 1. Hard-coded never-index set — exact directory name match
     if (ALWAYS_EXCLUDE_DIRS.has(name)) { return true; }
 

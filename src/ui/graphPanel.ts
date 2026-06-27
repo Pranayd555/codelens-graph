@@ -1,4 +1,5 @@
 import { GraphNode, GraphEdge } from '../types';
+import { isConfigPath, isNodeModulePath } from '../utils';
 
 export function toWebviewData(nodes: GraphNode[], edges: GraphEdge[]) {
   return {
@@ -9,6 +10,7 @@ export function toWebviewData(nodes: GraphNode[], edges: GraphEdge[]) {
       file: n.filePath,
       line: n.line,
       undefinedRefs: n.undefinedRefs ?? [],
+      isConfig: isConfigPath(n.filePath),
     })),
     edges: edges.map(e => ({
       source: e.fromId,
@@ -142,6 +144,8 @@ body {
 .edge.implements { stroke: #d2a679; stroke-opacity: 0.6; stroke-width: 1px; stroke-dasharray: 3 3; }
 .edge.uses_type  { stroke: #9cdcfe; stroke-opacity: 0.4; stroke-width: 1px; }
 .edge.contains   { stroke: rgba(255,255,255,0.08); stroke-width: 0.8px; stroke-dasharray: 2 3; }
+.edge.depends_on      { stroke: #d2a679; stroke-opacity: 0.5; stroke-width: 1px; }
+.edge.peer_dependency { stroke: #888; stroke-opacity: 0.4; stroke-width: 1px; stroke-dasharray: 3 3; }
 .edge:hover      { stroke-opacity: 1 !important; }
 
 /* ── Tooltip ─────────────────────────────────────────────────────────────── */
@@ -213,6 +217,7 @@ body {
   <button class="filter-btn" data-type="method">Methods</button>
   <button class="filter-btn" data-type="variable">Variables</button>
   <button class="filter-btn" data-type="interface">Interfaces</button>
+  <button class="filter-btn" data-type="configs">Configs</button>
   <button class="filter-btn issues" data-type="issues">⚠ Issues</button>
 </div>
 
@@ -301,8 +306,8 @@ svg.call(d3.zoom().scaleExtent([0.02, 12]).on('zoom', e => {
 
 // Arrow markers for directed edges
 const defs = svg.append('defs');
-['calls','imports','inherits','implements'].forEach(type => {
-  const colors = { calls:'#58a6ff', imports:'#4ec9b0', inherits:'#bc8cff', implements:'#d2a679' };
+['calls','imports','inherits','implements','depends_on','peer_dependency'].forEach(type => {
+  const colors = { calls:'#58a6ff', imports:'#4ec9b0', inherits:'#bc8cff', implements:'#d2a679', depends_on:'#d2a679', peer_dependency:'#888' };
   defs.append('marker')
     .attr('id', 'arr-'+type)
     .attr('viewBox','0 0 8 8').attr('refX',16).attr('refY',4)
@@ -341,8 +346,19 @@ function render() {
   // ── Filter nodes ────────────────────────────────────────────────────────────
   let visNodes = RAW.nodes.filter(n => {
     if (n.type === 'import') { return false; }  // hide noisy import nodes
-    if (activeFilter === 'issues') { return n.undefinedRefs && n.undefinedRefs.length > 0; }
-    if (activeFilter !== 'all' && n.type !== activeFilter) { return false; }
+    if (activeFilter === 'all') {
+      // Exclude configs from the "all" tab
+      if (n.isConfig) { return false; }
+    } else if (activeFilter === 'configs') {
+      if (!n.isConfig) { return false; }
+    } else {
+      // For any other activeFilter (like function, class, variable, etc.) or issues:
+      // Exclude configs
+      if (n.isConfig) { return false; }
+      if (activeFilter === 'issues') { return n.undefinedRefs && n.undefinedRefs.length > 0; }
+      if (n.type !== activeFilter) { return false; }
+    }
+
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       if (!n.name.toLowerCase().includes(q)) { return false; }
@@ -354,7 +370,7 @@ function render() {
 
   // ── Filter edges ─────────────────────────────────────────────────────────────
   // Show structural edges (contains) as light connectors AND meaningful edges (calls etc)
-  const SHOW_EDGE_TYPES = new Set(['calls','imports','inherits','implements','uses_type','contains']);
+  const SHOW_EDGE_TYPES = new Set(['calls','imports','inherits','implements','uses_type','contains','depends-on','peer-dependency']);
   const visEdges = RAW.edges.filter(e => {
     if (!SHOW_EDGE_TYPES.has(e.type)) { return false; }
     const src = typeof e.source === 'object' ? e.source.id : e.source;
@@ -417,12 +433,20 @@ function render() {
     .alphaDecay(0.02)    // slower cooling = better layout
     .velocityDecay(0.4);
 
+  // Pre-warm the simulation layout when there are many nodes to prevent visual lag
+  if (nodes.length > 200) {
+    const warmupTicks = nodes.length > 1000 ? 90 : 60;
+    for (let i = 0; i < warmupTicks; i++) {
+      simulation.tick();
+    }
+  }
+
   // ── Draw edges ────────────────────────────────────────────────────────────
   const link = edgeLayer.selectAll('path.edge')
     .data(edges).join('path')
-    .attr('class', d => 'edge ' + (d.type||''))
-    .attr('marker-end', d => ['calls','inherits','implements'].includes(d.type)
-      ? \`url(#arr-\${d.type})\` : null);
+    .attr('class', d => 'edge ' + (d.type||'').replace(/-/g, '_'))
+    .attr('marker-end', d => ['calls','inherits','implements','depends_on','peer_dependency'].includes((d.type||'').replace(/-/g, '_'))
+      ? \`url(#arr-\${(d.type||'').replace(/-/g, '_')})\` : null);
 
   // ── Draw nodes ────────────────────────────────────────────────────────────
   const nodeGroups = nodeLayer.selectAll('g.node-group')

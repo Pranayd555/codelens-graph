@@ -3,6 +3,7 @@ import { GraphDB }  from '../graph/graphDB';
 import { GraphNode, AgentContext, GraphEdge, Diagnosis } from '../types';
 import { SnippetExtractor } from './snippetExtractor';
 import { FileClassifier }   from './fileClassifier';
+import { isConfigPath, isNodeModulePath } from '../utils';
 
 // ─── Token estimator ──────────────────────────────────────────────────────────
 function estimateTokens(text: string): number {
@@ -38,20 +39,41 @@ export class ContextBuilder {
 
   // ── Main build ────────────────────────────────────────────────────────────
 
-  build(taskDescription: string, maxDepth = 2, maxTokenBudget = 2000): AgentContext {
+  build(taskDescription: string, maxDepth = 2, maxTokenBudget = 2000, mode: 'short' | 'deep' = 'short'): AgentContext {
     const keywords   = extractKeywords(taskDescription);
-    const entryNodes = this.findEntryPoints(keywords);
+
+    const isAskedNodeModule = /node_modules|node\s+module|dependency|dependencies|npm|yarn|pnpm/i.test(taskDescription) || keywords.some(kw => kw === 'node_modules' || kw === 'package' || kw === 'dependency');
+    const isAskedConfigs = /config|readme|settings|\.json|\.config/i.test(taskDescription) || keywords.some(kw => kw === 'config' || kw === 'readme' || kw === 'package' || kw === 'settings');
+
+    let depVisibility: 'full' | 'metadata' | 'hidden' = 'metadata';
+    if (taskDescription.length < 15 || maxTokenBudget < 1000) {
+      depVisibility = 'hidden';
+    } else if (isAskedNodeModule || isAskedConfigs) {
+      depVisibility = 'full';
+    }
+
+    const scope: 'workspace' | 'all' = depVisibility === 'full' ? 'all' : 'workspace';
+    const entryNodes = this.findEntryPoints(keywords, scope);
     const entryIds   = entryNodes.map(n => n.id);
 
     const { nodes, edges } = this.db.bfsExpand(entryIds, maxDepth);
-    const scored           = this.scoreNodes(nodes, keywords, taskDescription);
+    const filteredNodes = nodes.filter(n => {
+      const isNm = isNodeModulePath(n.filePath);
+      const isCfg = isConfigPath(n.filePath);
+      if (depVisibility === 'hidden' || depVisibility === 'metadata') {
+        return !isNm && !isCfg;
+      }
+      return true;
+    });
+
+    const scored           = this.scoreNodes(filteredNodes, keywords, taskDescription);
     const { trimmedNodes, trimmedEdges } = this.trimToBudget(scored, edges, maxTokenBudget);
 
     // ── IMPROVEMENT 3: rich warnings with exact location + snippet ────────────
     const warnings   = this.generateWarnings(trimmedNodes, taskDescription);
 
     // ── IMPROVEMENT 4: category hints so agent finds files without grep ───────
-    const existingFiles   = this.db.getAllFiles();
+    const existingFiles   = this.db.getAllFiles('workspace');
 
     // ── IMPROVEMENT 1+2: diagnoses include import path + undefined refs ───────
     const diagnoses  = this.buildDiagnoses(trimmedNodes, taskDescription);
@@ -65,18 +87,19 @@ export class ContextBuilder {
       diagnoses,
       tokenEstimate: 0,
       generatedAt: Date.now(),
+      depVisibility,
     };
 
-    context.tokenEstimate = estimateTokens(this.buildSystemPromptInjection(context));
+    context.tokenEstimate = estimateTokens(this.buildSystemPromptInjection(context, mode));
     return context;
   }
 
   // ── Entry point discovery ─────────────────────────────────────────────────
 
-  private findEntryPoints(keywords: string[]): GraphNode[] {
+  private findEntryPoints(keywords: string[], scope: 'workspace' | 'all'): GraphNode[] {
     const found = new Map<string, GraphNode>();
     for (const kw of keywords) {
-      for (const node of this.db.searchNodes(kw, 10)) {
+      for (const node of this.db.searchNodes(kw, 10, scope)) {
         if (!found.has(node.id)) { found.set(node.id, node); }
       }
     }
@@ -252,7 +275,7 @@ export class ContextBuilder {
 
   // ── IMPROVEMENT 1: System prompt injection with snippets + relations ──────
 
-  buildSystemPromptInjection(context: AgentContext): string {
+  buildSystemPromptInjection(context: AgentContext, mode: 'short' | 'deep' = 'short'): string {
     const lines: string[] = [
       '## Codebase Context (CodeLens Graph)',
       `Generated: ${new Date(context.generatedAt).toISOString()}`,
@@ -267,6 +290,26 @@ export class ContextBuilder {
       lines.push('### File map (by category):');
       lines.push(categoryHint);
       lines.push('');
+    }
+
+    if (context.depVisibility === 'metadata') {
+      const depsNodes = this.db.getNodesByType('file').filter(n => isNodeModulePath(n.filePath) || isConfigPath(n.filePath));
+      if (depsNodes.length > 0) {
+        lines.push('### Dependencies & Configurations (metadata-only):');
+        for (const n of depsNodes) {
+          const relPath = n.filePath.replace(/\\/g, '/').split('/node_modules/').pop() || n.filePath;
+          if (isNodeModulePath(n.filePath)) {
+            if (n.filePath.endsWith('package.json') && n.signature) {
+              lines.push(`- node_modules/${relPath.replace('/package.json', '')} (${n.signature})`);
+            } else if (n.filePath.endsWith('index.d.ts') || n.filePath.endsWith('.d.ts')) {
+              lines.push(`- node_modules/${relPath} (type definitions)`);
+            }
+          } else {
+            lines.push(`- ${n.name} (config)`);
+          }
+        }
+        lines.push('');
+      }
     }
 
     // ── IMPROVEMENT 1: Symbols with snippet + IMPROVEMENT 2: import path ──
@@ -320,12 +363,14 @@ export class ContextBuilder {
       }
 
       // IMPROVEMENT 1: Actual code snippet — eliminates the file read
-      const snippet = this.snippets.extractSnippet(node);
-      if (snippet) {
-        lines.push('- **Snippet:**');
-        lines.push('```' + node.language);
-        lines.push(snippet);
-        lines.push('```');
+      if (mode === 'deep') {
+        const snippet = this.snippets.extractSnippet(node);
+        if (snippet) {
+          lines.push('- **Snippet:**');
+          lines.push('```' + node.language);
+          lines.push(snippet);
+          lines.push('```');
+        }
       }
 
       lines.push('');
@@ -385,7 +430,7 @@ export class ContextBuilder {
   }
 
   // Keep for backward compat (used by extension.ts showContext command)
-  serialize(context: AgentContext): string {
-    return this.buildSystemPromptInjection(context);
+  serialize(context: AgentContext, mode: 'short' | 'deep' = 'short'): string {
+    return this.buildSystemPromptInjection(context, mode);
   }
 }

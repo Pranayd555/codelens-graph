@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path   from 'path';
 import * as crypto from 'crypto';
+import * as fs     from 'fs';
 
 import { GraphDB }            from './graph/graphDB';
 import { ASTParser }          from './ingestion/astParser';
@@ -14,6 +15,7 @@ import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
 import { readRecentLogs, formatUsageReport } from './mcp/mcpLogger';
 import { StatsViewProvider }   from './ui/statsView';
 import { GraphStats }         from './types';
+import { isNodeModulePath }   from './utils';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -142,14 +144,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Called by the AI agent BEFORE starting work on a task.
     // Returns a compressed context JSON — the agent reads it, not the user.
-    vscode.commands.registerCommand('codelens-graph.getContextForTask', async (taskDescription?: string) => {
+    vscode.commands.registerCommand('codelens-graph.getContextForTask', async (taskDescription?: string, mode?: 'short' | 'deep') => {
       const task = taskDescription
         ?? await vscode.window.showInputBox({ prompt: 'Task description for context lookup' });
       if (!task) { return; }
 
+      const actualMode = mode ?? 'short';
       const cfg = getConfig();
-      const agentCtx = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget);
-      const injection = contextBuilder.buildSystemPromptInjection(agentCtx);
+      const agentCtx = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget, actualMode);
+      const injection = contextBuilder.buildSystemPromptInjection(agentCtx, actualMode);
 
       // Show in editor — context is returned directly, no file write needed
       const doc = await vscode.workspace.openTextDocument({
@@ -244,7 +247,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // node_modules / dist / .angular etc never trigger a re-index.
     const isExcludedPath = (fsPath: string): boolean => {
       const rel = path.relative(workspaceRoot, fsPath).replace(/\\/g, '/');
-      const FAST_EXCLUDE = /node_modules|[/\\]\.codelens[/\\]|[/\\]\.angular[/\\]|[/\\]\.next[/\\]|[/\\]\.nuxt[/\\]|[/\\]\.vite[/\\]|[/\\]\.turbo[/\\]|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]|[/\\]\.trae[/\\]|[/\\]\.cursor[/\\]|__pycache__|[/\\]\.venv[/\\]|[/\\]target[/\\]|[/\\]vendor[/\\]/;
+      const FAST_EXCLUDE = /(?:^|[/\\])(?:node_modules|\.codelens|\.angular|\.next|\.nuxt|\.vite|\.turbo|dist|build|\.git|\.trae|\.cursor|__pycache__|\.venv|target|vendor)(?:[/\\]|$)/;
       return FAST_EXCLUDE.test(rel);
     };
 
@@ -264,6 +267,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
 
     fsWatcher.onDidDelete(uri => {
+      if (isExcludedPath(uri.fsPath)) { return; }
       const removedSymbols = db.getNodesByFile(uri.fsPath)
         .filter(node => node.type !== 'file' && node.type !== 'import')
         .map(node => node.name);
@@ -390,8 +394,24 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
 
 // ─── showGraphPanel ───────────────────────────────────────────────────────────
 
+let lastSentVersion = '';
+
+function getGraphVersion(): string {
+  try {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+    if (workspaceRoot) {
+      const dbPath = path.join(workspaceRoot, '.codelens', 'codelens-graph.db');
+      if (fs.existsSync(dbPath)) {
+        const stat = fs.statSync(dbPath);
+        return `${stat.mtimeMs}:${stat.size}`;
+      }
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
 function buildGraphWebviewData() {
-  const allFiles = db.getAllFiles();
+  const allFiles = db.getAllFiles('all').filter(f => !isNodeModulePath(f));
   const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
   const edgeMap  = new Map<string, import('./types').GraphEdge>();
   for (const n of allNodes) {
@@ -419,6 +439,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
     }
   );
 
+  lastSentVersion = getGraphVersion();
   const nonce   = crypto.randomBytes(16).toString('hex');
   const initial = buildGraphWebviewData();
   graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
@@ -436,9 +457,13 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
       vscode.commands.executeCommand('codelens-graph.buildGraph');
     }
     if (msg.command === 'ready') {
-      // Webview JS finished loading — push fresh data and savings
-      const data = buildGraphWebviewData();
-      graphPanel?.webview.postMessage({ command: 'updateGraph', ...data });
+      // Webview JS finished loading. Only push if version changed!
+      const currentVersion = getGraphVersion();
+      if (currentVersion !== lastSentVersion) {
+        lastSentVersion = currentVersion;
+        const data = buildGraphWebviewData();
+        graphPanel?.webview.postMessage({ command: 'updateGraph', ...data });
+      }
       refreshSavings();
     }
   });
@@ -448,8 +473,12 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
     if (e.webviewPanel.visible) {
       setTimeout(() => {
         if (!graphPanel) { return; }
-        const data = buildGraphWebviewData();
-        graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
+        const currentVersion = getGraphVersion();
+        if (currentVersion !== lastSentVersion) {
+          lastSentVersion = currentVersion;
+          const data = buildGraphWebviewData();
+          graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
+        }
       }, 120);
     }
   });
@@ -487,6 +516,7 @@ function refreshSavings(): void {
 
 function refreshGraphPanel(): void {
   if (!graphPanel?.visible) { return; }
+  lastSentVersion = getGraphVersion();
   const data = buildGraphWebviewData();
   graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
 }
@@ -500,9 +530,16 @@ async function showContextPreview(): Promise<void> {
   });
   if (!task) { return; }
 
+  const modeChoice = await vscode.window.showQuickPick(['short', 'deep'], {
+    title: 'Select Context Detail Level',
+    placeHolder: 'short (file map + signatures) or deep (includes code snippets)',
+  });
+  if (!modeChoice) { return; }
+  const mode = modeChoice as 'short' | 'deep';
+
   const cfg    = getConfig();
-  const ctx    = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget);
-  const output = contextBuilder.buildSystemPromptInjection(ctx);
+  const ctx    = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget, mode);
+  const output = contextBuilder.buildSystemPromptInjection(ctx, mode);
 
   const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: [
     `# CodeLens Agent Context`,
@@ -559,7 +596,9 @@ async function searchSymbol(): Promise<void> {
 
 async function detectRecentlyChangedFiles(workspaceRoot: string): Promise<string[]> {
   const uris = await vscode.workspace.findFiles(
-    '**/*', '**/node_modules/**', 200
+    '**/*',
+    '{**/node_modules/**,**/dist/**,**/build/**,**/.git/**,**/.codelens/**,**/out/**,**/output/**}',
+    200
   );
   const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
   const fs = require('fs');
