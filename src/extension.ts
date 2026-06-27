@@ -15,6 +15,7 @@ import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
 import { readRecentLogs, formatUsageReport } from './mcp/mcpLogger';
 import { StatsViewProvider }   from './ui/statsView';
 import { GraphStats }         from './types';
+import { isNodeModulePath }   from './utils';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -410,7 +411,7 @@ function getGraphVersion(): string {
 }
 
 function buildGraphWebviewData() {
-  const allFiles = db.getAllFiles('all');
+  const allFiles = db.getAllFiles('all').filter(f => !isNodeModulePath(f));
   const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
   const edgeMap  = new Map<string, import('./types').GraphEdge>();
   for (const n of allNodes) {

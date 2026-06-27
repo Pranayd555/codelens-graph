@@ -484,7 +484,7 @@ export class MCPServer {
 
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
-    console.error('[CodeLens MCP] Server ready — 9 tools on stdio');
+    console.error('[CodeLens MCP] Server ready — 10 tools on stdio');
   }
 
   async stop(): Promise<void> {

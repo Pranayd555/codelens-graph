@@ -14,11 +14,12 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
   - `deep`: Includes inline code snippets for resolved symbols, allowing agents to read necessary code details without accessing the file system file-by-file.
 - **New Dependency Edges**: Integrated `depends-on` and `peer-dependency` edge types in the graph DB to represent package dependencies and relationships.
 - **D3 Webview UI Filters & Styling**:
-  - Added filter tabs for "Node Modules" and "Configs".
+  - Added a filter tab for "Configs".
   - Implemented specific edge rendering and arrow styling for `depends_on` and `peer_dependency` relationships.
   - Pre-warmed graph simulation layout (up to 90 ticks) for larger codebases (200+ nodes) to prevent initial webview loading lag.
 
 ### Changed
+- **Completely Excluded `node_modules` from Graph Panel**: Excluded all `node_modules` files and symbols from entering the D3 webview payload, and removed the "Node Modules" filter button from the UI toolbar. Dependencies remain fully accessible to AI agents via the MCP tools (like `codelens_dependencies` or `scope: "deps"`).
 - **MCP Rules Protocol**: Updated default agent instruction rules in `skillGenerator.ts` (Rules 1, 2, 3, and 6) to guide agents on utilizing `mode: "deep"` and query dependencies via `codelens_dependencies` or `scope: "deps"`.
 - **Changed Files Filtering**: Optimized the background post-agent-run scanning (`backgroundScanner.ts`) to filter changed files against user and system exclusion patterns before updating the database.
 - **Ignore AST Keywords**: The regex parser fallback now ignores common programming language keywords (e.g., `if`, `for`, `class`, `import`) to prevent symbol naming noise.

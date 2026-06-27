@@ -10,8 +10,7 @@ export function toWebviewData(nodes: GraphNode[], edges: GraphEdge[]) {
       file: n.filePath,
       line: n.line,
       undefinedRefs: n.undefinedRefs ?? [],
-      isNodeModule: isNodeModulePath(n.filePath),
-      isConfig: isConfigPath(n.filePath) && !isNodeModulePath(n.filePath),
+      isConfig: isConfigPath(n.filePath),
     })),
     edges: edges.map(e => ({
       source: e.fromId,
@@ -218,7 +217,6 @@ body {
   <button class="filter-btn" data-type="method">Methods</button>
   <button class="filter-btn" data-type="variable">Variables</button>
   <button class="filter-btn" data-type="interface">Interfaces</button>
-  <button class="filter-btn" data-type="node_modules">Node Modules</button>
   <button class="filter-btn" data-type="configs">Configs</button>
   <button class="filter-btn issues" data-type="issues">⚠ Issues</button>
 </div>
@@ -349,16 +347,14 @@ function render() {
   let visNodes = RAW.nodes.filter(n => {
     if (n.type === 'import') { return false; }  // hide noisy import nodes
     if (activeFilter === 'all') {
-      // Exclude node_modules and configs from the "all" tab
-      if (n.isNodeModule || n.isConfig) { return false; }
-    } else if (activeFilter === 'node_modules') {
-      if (!n.isNodeModule) { return false; }
+      // Exclude configs from the "all" tab
+      if (n.isConfig) { return false; }
     } else if (activeFilter === 'configs') {
       if (!n.isConfig) { return false; }
     } else {
       // For any other activeFilter (like function, class, variable, etc.) or issues:
-      // Exclude node_modules and configs
-      if (n.isNodeModule || n.isConfig) { return false; }
+      // Exclude configs
+      if (n.isConfig) { return false; }
       if (activeFilter === 'issues') { return n.undefinedRefs && n.undefinedRefs.length > 0; }
       if (n.type !== activeFilter) { return false; }
     }
