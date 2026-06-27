@@ -134,10 +134,11 @@ export class BackgroundScanner {
     workspaceRoot: string,
     options: ScanOptions
   ): Promise<void> {
-    console.log(`[CodeLens] Agent run complete. Re-scanning ${changedFiles.length} changed files…`);
+    const allowedFiles = changedFiles.filter(fp => this.scanner.isFileAllowed(fp, workspaceRoot, options));
+    console.log(`[CodeLens] Agent run complete. Re-scanning ${allowedFiles.length} / ${changedFiles.length} allowed files…`);
     this.onStatusChange?.('updating');
 
-    for (const fp of changedFiles) {
+    for (const fp of allowedFiles) {
       try {
         await this.scanner.updateFile(fp, false);
       } catch { /* ignore individual file errors */ }

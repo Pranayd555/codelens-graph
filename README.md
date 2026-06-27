@@ -10,7 +10,7 @@
 
 ## How it works
 
-On activation, CodeLens Graph silently indexes your entire codebase into a local SQLite graph — every file, class, function, method, variable, import, and call relationship. It then starts an MCP server exposing 9 tools the agent calls natively, just like `read_file`.
+On activation, CodeLens Graph silently indexes your entire codebase into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and package dependencies (entry points, signatures, and version details from `node_modules`). It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
 
 The key insight: instead of the agent reading 5–10 files to orient itself, it calls one MCP tool and gets back only the relevant symbols, snippets, and relationships for the current task.
 
@@ -24,20 +24,21 @@ Not every task needs the same depth of context. The `codelens_triage` tool class
 |------|-----------|------|------------|
 | 1 | Typo, comment, format | None | 0 tokens |
 | 2 | "Where is X defined?" | `codelens_search` | ~50 tokens |
-| 3 | Feature / bug fix | `codelens_context` | ~200–500 tokens |
+| 3 | Feature / bug fix | `codelens_context` (short/deep) | ~200–500 tokens |
 | 4 | Refactor / rename across files | `codelens_context` + `codelens_impact` | ~600–1200 tokens |
 
 The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents a Tier 1 task from triggering a full Tier 3 context pull.
 
 ---
 
-## MCP Tools (9 total)
+## MCP Tools (10 total)
 
 | Tool | Purpose | When to use |
 |------|---------|-------------|
 | `codelens_triage` | Classify task → pick minimum tool | **Always first** |
 | `codelens_search` | Find symbol by name → exact file:line | Tier 2 |
-| `codelens_context` | Compressed context for a task | Tier 3 |
+| `codelens_context` | Compressed context for a task (`short` / `deep`) | Tier 3 |
+| `codelens_dependencies` | Query packages & configurations | Dependency analysis / configurations lookup |
 | `codelens_callers` | What calls a function | Tier 4 / before refactor |
 | `codelens_callees` | What a function calls | Tier 4 / dependencies |
 | `codelens_impact` | Full impact radius of a change | Tier 4 |
@@ -52,7 +53,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.1.0.vsix
+code --install-extension codelens-graph-0.2.0.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
@@ -115,6 +116,7 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 src/
 ├── extension.ts              # VS Code entry point, command registration
 ├── types.ts                  # GraphNode, GraphEdge, AgentContext, Diagnosis
+├── utils.ts                  # Path helpers, configuration whitelist, and node_modules filters
 ├── ingestion/
 │   ├── astParser.ts          # tree-sitter WASM parser (regex fallback)
 │   ├── workspaceScanner.ts   # Walks workspace, async file parsing
@@ -130,7 +132,7 @@ src/
 │   ├── skillGenerator.ts     # Writes .codelens/mcp.json + README
 │   └── backgroundScanner.ts  # Silent background scan on activation
 ├── mcp/
-│   ├── mcpServer.ts          # 9 MCP tools (triage, search, context…)
+│   ├── mcpServer.ts          # 10 MCP tools (triage, search, context, dependencies…)
 │   └── mcpEntry.ts           # Standalone MCP binary entry point
 └── ui/
     ├── graphPanel.ts         # D3 force-directed graph webview

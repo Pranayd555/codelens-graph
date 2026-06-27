@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import {
   GraphNode, GraphEdge, GraphSnapshot, GraphStats, NodeType, EdgeType, CallReference
 } from '../types';
+import { isConfigPath, isNodeModulePath } from '../utils';
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -229,21 +230,37 @@ export class GraphDB {
   }
 
   // Nodes that have undefined references — pre-diagnosed issues
-  getNodesWithUndefinedRefs(): GraphNode[] {
+  getNodesWithUndefinedRefs(scope: 'workspace' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
     const stmt = this.db.prepare(
       `SELECT * FROM nodes WHERE undefined_refs IS NOT NULL AND undefined_refs != '[]' ORDER BY file_path, line`
     );
     const results: GraphNode[] = [];
     while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free(); return results;
+    stmt.free();
+
+    if (scope === 'all') { return results; }
+
+    return results.filter(n => {
+      return !isNodeModulePath(n.filePath) && !isConfigPath(n.filePath);
+    });
   }
 
-  searchNodes(query: string, limit = 20): GraphNode[] {
+  searchNodes(query: string, limit = 20, scope: 'workspace' | 'deps' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
+    
+    let scopeSql = '';
+    if (scope === 'workspace') {
+      scopeSql = "AND file_path NOT LIKE '%node_modules%'";
+    } else if (scope === 'deps') {
+      // In SQLite, look for node_modules or common config extensions to filter database nodes quickly
+      scopeSql = "AND (file_path LIKE '%node_modules%' OR file_path LIKE '%.json' OR file_path LIKE '%.md')";
+    }
+
     const stmt = this.db.prepare(`
       SELECT * FROM nodes
-      WHERE lower(name) LIKE lower(?) OR lower(signature) LIKE lower(?)
+      WHERE (lower(name) LIKE lower(?) OR lower(signature) LIKE lower(?))
+      ${scopeSql}
       ORDER BY
         CASE WHEN lower(name) = lower(?) THEN 0
              WHEN lower(name) LIKE lower(?) THEN 1
@@ -254,7 +271,14 @@ export class GraphDB {
     stmt.bind([like, like, query, `${query}%`, limit]);
     const results: GraphNode[] = [];
     while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free(); return results;
+    stmt.free();
+
+    if (scope === 'workspace') {
+      return results.filter(n => !isConfigPath(n.filePath));
+    } else if (scope === 'deps') {
+      return results.filter(n => isNodeModulePath(n.filePath) || isConfigPath(n.filePath));
+    }
+    return results;
   }
 
   deleteNodesByFile(filePath: string): void {
@@ -268,14 +292,26 @@ export class GraphDB {
     this.db.run('DELETE FROM nodes WHERE file_path = ?', [filePath]);
   }
 
-  getAllFiles(): string[] {
+  getAllFiles(scope: 'workspace' | 'deps' | 'all' = 'workspace'): string[] {
     this.refreshFromDiskIfChanged();
     const stmt = this.db.prepare(
       `SELECT DISTINCT file_path FROM nodes WHERE type = 'file' ORDER BY file_path`
     );
     const results: string[] = [];
     while (stmt.step()) { results.push(stmt.getAsObject()['file_path'] as string); }
-    stmt.free(); return results;
+    stmt.free();
+
+    if (scope === 'all') { return results; }
+
+    return results.filter(fp => {
+      const isNm = isNodeModulePath(fp);
+      const isCfg = isConfigPath(fp);
+      if (scope === 'workspace') {
+        return !isNm && !isCfg;
+      } else {
+        return isNm || isCfg;
+      }
+    });
   }
 
   // ── Edge operations ───────────────────────────────────────────────────────
@@ -391,16 +427,59 @@ export class GraphDB {
 
   // ── Stats ─────────────────────────────────────────────────────────────────
 
-  getStats(): Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> {
+  getStats(scope: 'workspace' | 'all' = 'workspace'): Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> {
     this.refreshFromDiskIfChanged();
-    const totalNodes = (this.db.exec('SELECT COUNT(*) FROM nodes')[0]?.values[0][0] ?? 0) as number;
-    const totalEdges = (this.db.exec('SELECT COUNT(*) FROM edges')[0]?.values[0][0] ?? 0) as number;
-    const fileCount  = (this.db.exec(`SELECT COUNT(*) FROM nodes WHERE type='file'`)[0]?.values[0][0] ?? 0) as number;
-    const byTypeRows = this.db.exec('SELECT type, COUNT(*) FROM nodes GROUP BY type');
-    const byType: Record<string, number> = {};
-    if (byTypeRows[0]) {
-      for (const row of byTypeRows[0].values) { byType[row[0] as string] = row[1] as number; }
+    
+    if (scope === 'all') {
+      const totalNodes = (this.db.exec('SELECT COUNT(*) FROM nodes')[0]?.values[0][0] ?? 0) as number;
+      const totalEdges = (this.db.exec('SELECT COUNT(*) FROM edges')[0]?.values[0][0] ?? 0) as number;
+      const fileCount  = (this.db.exec(`SELECT COUNT(*) FROM nodes WHERE type='file'`)[0]?.values[0][0] ?? 0) as number;
+      const byTypeRows = this.db.exec('SELECT type, COUNT(*) FROM nodes GROUP BY type');
+      const byType: Record<string, number> = {};
+      if (byTypeRows[0]) {
+        for (const row of byTypeRows[0].values) { byType[row[0] as string] = row[1] as number; }
+      }
+      return { totalNodes, totalEdges, fileCount, byType: byType as Record<NodeType, number> };
     }
+
+    const wsFiles = this.getAllFiles('workspace');
+    const wsFilesSet = new Set(wsFiles);
+
+    const stmt = this.db.prepare('SELECT id, type, file_path FROM nodes');
+    let totalNodes = 0;
+    let fileCount = 0;
+    const byType: Record<string, number> = {};
+    const wsNodeIds = new Set<string>();
+
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      const fp = row['file_path'] as string;
+      const id = row['id'] as string;
+      const type = row['type'] as string;
+
+      if (wsFilesSet.has(fp)) {
+        wsNodeIds.add(id);
+        totalNodes++;
+        if (type === 'file') {
+          fileCount++;
+        }
+        byType[type] = (byType[type] || 0) + 1;
+      }
+    }
+    stmt.free();
+
+    const edgeStmt = this.db.prepare('SELECT from_id, to_id FROM edges');
+    let totalEdges = 0;
+    while (edgeStmt.step()) {
+      const row = edgeStmt.getAsObject();
+      const fromId = row['from_id'] as string;
+      const toId = row['to_id'] as string;
+      if (wsNodeIds.has(fromId) && wsNodeIds.has(toId)) {
+        totalEdges++;
+      }
+    }
+    edgeStmt.free();
+
     return { totalNodes, totalEdges, fileCount, byType: byType as Record<NodeType, number> };
   }
 
@@ -562,13 +641,22 @@ export class GraphDB {
         const target = filesByPath.get(path.normalize(targetPath));
         if (!target) { continue; }
 
+        const importerIsNm = isNodeModulePath(importerPath);
+        const targetIsNm = isNodeModulePath(targetPath);
+        let edgeType: EdgeType = 'imports';
+        if (!importerIsNm && targetIsNm) {
+          edgeType = 'depends-on';
+        } else if (importerIsNm && targetIsNm) {
+          edgeType = 'peer-dependency';
+        }
+
         this.db.run(
           'INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)',
           [
             `resolved-import::${importer.id}::${target.id}`,
             importer.id,
             target.id,
-            'imports',
+            edgeType,
             JSON.stringify({ source: importNode.name, resolution: 'workspace' }),
           ]
         );

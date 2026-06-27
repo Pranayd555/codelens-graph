@@ -27,6 +27,8 @@ export type EdgeType =
   | 'exports'
   | 'references'
   | 'modifies'
+  | 'depends-on'
+  | 'peer-dependency'
   | 'undefined_ref';   // NEW: symbol used in body but never defined/imported
 
 // ─── Graph node ────────────────────────────────────────────────────────────────
@@ -129,6 +131,7 @@ export interface AgentContext {
   diagnoses: Diagnosis[];
   tokenEstimate: number;
   generatedAt: number;
+  depVisibility?: 'full' | 'metadata' | 'hidden';
 }
 
 // NEW: a concrete issue the graph found that the agent should fix
