@@ -6,6 +6,7 @@ import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
 import { isConfigPath, isNodeModulePath } from '../utils';
+import { TextIndex, TextEntry } from '../indexing/textIndex';
 
 // ─── Task tier classifier ─────────────────────────────────────────────────────
 
@@ -28,10 +29,14 @@ function classifyTask(task: string): TierResult {
     };
   }
 
-  if (/where is|find.*function|find.*class|locate|which file|what.*returns|signature of|definition of|import path/.test(t)) {
+  if (/where is|find.*function|find.*class|locate|which file|what.*returns|signature of|definition of|import path|search.*for|string|text|comment|mention|message|print/.test(t)) {
+    const isText = /string|text|comment|mention|message|print/i.test(t);
     return {
-      tier: 2, label: 'Symbol lookup', cost: '~50 tokens', nextTool: 'codelens_search',
-      instruction: 'Call codelens_search only. After it returns, read ONLY that file:line range.',
+      tier: 2, label: 'Search & Lookup', cost: '~50 tokens',
+      nextTool: isText ? 'codelens_text_search' : 'codelens_search',
+      instruction: isText
+        ? 'Call codelens_text_search to locate the text or comment. You may also use other tools if needed.'
+        : 'Call codelens_search to locate the symbol definition. You may also use other tools if needed.',
     };
   }
 
@@ -39,13 +44,13 @@ function classifyTask(task: string): TierResult {
     return {
       tier: 4, label: 'Cross-file refactor', cost: '~600-1200 tokens',
       nextTool: 'codelens_context + codelens_impact',
-      instruction: 'Call codelens_context then codelens_impact. Read only files the graph specifies.',
+      instruction: 'Call codelens_context then codelens_impact. Tracing callers or impact helps verify changes.',
     };
   }
 
   return {
     tier: 3, label: 'Feature / bug fix', cost: '~200-500 tokens', nextTool: 'codelens_context',
-    instruction: 'Call codelens_context with your task. Read only the file:line locations returned.',
+    instruction: 'Call codelens_context for codebase context. You may also use other specific tools (like codelens_text_search or codelens_node) as necessary.',
   };
 }
 
@@ -55,8 +60,11 @@ export class MCPServer {
   private server:    any;
   private transport: any;
   private logger!:   MCPLogger;
+  private textIndex: TextIndex;
 
-  constructor(private db: GraphDB, private contextBuilder: ContextBuilder) {}
+  constructor(private db: GraphDB, private contextBuilder: ContextBuilder) {
+    this.textIndex = new TextIndex(db);
+  }
 
   async start(workspaceRoot: string): Promise<void> {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -69,7 +77,7 @@ export class MCPServer {
     this.logger = new MCPLogger(workspaceRoot);
 
     this.server = new McpServer(
-      { name: 'codelens-graph', version: '0.1.0' },
+      { name: 'codelens-graph', version: '0.2.1' },
       {
         instructions:
           'MANDATORY: Use CodeLens Graph tools for ALL codebase discovery. '
@@ -132,10 +140,10 @@ export class MCPServer {
 
     tool(
       'codelens_search',
-      'Search the full codebase for any symbol by name. '
-      + 'Use for Tier 2 tasks or to verify a symbol does not exist before creating it. '
-      + 'Returns exact file:line + signature. '
-      + 'After this call, read ONLY that specific line range — never the whole file.',
+      'Search the codebase for symbol definitions (classes, functions, methods, variables, interfaces, types) by name. '
+      + 'Returns the exact file path, line number, and symbol signature. '
+      + 'Use this for Tier 2 tasks to locate where a symbol is defined, or before creating a new symbol to ensure it does not already exist. '
+      + 'DO NOT use for arbitrary text/string searches or looking inside comments/strings (use codelens_text_search instead).',
       {
         query: z.string(),
         limit: z.number().optional().default(10),
@@ -162,11 +170,10 @@ export class MCPServer {
 
     tool(
       'codelens_context',
-      'Compressed codebase context for a feature/bugfix task (Tier 3). '
-      + 'Returns relevant symbols with optional snippets, file:line, import paths, '
-      + 'call relationships, duplicate warnings, and pre-diagnosed errors. '
-      + 'ONE call replaces reading 3-10 files. '
-      + 'After this, read ONLY the file:line locations specified.',
+      'Retrieve a compressed codebase context subgraph for a feature or bugfix task (Tier 3). '
+      + 'Returns relevant files, symbols, import paths, and call relationships. '
+      + 'Use mode "short" to get a high-level map (very cheap), or mode "deep" to pull full implementation snippets of related symbols. '
+      + 'After calling this, read ONLY the file:line ranges specified to save tokens.',
       {
         task:       z.string(),
         max_depth:  z.number().optional().default(2),
@@ -187,50 +194,44 @@ export class MCPServer {
       }
     );
 
-    // ── codelens_callers ──────────────────────────────────────────────────────
+    // ── codelens_relations ────────────────────────────────────────────────────
 
     tool(
-      'codelens_callers',
-      'Find all callers of a function. Use for Tier 4 tasks before modifying a shared API. '
-      + 'Do NOT call for simple local fixes.',
-      { symbol: z.string() },
-      async ({ symbol }: { symbol: string }) => {
+      'codelens_relations',
+      'Find callers (who calls this) and/or callees (what this calls) of a function or method. '
+      + 'Use this to map incoming or outgoing call dependencies before editing a shared symbol.',
+      {
+        symbol: z.string().describe('Name of the symbol (function or method) to query'),
+        direction: z.enum(['callers', 'callees', 'both']).optional().default('both').describe('Query incoming callers, outgoing callees, or both')
+      },
+      async ({ symbol, direction }: { symbol: string; direction: 'callers' | 'callees' | 'both' }) => {
         this.db.refreshFromDiskIfChanged();
         const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!targets.length) { return txt('"' + symbol + '" not found in graph.'); }
+        
         const lines: string[] = [];
         for (const t of targets) {
-          const callers = this.db.getEdgesTo(t.id, 'calls')
-            .map(e => this.db.getNode(e.fromId)).filter(Boolean) as GraphNode[];
-          lines.push('## ' + t.name + ' @ ' + this.rel(t.filePath, workspaceRoot) + ':' + t.line);
-          lines.push(callers.length
-            ? callers.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
-            : '  No callers found in indexed codebase.');
-          lines.push('');
-        }
-        return txt(lines.join('\n'));
-      }
-    );
-
-    // ── codelens_callees ──────────────────────────────────────────────────────
-
-    tool(
-      'codelens_callees',
-      'Find all functions a symbol calls. Use for Tier 4 or when understanding dependencies.',
-      { symbol: z.string() },
-      async ({ symbol }: { symbol: string }) => {
-        this.db.refreshFromDiskIfChanged();
-        const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
-        if (!targets.length) { return txt('"' + symbol + '" not found.'); }
-        const lines: string[] = [];
-        for (const t of targets) {
-          const callees = this.db.getEdgesFrom(t.id, 'calls')
-            .map(e => this.db.getNode(e.toId)).filter(Boolean) as GraphNode[];
-          lines.push('## ' + t.name + ' calls:');
-          lines.push(callees.length
-            ? callees.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
-            : '  No outgoing calls found.');
-          lines.push('');
+          lines.push('## Symbol: ' + t.name + ' @ ' + this.rel(t.filePath, workspaceRoot) + ':' + t.line);
+          
+          if (direction === 'callers' || direction === 'both') {
+            const callers = this.db.getEdgesTo(t.id, 'calls')
+              .map(e => this.db.getNode(e.fromId)).filter(Boolean) as GraphNode[];
+            lines.push('### Callers (Incoming):');
+            lines.push(callers.length
+              ? callers.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
+              : '  No callers found in indexed codebase.');
+            lines.push('');
+          }
+          
+          if (direction === 'callees' || direction === 'both') {
+            const callees = this.db.getEdgesFrom(t.id, 'calls')
+              .map(e => this.db.getNode(e.toId)).filter(Boolean) as GraphNode[];
+            lines.push('### Callees (Outgoing):');
+            lines.push(callees.length
+              ? callees.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
+              : '  No outgoing calls found.');
+            lines.push('');
+          }
         }
         return txt(lines.join('\n'));
       }
@@ -240,8 +241,8 @@ export class MCPServer {
 
     tool(
       'codelens_impact',
-      'Full impact radius of changing a symbol. Use for Tier 4 refactors ONLY — not bugfixes. '
-      + 'Call BEFORE refactoring to understand what else will break.',
+      'Calculate the transitive impact radius/dependency tree of changing a symbol. '
+      + 'Use before major refactoring (Tier 4) to list all files and symbols that may break or require updates.',
       { symbol: z.string(), depth: z.number().optional().default(3) },
       async ({ symbol, depth }: { symbol: string; depth?: number }) => {
         this.db.refreshFromDiskIfChanged();
@@ -269,9 +270,9 @@ export class MCPServer {
 
     tool(
       'codelens_node',
-      'Full details + code snippet for one symbol. '
-      + 'Use instead of read_file when you only need to inspect a single function body. '
-      + 'Set with_snippet=true only when you need the actual code lines.',
+      'Retrieve detailed schema information and signature for a single symbol by name. '
+      + 'Set with_snippet=true to inspect its code block/body. '
+      + 'Use this instead of reading a whole file when you only need to understand or view the implementation of one specific class or function.',
       { symbol: z.string(), with_snippet: z.boolean().optional().default(false) },
       async ({ symbol, with_snippet }: { symbol: string; with_snippet?: boolean }) => {
         this.db.refreshFromDiskIfChanged();
@@ -309,8 +310,9 @@ export class MCPServer {
 
     tool(
       'codelens_files',
-      'File structure grouped by category (routes, services, models, templates, utils...). '
-      + 'Use instead of ls/find/directory scanning. Supply filter to narrow results.',
+      'Retrieve the workspace file structure grouped by category (routes, services, models, utils...). '
+      + 'Use this instead of ls, find, or directory listing commands. '
+      + 'Supply a filter to search file paths, or set scope="deps" to find package.json, configuration files, or type definitions.',
       {
         filter: z.string().optional(),
         scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace')
@@ -477,6 +479,64 @@ export class MCPServer {
           '- Symbols with undefined refs: ' + issues,
           '- By type: ' + Object.entries(stats.byType).map(([k, v]) => k + ':' + v).join(', '),
         ].join('\n'));
+      }
+    );
+
+    // ── codelens_text_search ──────────────────────────────────────────────────
+
+    tool(
+      'codelens_text_search',
+      'Fuzzy full-text search for arbitrary strings, comments, string literals, and local variables. '
+      + 'Use this when the query is not a formal symbol name, or when looking for error messages, TODO comments, conceptual references, or specific text strings.',
+      {
+        query: z.string().describe('Text to search for (e.g., "getPatterns", "TODO", "rate limit")'),
+        fileFilter: z.string().optional().describe('Optional file extension filter, e.g. ".ts" or ".md"'),
+        inComments: z.boolean().optional().describe('Search in comments only'),
+        inStrings: z.boolean().optional().describe('Search in string literals only'),
+        limit: z.number().optional().default(10).describe('Max results')
+      },
+      async ({ query, fileFilter, inComments, inStrings, limit }: {
+        query: string;
+        fileFilter?: string;
+        inComments?: boolean;
+        inStrings?: boolean;
+        limit?: number;
+      }) => {
+        this.db.refreshFromDiskIfChanged();
+        
+        let tokenType: TextEntry['tokenType'] | undefined;
+        if (inComments) {
+          tokenType = 'comment';
+        } else if (inStrings) {
+          tokenType = 'string_literal';
+        }
+
+        const results = this.textIndex.search(query, {
+          limit,
+          fileFilter,
+          tokenType,
+          fuzzy: true
+        });
+
+        if (results.length === 0) {
+          return txt('No matches found for "' + query + '".');
+        }
+
+        const lines = [
+          '## Text Search Results for "' + query + '" (' + results.length + ' matches):',
+          ''
+        ];
+
+        for (const entry of results) {
+          const relPath = path.relative(workspaceRoot, entry.filePath).replace(/\\/g, '/');
+          lines.push('### [' + entry.tokenType + '] ' + relPath + ':' + entry.line);
+          lines.push('```');
+          lines.push(entry.rawText);
+          lines.push('```');
+          lines.push('');
+        }
+
+        return txt(lines.join('\n'));
       }
     );
 

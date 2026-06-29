@@ -327,6 +327,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         .filter(node => node.type !== 'file' && node.type !== 'import')
         .map(node => node.name);
       db.deleteNodesByFile(uri.fsPath);
+      db.deleteTextEntriesByFile(uri.fsPath);
       db.resolveWorkspaceRelationships(uri.fsPath, removedSymbols);
       db.persist();
       refreshGraphPanel();

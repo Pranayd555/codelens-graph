@@ -60,6 +60,16 @@ const SCHEMA = `
     line        INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS text_index (
+    word        TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    raw_text    TEXT NOT NULL,
+    token_type  TEXT NOT NULL,
+    PRIMARY KEY (word, file_path, line)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(file_path);
   CREATE INDEX IF NOT EXISTS idx_nodes_type  ON nodes(type);
   CREATE INDEX IF NOT EXISTS idx_nodes_name  ON nodes(name);
@@ -68,6 +78,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_edges_type  ON edges(type);
   CREATE INDEX IF NOT EXISTS idx_call_refs_from   ON call_refs(from_id);
   CREATE INDEX IF NOT EXISTS idx_call_refs_symbol ON call_refs(symbol_name);
+  CREATE INDEX IF NOT EXISTS idx_text_index_word  ON text_index(word);
+  CREATE INDEX IF NOT EXISTS idx_text_index_file  ON text_index(file_path);
 `;
 
 // ─── GraphDB ──────────────────────────────────────────────────────────────────
@@ -769,5 +781,55 @@ export class GraphDB {
       type:     row['type']     as EdgeType,
       metadata: row['metadata'] ? JSON.parse(row['metadata'] as string) : undefined,
     };
+  }
+
+  // ── Text Index Operations ──────────────────────────────────────────────────
+
+  addTextEntries(entries: any[]): void {
+    this.prepareWrite();
+    this.db.run('BEGIN');
+    try {
+      const stmt = this.db.prepare(`
+        INSERT OR IGNORE INTO text_index (word, file_path, line, text, raw_text, token_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const e of entries) {
+        stmt.run([e.word, e.filePath, e.line, e.text, e.rawText, e.tokenType]);
+      }
+      stmt.free();
+      this.db.run('COMMIT');
+    } catch (e) {
+      this.db.run('ROLLBACK');
+      throw e;
+    }
+  }
+
+  deleteTextEntriesByFile(filePath: string): void {
+    this.prepareWrite();
+    this.db.run('DELETE FROM text_index WHERE file_path = ?', [filePath]);
+  }
+
+  getTextEntriesByWord(word: string, exact: boolean): any[] {
+    this.refreshFromDiskIfChanged();
+    const query = exact
+      ? 'SELECT * FROM text_index WHERE word = ?'
+      : 'SELECT * FROM text_index WHERE word LIKE ?';
+    const param = exact ? word : `${word}%`;
+    const stmt = this.db.prepare(query);
+    stmt.bind([param]);
+    const results: any[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      results.push({
+        word: row.word,
+        filePath: row.file_path,
+        line: row.line as number,
+        text: row.text,
+        rawText: row.raw_text,
+        tokenType: row.token_type,
+      });
+    }
+    stmt.free();
+    return results;
   }
 }

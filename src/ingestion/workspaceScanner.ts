@@ -4,6 +4,7 @@ import { ASTParser } from './astParser';
 import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
 import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile } from '../utils';
+import { TextIndex } from '../indexing/textIndex';
 
 export interface ScanOptions {
   excludePatterns:     string[];
@@ -143,7 +144,10 @@ const ALWAYS_EXCLUDE_FILES = new Set([
 // ─── WorkspaceScanner ─────────────────────────────────────────────────────────
 
 export class WorkspaceScanner {
-  constructor(private parser: ASTParser, private db: GraphDB) {}
+  private textIndex: TextIndex;
+  constructor(private parser: ASTParser, private db: GraphDB) {
+    this.textIndex = new TextIndex(db);
+  }
 
   async scanWorkspace(rootPaths: string[], options: ScanOptions): Promise<ScanResult> {
     const start  = Date.now();
@@ -190,6 +194,7 @@ export class WorkspaceScanner {
           this.db.upsertNodes(parsed.nodes);
           this.db.upsertEdges(parsed.edges);
           this.db.upsertCallRefs(parsed.callRefs);
+          await this.textIndex.buildForFile(filePath, parsed.language);
           result.nodesAdded += parsed.nodes.length;
           result.edgesAdded += parsed.edges.length;
           result.filesScanned++;
@@ -220,6 +225,7 @@ export class WorkspaceScanner {
       this.db.upsertNodes(parsed.nodes);
       this.db.upsertEdges(parsed.edges);
       this.db.upsertCallRefs(parsed.callRefs);
+      await this.textIndex.buildForFile(filePath, parsed.language);
     }
     if (resolveRelationships) {
       const currentSymbols = parsed.nodes
