@@ -42,7 +42,8 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     setTimeout(() => this.sendData(), 200);
   }
 
-  refresh(): void {
+  async refresh(): Promise<void> {
+    await this.db.ensureInit();
     if (!this.view?.visible) {
       const stats  = this.db.getStats();
       const issues = this.db.getNodesWithUndefinedRefs().length;
@@ -50,7 +51,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
       this.lastIssues = issues;
       return;
     }
-    this.sendData();
+    await this.sendData();
   }
 
   updateSavings(tokens: number, calls: number): void {
@@ -58,8 +59,9 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     this.view.webview.postMessage({ command: 'updateSavings', tokens, calls });
   }
 
-  private sendData(): void {
+  private async sendData(): Promise<void> {
     if (!this.view) { return; }
+    await this.db.ensureInit();
     const stats  = this.db.getStats();
     const issues = this.db.getNodesWithUndefinedRefs().length;
     this.lastStats  = stats;

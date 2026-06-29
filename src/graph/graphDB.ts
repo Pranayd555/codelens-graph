@@ -1,6 +1,4 @@
 // sql.js ships as CommonJS — use require()
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const initSqlJs = require('sql.js') as typeof import('sql.js').default;
 type Database = import('sql.js').Database;
 import * as path from 'path';
 import * as fs from 'fs';
@@ -77,33 +75,54 @@ const SCHEMA = `
 export class GraphDB {
   private db!: Database;
   private dbPath: string;
-  private SQL!: Awaited<ReturnType<typeof initSqlJs>>;
+  private SQL!: any;
   private fileVersion = '';
   private dirty = false;
+  private initPromise: Promise<void> | null = null;
 
   constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
   }
 
   async init(): Promise<void> {
-    // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
-    const wasmDir = (() => {
-      const distWasm = require('path').join(__dirname, 'wasm');
-      const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
-      return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
+    if (this.initPromise) { return this.initPromise; }
+    
+    this.initPromise = (async () => {
+      // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
+      const wasmDir = (() => {
+        const distWasm = require('path').join(__dirname, 'wasm');
+        const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
+        return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
+      })();
+      
+      const initSqlJs = require('sql.js') as typeof import('sql.js').default;
+      this.SQL = await initSqlJs({
+        locateFile: (file: string) => require('path').join(wasmDir, file),
+      });
+      if (fs.existsSync(this.dbPath)) {
+        try {
+          const data = fs.readFileSync(this.dbPath);
+          this.db = new this.SQL.Database(data);
+        } catch (err) {
+          console.warn(`[CodeLens] Failed to load database from disk (${this.dbPath}), falling back to a fresh DB:`, err);
+          this.db = new this.SQL.Database();
+        }
+      } else {
+        this.db = new this.SQL.Database();
+      }
+      this.db.run(SCHEMA);
+      this.runMigrations();
+      // DO NOT call this.persist() on init — avoid redundant slow write when no changes were made.
     })();
-    this.SQL = await initSqlJs({
-      locateFile: (file: string) => require('path').join(wasmDir, file),
-    });
-    if (fs.existsSync(this.dbPath)) {
-      const data = fs.readFileSync(this.dbPath);
-      this.db = new this.SQL.Database(data);
-    } else {
-      this.db = new this.SQL.Database();
+
+    return this.initPromise;
+  }
+
+  async ensureInit(): Promise<void> {
+    if (!this.initPromise) {
+      await this.init();
     }
-    this.db.run(SCHEMA);
-    this.runMigrations();
-    this.persist();
+    return this.initPromise!;
   }
 
   // Add columns that didn't exist in earlier schema versions
@@ -135,17 +154,25 @@ export class GraphDB {
   // workspace-local DB while MCP reads it from another process, so readers
   // must reload when the file changes instead of serving a stale snapshot.
   refreshFromDiskIfChanged(): boolean {
+    if (!this.db) {
+      throw new Error('Database not initialized. Ensure init() has completed successfully.');
+    }
     if (this.dirty || !fs.existsSync(this.dbPath)) { return false; }
     const currentVersion = this.getFileVersion();
     if (!currentVersion || currentVersion === this.fileVersion) { return false; }
 
-    const data = fs.readFileSync(this.dbPath);
-    const replacement = new this.SQL.Database(data);
-    this.db.close();
-    this.db = replacement;
-    this.db.run(SCHEMA);
-    this.fileVersion = currentVersion;
-    return true;
+    try {
+      const data = fs.readFileSync(this.dbPath);
+      const replacement = new this.SQL.Database(data);
+      this.db.close();
+      this.db = replacement;
+      this.db.run(SCHEMA);
+      this.fileVersion = currentVersion;
+      return true;
+    } catch (err) {
+      console.warn(`[CodeLens] Failed to reload database from disk (${this.dbPath}):`, err);
+      return false;
+    }
   }
 
   private getFileVersion(): string {
@@ -158,6 +185,9 @@ export class GraphDB {
   }
 
   private prepareWrite(): void {
+    if (!this.db) {
+      throw new Error('Database not initialized. Ensure init() has completed successfully.');
+    }
     this.refreshFromDiskIfChanged();
     this.dirty = true;
   }
