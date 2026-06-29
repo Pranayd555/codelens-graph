@@ -197,11 +197,11 @@ body {
     <div class="section-title">MCP Server</div>
     <div class="mcp-badge">
       <div class="dot green"></div>
-      <span>9 tools available</span>
+      <span>10 tools available</span>
     </div>
     <div class="tool-list">
-      codelens_triage · codelens_search · codelens_context<br>
-      codelens_callers · codelens_callees · codelens_impact<br>
+      codelens_triage · codelens_search · codelens_context · codelens_dependencies<br>
+      codelens_relations · codelens_impact · codelens_text_search<br>
       codelens_node · codelens_files · codelens_status
     </div>
     <button class="btn btn-secondary" onclick="send('copyMcpConfig')">⎘ Copy MCP Config</button>

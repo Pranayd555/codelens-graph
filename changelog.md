@@ -4,6 +4,26 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [0.2.1] - 2026-06-29
+
+### Added
+- **Asynchronous DB Initialization**: Defer database loading and sql.js WASM compilation to background promises, reducing extension host activation block to under 30ms.
+- **DB Access Guards**: Integrated `ensureInit()` awaiters across all commands, watchers, and views to handle lazy database loading safely.
+- **WASM Lazy Loading**: Moved the heavy `sql.js` require block to only load when the database is first initialized, reducing bundle load latency.
+- **Database Corruption Recovery**: Added try-catch fallbacks to reload and initialization code; if the database file gets corrupted on disk, it falls back to a clean DB instead of crashing.
+- **Keyword Guards for Regex Fallback**: Implemented a negative lookahead guard (`(?!(?:if|for|while|switch|catch...)\b)`) in the fallback parser method regex to prevent control flow statements from being matched as symbols.
+- **Command Error Handlers**: Wrapped user-facing commands (`manualBuild`, `showContextPreview`, `searchSymbol`) in try-catch wrappers to display friendly VS Code error alerts on failure.
+- **Text Indexing & Fuzzy Search**: Implemented a lightweight line-based fuzzy text index and search (`codelens_text_search` MCP tool) to find comments, string literals, and arbitrary text mentions.
+- **Unified Call Relations Tool**: Combined callers and callees queries into a single, unified `codelens_relations` tool supporting custom direction queries.
+- **In-Memory Version Tracking**: Replaced slow disk file stat checks with instant, zero-I/O in-memory version increments to detect graph mutations.
+- **Live UI Syncing**: Wired a unified `refreshAll` callback into all file system watchers and scanner events to refresh both the sidebar stats and the graph explorer UI synchronously.
+- **Custom Markdown Visibility**: Treated non-generated workspace `.md` files as configuration paths to make them easily discoverable in agent configuration queries.
+
+### Removed
+- **Redundant Startup DB Write**: Removed the slow, redundant `this.persist()` write from database startup sequence.
+
+---
+
 ## [0.2.0] - 2026-06-27
 
 ### Added

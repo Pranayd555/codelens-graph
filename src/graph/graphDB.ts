@@ -91,9 +91,14 @@ export class GraphDB {
   private fileVersion = '';
   private dirty = false;
   private initPromise: Promise<void> | null = null;
+  private version = 0;
 
   constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
+  }
+
+  getVersion(): number {
+    return this.version;
   }
 
   async init(): Promise<void> {
@@ -124,6 +129,7 @@ export class GraphDB {
       }
       this.db.run(SCHEMA);
       this.runMigrations();
+      this.version++;
       // DO NOT call this.persist() on init — avoid redundant slow write when no changes were made.
     })();
 
@@ -155,6 +161,7 @@ export class GraphDB {
     fs.writeFileSync(this.dbPath, data);
     this.dirty = false;
     this.fileVersion = this.getFileVersion();
+    this.version++;
   }
 
   close(): void {
@@ -180,6 +187,7 @@ export class GraphDB {
       this.db = replacement;
       this.db.run(SCHEMA);
       this.fileVersion = currentVersion;
+      this.version++;
       return true;
     } catch (err) {
       console.warn(`[CodeLens] Failed to reload database from disk (${this.dbPath}):`, err);

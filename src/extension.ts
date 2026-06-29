@@ -128,17 +128,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (state === 'ready')     {
       const s = db.getStats();
       setStatus('ready', s.totalNodes, s.totalEdges);
-      refreshGraphPanel();
-      statsViewProvider?.refresh();
+      refreshAll();
     }
     if (state === 'error')     { setStatus('error'); }
   });
 
   backgroundScanner.onComplete(stats => {
     setStatus('ready', stats.totalNodes, stats.totalEdges);
-    refreshGraphPanel();
-    statsViewProvider?.refresh();
-    refreshSavings();
+    refreshAll();
   });
 
   backgroundScanner.onSkills(_written => {
@@ -310,14 +307,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
       });
-      refreshGraphPanel();
+      refreshAll();
     });
 
     fsWatcher.onDidCreate(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
       await db.ensureInit();
       await fileWatcher.handleFileCreate(uri.fsPath);
-      refreshGraphPanel();
+      refreshAll();
     });
 
     fsWatcher.onDidDelete(async uri => {
@@ -330,7 +327,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       db.deleteTextEntriesByFile(uri.fsPath);
       db.resolveWorkspaceRelationships(uri.fsPath, removedSymbols);
       db.persist();
-      refreshGraphPanel();
+      refreshAll();
     });
 
     context.subscriptions.push(fsWatcher);
@@ -392,8 +389,7 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
       const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: result.durationMs };
 
       setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
-      refreshGraphPanel();
-      statsViewProvider?.refresh();
+      refreshAll();
 
       // Generate / update skill files
       const ides = await getOrPromptSelectedIdes(context);
@@ -413,21 +409,7 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
 
 // ─── showGraphPanel ───────────────────────────────────────────────────────────
 
-let lastSentVersion = '';
-
-function getGraphVersion(): string {
-  try {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-    if (workspaceRoot) {
-      const dbPath = path.join(workspaceRoot, '.codelens', 'codelens-graph.db');
-      if (fs.existsSync(dbPath)) {
-        const stat = fs.statSync(dbPath);
-        return `${stat.mtimeMs}:${stat.size}`;
-      }
-    }
-  } catch { /* ignore */ }
-  return '';
-}
+let lastSentVersion = -1;
 
 function buildGraphWebviewData() {
   const allFiles = db.getAllFiles('all').filter(f => !isNodeModulePath(f));
@@ -459,7 +441,7 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
     }
   );
 
-  lastSentVersion = getGraphVersion();
+  lastSentVersion = db.getVersion();
   const nonce   = crypto.randomBytes(16).toString('hex');
   const initial = buildGraphWebviewData();
   graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
@@ -478,7 +460,7 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
     }
     if (msg.command === 'ready') {
       // Webview JS finished loading. Only push if version changed!
-      const currentVersion = getGraphVersion();
+      const currentVersion = db.getVersion();
       if (currentVersion !== lastSentVersion) {
         lastSentVersion = currentVersion;
         const data = buildGraphWebviewData();
@@ -493,7 +475,7 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
     if (e.webviewPanel.visible) {
       setTimeout(() => {
         if (!graphPanel) { return; }
-        const currentVersion = getGraphVersion();
+        const currentVersion = db.getVersion();
         if (currentVersion !== lastSentVersion) {
           lastSentVersion = currentVersion;
           const data = buildGraphWebviewData();
@@ -516,13 +498,12 @@ function refreshSavings(): void {
     if (logs.length === 0) { return; }
     // Savings = estimated tokens a naive agent would spend reading files
     // minus what CodeLens tools actually cost.
-    // Each codelens_context call replaces ~2000 tokens of file reads.
+    // Each codelens_context call replaces ~1800 tokens of file reads.
     // Each codelens_search call replaces ~400 tokens of grep + file reads.
     const toolCounts = logs.reduce((m, l) => { m[l.tool] = (m[l.tool] || 0) + 1; return m; }, {} as Record<string, number>);
     const saved = (toolCounts['codelens_context'] ?? 0) * 1800
                 + (toolCounts['codelens_search']  ?? 0) * 400
-                + (toolCounts['codelens_callers'] ?? 0) * 300
-                + (toolCounts['codelens_callees'] ?? 0) * 300
+                + (toolCounts['codelens_relations'] ?? 0) * 300
                 + (toolCounts['codelens_impact']  ?? 0) * 500
                 + (toolCounts['codelens_node']    ?? 0) * 200
                 + (toolCounts['codelens_files']   ?? 0) * 600;
@@ -536,9 +517,15 @@ function refreshSavings(): void {
 
 function refreshGraphPanel(): void {
   if (!graphPanel?.visible) { return; }
-  lastSentVersion = getGraphVersion();
+  lastSentVersion = db.getVersion();
   const data = buildGraphWebviewData();
   graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
+}
+
+function refreshAll(): void {
+  refreshGraphPanel();
+  statsViewProvider?.refresh();
+  refreshSavings();
 }
 
 // ─── showContextPreview ───────────────────────────────────────────────────────

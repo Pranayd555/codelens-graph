@@ -2,7 +2,7 @@
   "name": "codelens-graph",
   "displayName": "CodeLens Graph",
   "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "PranayDas",
   "repository": {
     "type": "git",
