@@ -39,8 +39,8 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 | `codelens_search` | Find symbol by name → exact file:line | Tier 2 |
 | `codelens_context` | Compressed context for a task (`short` / `deep`) | Tier 3 |
 | `codelens_dependencies` | Query packages & configurations | Dependency analysis / configurations lookup |
-| `codelens_callers` | What calls a function | Tier 4 / before refactor |
-| `codelens_callees` | What a function calls | Tier 4 / dependencies |
+| `codelens_relations` | Find callers (incoming) or callees (outgoing) of a symbol | Tier 4 / refactor |
+| `codelens_text_search` | Fuzzy search for comments, strings, or arbitrary text | Tier 2 / keyword lookup |
 | `codelens_impact` | Full impact radius of a change | Tier 4 |
 | `codelens_node` | Full details + snippet for one symbol | Any tier |
 | `codelens_files` | File structure by category | Project orientation |
@@ -53,7 +53,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.2.0.vsix
+code --install-extension codelens-graph-0.2.1.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`

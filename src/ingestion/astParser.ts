@@ -703,7 +703,7 @@ class RegexFallbackParser {
       { r: /(?:export\s+)?interface\s+(\w+)/,                                  t: 'interface' },
       { r: /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(/,                 t: 'function'  },
       { r: /(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(.*\)\s*=>/,      t: 'function'  },
-      { r: /^\s+(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*(\w+)\s*\(/, t: 'method' },
+      { r: /^\s+(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*(?!(?:if|for|while|switch|catch|foreach|using|lock|synchronized|with|elif|except|until|unless)\b)(\w+)\s*\(/, t: 'method' },
       { r: /^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=/,                     t: 'variable'  },
     ];
 

@@ -55,7 +55,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return context.workspaceState.get<string[]>('selectedIdes') ?? [];
   });
 
-  await db.init();
+  // Start database initialization asynchronously in the background.
+  db.init().then(() => {
+    const cfg = getConfig();
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+    if (workspaceRoot) {
+      const stats = db.getStats();
+
+      if (stats.totalNodes === 0) {
+        // First install: show scanning status immediately so user knows it's working
+        setStatus('scanning');
+        backgroundScanner.scheduleInitialScan(workspaceRoot, {
+          excludePatterns:     cfg.excludePatterns,
+          supportedExtensions: cfg.supportedExtensions,
+        }, context);
+
+        // Prompt the user for IDE preferences on first install/activation
+        if (context.workspaceState.get('selectedIdes') === undefined) {
+          vscode.window.showInformationMessage(
+            'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
+            'Select IDEs',
+            'Skip'
+          ).then(async choice => {
+            if (choice === 'Select IDEs') {
+              await getOrPromptSelectedIdes(context, true);
+            } else {
+              await context.workspaceState.update('selectedIdes', []);
+            }
+            // Regenerate skills immediately with choice if scanner finished
+            const dbStats = db.getStats();
+            if (dbStats.totalNodes > 0) {
+              const fullStats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
+              const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
+              skillGenerator.generateAll(workspaceRoot, fullStats, ides);
+            }
+          });
+        }
+      } else {
+        // Already have a graph — refresh skills and show ready
+        setStatus('ready', stats.totalNodes, stats.totalEdges);
+        statsViewProvider?.refresh();
+        const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
+        const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
+        skillGenerator.generateAll(workspaceRoot, fullStats, ides);
+        console.log(`[CodeLens] Existing graph loaded: ${stats.totalNodes} nodes. Skills refreshed.`);
+      }
+    }
+  }).catch(err => {
+    console.error('[CodeLens] Database initialization failed:', err);
+    setStatus('error');
+  });
 
   // ── 2. Status bar ──────────────────────────────────────────────────────────
 
@@ -79,17 +128,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (state === 'ready')     {
       const s = db.getStats();
       setStatus('ready', s.totalNodes, s.totalEdges);
-      refreshGraphPanel();
-      statsViewProvider?.refresh();
+      refreshAll();
     }
     if (state === 'error')     { setStatus('error'); }
   });
 
   backgroundScanner.onComplete(stats => {
     setStatus('ready', stats.totalNodes, stats.totalEdges);
-    refreshGraphPanel();
-    statsViewProvider?.refresh();
-    refreshSavings();
+    refreshAll();
   });
 
   backgroundScanner.onSkills(_written => {
@@ -126,8 +172,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     // Graph viewer
-    vscode.commands.registerCommand('codelens-graph.showGraph', () => {
-      showGraphPanel(context);
+    vscode.commands.registerCommand('codelens-graph.showGraph', async () => {
+      await showGraphPanel(context);
     }),
 
     // Agent context preview (still available for debugging)
@@ -145,6 +191,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Called by the AI agent BEFORE starting work on a task.
     // Returns a compressed context JSON — the agent reads it, not the user.
     vscode.commands.registerCommand('codelens-graph.getContextForTask', async (taskDescription?: string, mode?: 'short' | 'deep') => {
+      await db.ensureInit();
       const task = taskDescription
         ?? await vscode.window.showInputBox({ prompt: 'Task description for context lookup' });
       if (!task) { return; }
@@ -167,6 +214,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Called by the AI agent AFTER it finishes making changes.
     // Re-scans changed files and regenerates skill files.
     vscode.commands.registerCommand('codelens-graph.updateAfterAgentRun', async (changedFiles?: string[]) => {
+      await db.ensureInit();
       const cfg = getConfig();
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
       if (!workspaceRoot) { return; }
@@ -224,6 +272,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Regenerate skill/MCP config files (no rescan)
     vscode.commands.registerCommand('codelens-graph.regenerateSkills', async () => {
+      await db.ensureInit();
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
       if (!workspaceRoot) { return; }
       const dbStats = db.getStats();
@@ -253,77 +302,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     fsWatcher.onDidChange(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      await db.ensureInit();
       await backgroundScanner.handleFileChanged(uri.fsPath, workspaceRoot, {
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
       });
-      refreshGraphPanel();
+      refreshAll();
     });
 
     fsWatcher.onDidCreate(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      await db.ensureInit();
       await fileWatcher.handleFileCreate(uri.fsPath);
-      refreshGraphPanel();
+      refreshAll();
     });
 
-    fsWatcher.onDidDelete(uri => {
+    fsWatcher.onDidDelete(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      await db.ensureInit();
       const removedSymbols = db.getNodesByFile(uri.fsPath)
         .filter(node => node.type !== 'file' && node.type !== 'import')
         .map(node => node.name);
       db.deleteNodesByFile(uri.fsPath);
+      db.deleteTextEntriesByFile(uri.fsPath);
       db.resolveWorkspaceRelationships(uri.fsPath, removedSymbols);
       db.persist();
-      refreshGraphPanel();
+      refreshAll();
     });
 
     context.subscriptions.push(fsWatcher);
   }
 
-  // ── 7. Auto-scan on activation (the core of autonomous operation) ─────────
-
-  if (workspaceRoot) {
-    const stats = db.getStats();
-
-    if (stats.totalNodes === 0) {
-      // First install: show scanning status immediately so user knows it's working
-      setStatus('scanning');
-      backgroundScanner.scheduleInitialScan(workspaceRoot, {
-        excludePatterns:     cfg.excludePatterns,
-        supportedExtensions: cfg.supportedExtensions,
-      }, context);
-
-      // Prompt the user for IDE preferences on first install/activation
-      if (context.workspaceState.get('selectedIdes') === undefined) {
-        vscode.window.showInformationMessage(
-          'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
-          'Select IDEs',
-          'Skip'
-        ).then(async choice => {
-          if (choice === 'Select IDEs') {
-            await getOrPromptSelectedIdes(context, true);
-          } else {
-            await context.workspaceState.update('selectedIdes', []);
-          }
-          // Regenerate skills immediately with choice if scanner finished
-          const dbStats = db.getStats();
-          if (dbStats.totalNodes > 0) {
-            const fullStats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
-            const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
-            skillGenerator.generateAll(workspaceRoot, fullStats, ides);
-          }
-        });
-      }
-    } else {
-      // Already have a graph — refresh skills and show ready
-      setStatus('ready', stats.totalNodes, stats.totalEdges);
-      statsViewProvider?.refresh();
-      const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
-      const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
-      skillGenerator.generateAll(workspaceRoot, fullStats, ides);
-      console.log(`[CodeLens] Existing graph loaded: ${stats.totalNodes} nodes. Skills refreshed.`);
-    }
-  }
+  // ── 7. Auto-scan on activation (deferred to db.init() resolution) ────────
 
 
   // Refresh savings display every 30s — updates while agent is actively working
@@ -347,6 +357,7 @@ export function deactivate(): void {
 // Triggered by the user explicitly. Shows progress UI unlike background scan.
 
 async function manualBuild(context: vscode.ExtensionContext, _force = false): Promise<void> {
+  await db.ensureInit();
   const folders = vscode.workspace.workspaceFolders;
   if (!folders?.length) {
     vscode.window.showWarningMessage('CodeLens Graph: No workspace folder open.');
@@ -362,53 +373,43 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
     title:       'CodeLens: Building knowledge graph…',
     cancellable: false,
   }, async (progress) => {
+    try {
+      const result = await scanner.scanWorkspace([workspaceRoot], {
+        excludePatterns:     cfg.excludePatterns,
+        supportedExtensions: cfg.supportedExtensions,
+        onProgress: (current, total, filePath) => {
+          progress.report({
+            message:   `${Math.round((current / total) * 100)}%  ${path.basename(filePath)}`,
+            increment: 100 / total,
+          });
+        },
+      });
 
-    const result = await scanner.scanWorkspace([workspaceRoot], {
-      excludePatterns:     cfg.excludePatterns,
-      supportedExtensions: cfg.supportedExtensions,
-      onProgress: (current, total, filePath) => {
-        progress.report({
-          message:   `${Math.round((current / total) * 100)}%  ${path.basename(filePath)}`,
-          increment: 100 / total,
-        });
-      },
-    });
+      const dbStats = db.getStats();
+      const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: result.durationMs };
 
-    const dbStats = db.getStats();
-    const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: result.durationMs };
+      setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
+      refreshAll();
 
-    setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
-    refreshGraphPanel();
-    statsViewProvider?.refresh();
+      // Generate / update skill files
+      const ides = await getOrPromptSelectedIdes(context);
+      const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
 
-    // Generate / update skill files
-    const ides = await getOrPromptSelectedIdes(context);
-    const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
-
-    vscode.window.showInformationMessage(
-      `CodeLens Graph: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.durationMs}ms` +
-      ` | Skills → ${written.length} agent rule files updated`
-    );
+      vscode.window.showInformationMessage(
+        `CodeLens Graph: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.durationMs}ms` +
+        ` | Skills → ${written.length} agent rule files updated`
+      );
+    } catch (err: any) {
+      console.error('[CodeLens] Manual build failed:', err);
+      vscode.window.showErrorMessage(`CodeLens build failed: ${err?.message || err}`);
+      setStatus('error');
+    }
   });
 }
 
 // ─── showGraphPanel ───────────────────────────────────────────────────────────
 
-let lastSentVersion = '';
-
-function getGraphVersion(): string {
-  try {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-    if (workspaceRoot) {
-      const dbPath = path.join(workspaceRoot, '.codelens', 'codelens-graph.db');
-      if (fs.existsSync(dbPath)) {
-        const stat = fs.statSync(dbPath);
-        return `${stat.mtimeMs}:${stat.size}`;
-      }
-    }
-  } catch { /* ignore */ }
-  return '';
-}
+let lastSentVersion = -1;
 
 function buildGraphWebviewData() {
   const allFiles = db.getAllFiles('all').filter(f => !isNodeModulePath(f));
@@ -421,7 +422,8 @@ function buildGraphWebviewData() {
   return toWebviewData(allNodes, [...edgeMap.values()]);
 }
 
-function showGraphPanel(context: vscode.ExtensionContext): void {
+async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
+  await db.ensureInit();
   if (graphPanel) {
     graphPanel.reveal(vscode.ViewColumn.Beside, false);
     return;
@@ -439,7 +441,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
     }
   );
 
-  lastSentVersion = getGraphVersion();
+  lastSentVersion = db.getVersion();
   const nonce   = crypto.randomBytes(16).toString('hex');
   const initial = buildGraphWebviewData();
   graphPanel.webview.html = getGraphPanelHtml(initial, nonce);
@@ -458,7 +460,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
     }
     if (msg.command === 'ready') {
       // Webview JS finished loading. Only push if version changed!
-      const currentVersion = getGraphVersion();
+      const currentVersion = db.getVersion();
       if (currentVersion !== lastSentVersion) {
         lastSentVersion = currentVersion;
         const data = buildGraphWebviewData();
@@ -473,7 +475,7 @@ function showGraphPanel(context: vscode.ExtensionContext): void {
     if (e.webviewPanel.visible) {
       setTimeout(() => {
         if (!graphPanel) { return; }
-        const currentVersion = getGraphVersion();
+        const currentVersion = db.getVersion();
         if (currentVersion !== lastSentVersion) {
           lastSentVersion = currentVersion;
           const data = buildGraphWebviewData();
@@ -496,13 +498,12 @@ function refreshSavings(): void {
     if (logs.length === 0) { return; }
     // Savings = estimated tokens a naive agent would spend reading files
     // minus what CodeLens tools actually cost.
-    // Each codelens_context call replaces ~2000 tokens of file reads.
+    // Each codelens_context call replaces ~1800 tokens of file reads.
     // Each codelens_search call replaces ~400 tokens of grep + file reads.
     const toolCounts = logs.reduce((m, l) => { m[l.tool] = (m[l.tool] || 0) + 1; return m; }, {} as Record<string, number>);
     const saved = (toolCounts['codelens_context'] ?? 0) * 1800
                 + (toolCounts['codelens_search']  ?? 0) * 400
-                + (toolCounts['codelens_callers'] ?? 0) * 300
-                + (toolCounts['codelens_callees'] ?? 0) * 300
+                + (toolCounts['codelens_relations'] ?? 0) * 300
                 + (toolCounts['codelens_impact']  ?? 0) * 500
                 + (toolCounts['codelens_node']    ?? 0) * 200
                 + (toolCounts['codelens_files']   ?? 0) * 600;
@@ -516,77 +517,93 @@ function refreshSavings(): void {
 
 function refreshGraphPanel(): void {
   if (!graphPanel?.visible) { return; }
-  lastSentVersion = getGraphVersion();
+  lastSentVersion = db.getVersion();
   const data = buildGraphWebviewData();
   graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
+}
+
+function refreshAll(): void {
+  refreshGraphPanel();
+  statsViewProvider?.refresh();
+  refreshSavings();
 }
 
 // ─── showContextPreview ───────────────────────────────────────────────────────
 
 async function showContextPreview(): Promise<void> {
-  const task = await vscode.window.showInputBox({
-    prompt:      'Describe the AI agent task',
-    placeHolder: 'e.g. "add rate limiting to auth middleware"',
-  });
-  if (!task) { return; }
+  try {
+    await db.ensureInit();
+    const task = await vscode.window.showInputBox({
+      prompt:      'Describe the AI agent task',
+      placeHolder: 'e.g. "add rate limiting to auth middleware"',
+    });
+    if (!task) { return; }
 
-  const modeChoice = await vscode.window.showQuickPick(['short', 'deep'], {
-    title: 'Select Context Detail Level',
-    placeHolder: 'short (file map + signatures) or deep (includes code snippets)',
-  });
-  if (!modeChoice) { return; }
-  const mode = modeChoice as 'short' | 'deep';
+    const modeChoice = await vscode.window.showQuickPick(['short', 'deep'], {
+      title: 'Select Context Detail Level',
+      placeHolder: 'short (file map + signatures) or deep (includes code snippets)',
+    });
+    if (!modeChoice) { return; }
+    const mode = modeChoice as 'short' | 'deep';
 
-  const cfg    = getConfig();
-  const ctx    = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget, mode);
-  const output = contextBuilder.buildSystemPromptInjection(ctx, mode);
+    const cfg    = getConfig();
+    const ctx    = contextBuilder.build(task, cfg.maxGraphDepth, cfg.maxTokenBudget, mode);
+    const output = contextBuilder.buildSystemPromptInjection(ctx, mode);
 
-  const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: [
-    `# CodeLens Agent Context`,
-    `**Task:** ${task}`,
-    `**Tokens:** ~${ctx.tokenEstimate}  |  **Symbols:** ${ctx.subgraph.nodes.length}`,
-    '',
-    '```', output, '```',
-    '',
-    ctx.warnings.length
-      ? '## ⚠️ Warnings\n' + ctx.warnings.map(w => `- ${w}`).join('\n')
-      : '## ✅ No conflicts detected',
-  ].join('\n') });
+    const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: [
+      `# CodeLens Agent Context`,
+      `**Task:** ${task}`,
+      `**Tokens:** ~${ctx.tokenEstimate}  |  **Symbols:** ${ctx.subgraph.nodes.length}`,
+      '',
+      '```', output, '```',
+      '',
+      ctx.warnings.length
+        ? '## ⚠️ Warnings\n' + ctx.warnings.map(w => `- ${w}`).join('\n')
+        : '## ✅ No conflicts detected',
+    ].join('\n') });
 
-  await vscode.window.showTextDocument(doc);
+    await vscode.window.showTextDocument(doc);
+  } catch (err: any) {
+    vscode.window.showErrorMessage(`CodeLens: Failed to show context preview: ${err?.message || err}`);
+  }
 }
 
 // ─── searchSymbol ─────────────────────────────────────────────────────────────
 
 async function searchSymbol(): Promise<void> {
-  const query = await vscode.window.showInputBox({
-    prompt: 'Search symbol in graph', placeHolder: 'function / class / variable name…',
-  });
-  if (!query) { return; }
-
-  const results = db.searchNodes(query, 20);
-  if (!results.length) {
-    vscode.window.showInformationMessage(`No symbols found for "${query}"`);
-    return;
-  }
-
-  const selected = await vscode.window.showQuickPick(
-    results.map(n => ({
-      label:       `$(symbol-${n.type === 'function' ? 'method' : n.type}) ${n.name}`,
-      description: `${n.type} · ${path.basename(n.filePath)}:${n.line}`,
-      detail:      n.signature?.slice(0, 120),
-      node:        n,
-    })),
-    { matchOnDescription: true, matchOnDetail: true }
-  );
-
-  if (selected) {
-    await vscode.window.showTextDocument(vscode.Uri.file(selected.node.filePath), {
-      selection: new vscode.Range(
-        new vscode.Position(Math.max(0, selected.node.line - 1), 0),
-        new vscode.Position(Math.max(0, selected.node.line - 1), 0)
-      )
+  try {
+    await db.ensureInit();
+    const query = await vscode.window.showInputBox({
+      prompt: 'Search symbol in graph', placeHolder: 'function / class / variable name…',
     });
+    if (!query) { return; }
+
+    const results = db.searchNodes(query, 20);
+    if (!results.length) {
+      vscode.window.showInformationMessage(`No symbols found for "${query}"`);
+      return;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      results.map(n => ({
+        label:       `$(symbol-${n.type === 'function' ? 'method' : n.type}) ${n.name}`,
+        description: `${n.type} · ${path.basename(n.filePath)}:${n.line}`,
+        detail:      n.signature?.slice(0, 120),
+        node:        n,
+      })),
+      { matchOnDescription: true, matchOnDetail: true }
+    );
+
+    if (selected) {
+      await vscode.window.showTextDocument(vscode.Uri.file(selected.node.filePath), {
+        selection: new vscode.Range(
+          new vscode.Position(Math.max(0, selected.node.line - 1), 0),
+          new vscode.Position(Math.max(0, selected.node.line - 1), 0)
+        )
+      });
+    }
+  } catch (err: any) {
+    vscode.window.showErrorMessage(`CodeLens: Search symbol failed: ${err?.message || err}`);
   }
 }
 

@@ -42,7 +42,8 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     setTimeout(() => this.sendData(), 200);
   }
 
-  refresh(): void {
+  async refresh(): Promise<void> {
+    await this.db.ensureInit();
     if (!this.view?.visible) {
       const stats  = this.db.getStats();
       const issues = this.db.getNodesWithUndefinedRefs().length;
@@ -50,7 +51,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
       this.lastIssues = issues;
       return;
     }
-    this.sendData();
+    await this.sendData();
   }
 
   updateSavings(tokens: number, calls: number): void {
@@ -58,8 +59,9 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     this.view.webview.postMessage({ command: 'updateSavings', tokens, calls });
   }
 
-  private sendData(): void {
+  private async sendData(): Promise<void> {
     if (!this.view) { return; }
+    await this.db.ensureInit();
     const stats  = this.db.getStats();
     const issues = this.db.getNodesWithUndefinedRefs().length;
     this.lastStats  = stats;
@@ -195,11 +197,11 @@ body {
     <div class="section-title">MCP Server</div>
     <div class="mcp-badge">
       <div class="dot green"></div>
-      <span>9 tools available</span>
+      <span>10 tools available</span>
     </div>
     <div class="tool-list">
-      codelens_triage · codelens_search · codelens_context<br>
-      codelens_callers · codelens_callees · codelens_impact<br>
+      codelens_triage · codelens_search · codelens_context · codelens_dependencies<br>
+      codelens_relations · codelens_impact · codelens_text_search<br>
       codelens_node · codelens_files · codelens_status
     </div>
     <button class="btn btn-secondary" onclick="send('copyMcpConfig')">⎘ Copy MCP Config</button>

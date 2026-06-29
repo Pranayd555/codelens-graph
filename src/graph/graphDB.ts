@@ -1,6 +1,4 @@
 // sql.js ships as CommonJS — use require()
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const initSqlJs = require('sql.js') as typeof import('sql.js').default;
 type Database = import('sql.js').Database;
 import * as path from 'path';
 import * as fs from 'fs';
@@ -62,6 +60,16 @@ const SCHEMA = `
     line        INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS text_index (
+    word        TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    raw_text    TEXT NOT NULL,
+    token_type  TEXT NOT NULL,
+    PRIMARY KEY (word, file_path, line)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(file_path);
   CREATE INDEX IF NOT EXISTS idx_nodes_type  ON nodes(type);
   CREATE INDEX IF NOT EXISTS idx_nodes_name  ON nodes(name);
@@ -70,6 +78,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_edges_type  ON edges(type);
   CREATE INDEX IF NOT EXISTS idx_call_refs_from   ON call_refs(from_id);
   CREATE INDEX IF NOT EXISTS idx_call_refs_symbol ON call_refs(symbol_name);
+  CREATE INDEX IF NOT EXISTS idx_text_index_word  ON text_index(word);
+  CREATE INDEX IF NOT EXISTS idx_text_index_file  ON text_index(file_path);
 `;
 
 // ─── GraphDB ──────────────────────────────────────────────────────────────────
@@ -77,33 +87,60 @@ const SCHEMA = `
 export class GraphDB {
   private db!: Database;
   private dbPath: string;
-  private SQL!: Awaited<ReturnType<typeof initSqlJs>>;
+  private SQL!: any;
   private fileVersion = '';
   private dirty = false;
+  private initPromise: Promise<void> | null = null;
+  private version = 0;
 
   constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
   }
 
+  getVersion(): number {
+    return this.version;
+  }
+
   async init(): Promise<void> {
-    // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
-    const wasmDir = (() => {
-      const distWasm = require('path').join(__dirname, 'wasm');
-      const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
-      return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
+    if (this.initPromise) { return this.initPromise; }
+    
+    this.initPromise = (async () => {
+      // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
+      const wasmDir = (() => {
+        const distWasm = require('path').join(__dirname, 'wasm');
+        const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
+        return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
+      })();
+      
+      const initSqlJs = require('sql.js') as typeof import('sql.js').default;
+      this.SQL = await initSqlJs({
+        locateFile: (file: string) => require('path').join(wasmDir, file),
+      });
+      if (fs.existsSync(this.dbPath)) {
+        try {
+          const data = fs.readFileSync(this.dbPath);
+          this.db = new this.SQL.Database(data);
+        } catch (err) {
+          console.warn(`[CodeLens] Failed to load database from disk (${this.dbPath}), falling back to a fresh DB:`, err);
+          this.db = new this.SQL.Database();
+        }
+      } else {
+        this.db = new this.SQL.Database();
+      }
+      this.db.run(SCHEMA);
+      this.runMigrations();
+      this.version++;
+      // DO NOT call this.persist() on init — avoid redundant slow write when no changes were made.
     })();
-    this.SQL = await initSqlJs({
-      locateFile: (file: string) => require('path').join(wasmDir, file),
-    });
-    if (fs.existsSync(this.dbPath)) {
-      const data = fs.readFileSync(this.dbPath);
-      this.db = new this.SQL.Database(data);
-    } else {
-      this.db = new this.SQL.Database();
+
+    return this.initPromise;
+  }
+
+  async ensureInit(): Promise<void> {
+    if (!this.initPromise) {
+      await this.init();
     }
-    this.db.run(SCHEMA);
-    this.runMigrations();
-    this.persist();
+    return this.initPromise!;
   }
 
   // Add columns that didn't exist in earlier schema versions
@@ -124,6 +161,7 @@ export class GraphDB {
     fs.writeFileSync(this.dbPath, data);
     this.dirty = false;
     this.fileVersion = this.getFileVersion();
+    this.version++;
   }
 
   close(): void {
@@ -135,17 +173,26 @@ export class GraphDB {
   // workspace-local DB while MCP reads it from another process, so readers
   // must reload when the file changes instead of serving a stale snapshot.
   refreshFromDiskIfChanged(): boolean {
+    if (!this.db) {
+      throw new Error('Database not initialized. Ensure init() has completed successfully.');
+    }
     if (this.dirty || !fs.existsSync(this.dbPath)) { return false; }
     const currentVersion = this.getFileVersion();
     if (!currentVersion || currentVersion === this.fileVersion) { return false; }
 
-    const data = fs.readFileSync(this.dbPath);
-    const replacement = new this.SQL.Database(data);
-    this.db.close();
-    this.db = replacement;
-    this.db.run(SCHEMA);
-    this.fileVersion = currentVersion;
-    return true;
+    try {
+      const data = fs.readFileSync(this.dbPath);
+      const replacement = new this.SQL.Database(data);
+      this.db.close();
+      this.db = replacement;
+      this.db.run(SCHEMA);
+      this.fileVersion = currentVersion;
+      this.version++;
+      return true;
+    } catch (err) {
+      console.warn(`[CodeLens] Failed to reload database from disk (${this.dbPath}):`, err);
+      return false;
+    }
   }
 
   private getFileVersion(): string {
@@ -158,6 +205,9 @@ export class GraphDB {
   }
 
   private prepareWrite(): void {
+    if (!this.db) {
+      throw new Error('Database not initialized. Ensure init() has completed successfully.');
+    }
     this.refreshFromDiskIfChanged();
     this.dirty = true;
   }
@@ -739,5 +789,55 @@ export class GraphDB {
       type:     row['type']     as EdgeType,
       metadata: row['metadata'] ? JSON.parse(row['metadata'] as string) : undefined,
     };
+  }
+
+  // ── Text Index Operations ──────────────────────────────────────────────────
+
+  addTextEntries(entries: any[]): void {
+    this.prepareWrite();
+    this.db.run('BEGIN');
+    try {
+      const stmt = this.db.prepare(`
+        INSERT OR IGNORE INTO text_index (word, file_path, line, text, raw_text, token_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const e of entries) {
+        stmt.run([e.word, e.filePath, e.line, e.text, e.rawText, e.tokenType]);
+      }
+      stmt.free();
+      this.db.run('COMMIT');
+    } catch (e) {
+      this.db.run('ROLLBACK');
+      throw e;
+    }
+  }
+
+  deleteTextEntriesByFile(filePath: string): void {
+    this.prepareWrite();
+    this.db.run('DELETE FROM text_index WHERE file_path = ?', [filePath]);
+  }
+
+  getTextEntriesByWord(word: string, exact: boolean): any[] {
+    this.refreshFromDiskIfChanged();
+    const query = exact
+      ? 'SELECT * FROM text_index WHERE word = ?'
+      : 'SELECT * FROM text_index WHERE word LIKE ?';
+    const param = exact ? word : `${word}%`;
+    const stmt = this.db.prepare(query);
+    stmt.bind([param]);
+    const results: any[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      results.push({
+        word: row.word,
+        filePath: row.file_path,
+        line: row.line as number,
+        text: row.text,
+        rawText: row.raw_text,
+        tokenType: row.token_type,
+      });
+    }
+    stmt.free();
+    return results;
   }
 }
