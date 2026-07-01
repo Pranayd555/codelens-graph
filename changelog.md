@@ -4,6 +4,16 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [0.2.2] - 2026-07-01
+
+### Added
+- **Two-Phase Database Scanning**: Graph building now scans workspace files first (excluding `node_modules`), rendering the UI immediately, then parses dependencies in the background.
+- **Pre-scan IDE Configuration Onboarding**: Prompts for and generates IDE configurations before scanning begins.
+- **Manual Configuration & Reset Actions**: Added "Add Configuration to IDE" and "Clear Configuration Files" buttons in the side panel Actions section.
+- **Active Webview Loader**: The Graph Panel now listens to scanning status and displays a spinner during graph generation.
+
+---
+
 ## [0.2.1] - 2026-06-29
 
 ### Added

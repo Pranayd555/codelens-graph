@@ -10,6 +10,8 @@ export interface ScanOptions {
   excludePatterns:     string[];
   supportedExtensions: string[];
   onProgress?:         (current: number, total: number, filePath: string) => void;
+  excludeDeps?:         boolean;
+  depsOnly?:            boolean;
 }
 
 export interface ScanResult {
@@ -171,6 +173,12 @@ export class WorkspaceScanner {
       });
       if (belongsToRoot && !indexedSet.has(path.normalize(indexed))) {
         const isDep = isNodeModulePath(indexed) || isConfigPath(indexed);
+        if (options.depsOnly && !isDep) {
+          continue;
+        }
+        if (options.excludeDeps && isDep) {
+          continue;
+        }
         if (isDep) {
           if (!fs.existsSync(indexed)) {
             this.db.deleteNodesByFile(indexed);
@@ -291,7 +299,7 @@ export class WorkspaceScanner {
     const userPatterns = options.excludePatterns;
 
     for (const root of rootPaths) {
-      this.walkDir(root, root, extSet, userPatterns, files);
+      this.walkDir(root, root, extSet, userPatterns, files, options);
     }
     return files;
   }
@@ -302,6 +310,7 @@ export class WorkspaceScanner {
     exts: Set<string>,
     userPatterns: string[],
     results: string[],
+    options: ScanOptions,
     inNodeModules = false,
     nodeModulesDepth = 0
   ): void {
@@ -318,6 +327,9 @@ export class WorkspaceScanner {
       const isNodeModulesDir = entry.name === 'node_modules';
 
       if (entry.isDirectory()) {
+        if (isNodeModulesDir && options.excludeDeps) {
+          continue;
+        }
         const nextInNodeModules = inNodeModules || isNodeModulesDir;
         const nextDepth = isNodeModulesDir ? 0 : (nextInNodeModules ? nodeModulesDepth + 1 : 0);
 
@@ -327,8 +339,11 @@ export class WorkspaceScanner {
         }
 
         if (this.shouldExcludeDir(entry.name, relPath, userPatterns)) { continue; }
-        this.walkDir(fullPath, root, exts, userPatterns, results, nextInNodeModules, nextDepth);
+        this.walkDir(fullPath, root, exts, userPatterns, results, options, nextInNodeModules, nextDepth);
       } else if (entry.isFile()) {
+        if (options.depsOnly && !inNodeModules) {
+          continue;
+        }
         if (this.shouldExcludeFile(entry.name, relPath, userPatterns)) {
           const isConfig = isConfigPath(fullPath);
           const isNm = inNodeModules;

@@ -1,6 +1,9 @@
 import * as path from 'path';
 import * as fs   from 'fs';
+import * as os   from 'os';
 import { GraphDB }        from '../graph/graphDB';
+import { ASTParser }      from '../ingestion/astParser';
+import { WorkspaceScanner } from '../ingestion/workspaceScanner';
 import { ContextBuilder } from '../context/contextBuilder';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
@@ -59,11 +62,166 @@ function classifyTask(task: string): TierResult {
 export class MCPServer {
   private server:    any;
   private transport: any;
-  private logger!:   MCPLogger;
-  private textIndex: TextIndex;
+  private workspaces = new Map<string, {
+    db: GraphDB;
+    contextBuilder: ContextBuilder;
+    textIndex: TextIndex;
+    logger: MCPLogger;
+  }>();
+  private defaultWorkspaceRoot = '';
 
-  constructor(private db: GraphDB, private contextBuilder: ContextBuilder) {
-    this.textIndex = new TextIndex(db);
+  constructor() {
+    this.setupRegistryWatcher();
+  }
+
+  private setupRegistryWatcher(): void {
+    const registryDir = path.join(os.homedir(), '.codelens');
+    const registryPath = path.join(registryDir, 'active-workspaces.json');
+    
+    // Ensure the directory exists
+    try {
+      fs.mkdirSync(registryDir, { recursive: true });
+    } catch {}
+
+    if (fs.existsSync(registryPath)) {
+      this.watchRegistryFile(registryPath);
+    } else {
+      // Check periodically until it is created
+      const interval = setInterval(() => {
+        if (fs.existsSync(registryPath)) {
+          this.watchRegistryFile(registryPath);
+          clearInterval(interval);
+        }
+      }, 5000);
+      interval.unref(); // Don't keep event loop alive for this
+    }
+  }
+
+  private watchRegistryFile(filePath: string): void {
+    try {
+      fs.watchFile(filePath, { interval: 2000 }, (curr, prev) => {
+        if (curr.mtimeMs !== prev.mtimeMs) {
+          this.resolveActiveWorkspace().then(active => {
+            console.error(`[CodeLens MCP] Active workspace hot-reloaded to: ${active}`);
+          }).catch(() => {});
+        }
+      });
+    } catch (err) {
+      console.error(`[CodeLens MCP] Failed to watch registry file:`, err);
+    }
+  }
+
+  private async resolveActiveWorkspace(overrideWorkspace?: string): Promise<string> {
+    if (overrideWorkspace) {
+      const resolved = path.resolve(overrideWorkspace);
+      if (fs.existsSync(resolved)) {
+        return resolved;
+      }
+    }
+
+    // Try reading active-workspaces.json global registry
+    const registryPath = path.join(os.homedir(), '.codelens', 'active-workspaces.json');
+    if (fs.existsSync(registryPath)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        const windows = data.windows ?? {};
+        let mostActivePath: string | null = null;
+        let maxTime = -1;
+        
+        for (const pid of Object.keys(windows)) {
+          const win = windows[pid];
+          if (win && win.path && win.lastActive > maxTime) {
+            mostActivePath = win.path;
+            maxTime = win.lastActive;
+          }
+        }
+        if (mostActivePath && fs.existsSync(mostActivePath)) {
+          return path.resolve(mostActivePath);
+        }
+      } catch (err) {
+        // Fallback
+      }
+    }
+
+    // Fall back to process.cwd() or the folder containing `.codelens/codelens-graph.db` in cwd and ancestors
+    return this.discoverWorkspaceFromCwd();
+  }
+
+  private discoverWorkspaceFromCwd(): string {
+    let curr = process.cwd();
+    while (true) {
+      const dbFile = path.join(curr, '.codelens', 'codelens-graph.db');
+      if (fs.existsSync(dbFile)) {
+        return path.resolve(curr);
+      }
+      const parent = path.dirname(curr);
+      if (parent === curr) {
+        break; // Reached root
+      }
+      curr = parent;
+    }
+    // Fallbacks
+    if (process.env.WORKSPACE_FOLDER && fs.existsSync(process.env.WORKSPACE_FOLDER)) {
+      return path.resolve(process.env.WORKSPACE_FOLDER);
+    }
+    return path.resolve(this.defaultWorkspaceRoot || process.cwd());
+  }
+
+  private async getWorkspaceContext(overrideWorkspace?: string): Promise<{
+    workspaceRoot: string;
+    db: GraphDB;
+    contextBuilder: ContextBuilder;
+    textIndex: TextIndex;
+    logger: MCPLogger;
+  }> {
+    const resolvedPath = await this.resolveActiveWorkspace(overrideWorkspace);
+    let ctx = this.workspaces.get(resolvedPath);
+    if (!ctx) {
+      const dbDir = path.join(resolvedPath, '.codelens');
+      fs.mkdirSync(dbDir, { recursive: true });
+      const db = new GraphDB(dbDir);
+      await db.init();
+
+      // Check if graph is empty, scan now (blocks until done — first run only)
+      const stats = db.getStats();
+      if (stats.totalNodes === 0) {
+        console.error(`[CodeLens MCP] Graph empty — indexing ${resolvedPath}…`);
+        const parser  = new ASTParser();
+        const scanner = new WorkspaceScanner(parser, db);
+
+        await scanner.scanWorkspace([resolvedPath], {
+          excludePatterns: [
+            '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
+            '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
+            '**/.turbo/**', '**/.parcel-cache/**', '**/.cache/**', '**/.angular/**',
+            '**/coverage/**', '**/.nyc_output/**', '**/playwright-report/**', '**/test-results/**',
+            '**/__pycache__/**', '**/.venv/**', '**/venv/**', '**/.pytest_cache/**',
+            '**/.mypy_cache/**', '**/site-packages/**', '**/*.egg-info/**',
+            '**/vendor/**', '**/target/**', '**/.gradle/**', '**/.m2/**', '**/obj/**',
+            '**/.git/**', '**/.hg/**', '**/.svn/**', '**/.idea/**', '**/.vs/**',
+            '**/.vscode/**', '**/.cursor/**', '**/.trae/**', '**/.codelens/**',
+            '**/DerivedData/**', '**/xcuserdata/**', '**/.build/**',
+          ],
+          supportedExtensions: [
+            '.ts','.tsx','.js','.jsx','.mjs',
+            '.py','.go','.rs','.java','.cs',
+            '.cpp','.c','.rb','.php','.swift','.kt',
+          ],
+        });
+
+        const newStats = db.getStats();
+        console.error(`[CodeLens MCP] Indexed ${newStats.fileCount} files, ${newStats.totalNodes} symbols`);
+      } else {
+        console.error(`[CodeLens MCP] Graph loaded: ${stats.totalNodes} symbols in ${stats.fileCount} files`);
+      }
+
+      const contextBuilder = new ContextBuilder(db);
+      const textIndex = new TextIndex(db);
+      const logger = new MCPLogger(resolvedPath);
+      ctx = { db, contextBuilder, textIndex, logger };
+      this.workspaces.set(resolvedPath, ctx);
+    }
+    return { workspaceRoot: resolvedPath, ...ctx };
   }
 
   async start(workspaceRoot: string): Promise<void> {
@@ -74,10 +232,25 @@ export class MCPServer {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { z } = require('zod');
 
-    this.logger = new MCPLogger(workspaceRoot);
+    this.defaultWorkspaceRoot = workspaceRoot === '--auto' ? '' : workspaceRoot;
+
+    // Resolve/initialize default workspace root
+    const activeWorkspace = await this.resolveActiveWorkspace();
+    await this.getWorkspaceContext(activeWorkspace);
+
+    const pkgVersion = (() => {
+      try {
+        const pkgPath = path.join(__dirname, '..', 'package.json');
+        if (fs.existsSync(pkgPath)) {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+          return pkg.version || '0.2.2';
+        }
+      } catch {}
+      return '0.2.2';
+    })();
 
     this.server = new McpServer(
-      { name: 'codelens-graph', version: '0.2.1' },
+      { name: 'codelens-graph', version: pkgVersion },
       {
         instructions:
           'MANDATORY: Use CodeLens Graph tools for ALL codebase discovery. '
@@ -95,14 +268,15 @@ export class MCPServer {
     const tool = (
       name: string,
       description: string,
-      schema: object,
+      schema: any,
       handler: (args: any) => Promise<{ content: Array<{ type: 'text'; text: string }> }>
     ) => {
       this.server.tool(name, description, schema, async (args: any) => {
         const t0     = Date.now();
         const result = await handler(args);
         const text   = result.content.map((c: any) => c.text).join('');
-        this.logger.log(name, args, text, Date.now() - t0);
+        const { logger } = await this.getWorkspaceContext(args.workspace);
+        logger.log(name, args, text, Date.now() - t0);
         return result;
       });
     };
@@ -116,10 +290,14 @@ export class MCPServer {
       'CALL THIS FIRST before any file operation or other CodeLens tool. '
       + 'Classifies the task and returns the single minimum tool needed. '
       + '~10 tokens. Tier 1=no tool, Tier 2=search, Tier 3=context, Tier 4=context+impact.',
-      { task: z.string().describe('What you are about to do, in plain English') },
-      async ({ task }: { task: string }) => {
+      {
+        task: z.string().describe('What you are about to do, in plain English'),
+        workspace: z.string().optional().describe('Optional workspace override path')
+      },
+      async ({ task, workspace }: { task: string; workspace?: string }) => {
         const r     = classifyTask(task);
-        const stats = this.db.getStats();
+        const { db } = await this.getWorkspaceContext(workspace);
+        const stats = db.getStats();
         const next  = r.tier === 1
           ? '✅ No CodeLens call needed. Proceed directly.'
           : '→ Next: ' + r.nextTool;
@@ -147,11 +325,13 @@ export class MCPServer {
       {
         query: z.string(),
         limit: z.number().optional().default(10),
-        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace')
+        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace'),
+        workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ query, limit, scope }: { query: string; limit?: number; scope?: 'workspace' | 'deps' | 'all' }) => {
-        this.db.refreshFromDiskIfChanged();
-        const results = this.db.searchNodes(query, limit ?? 10, scope ?? 'workspace');
+      async ({ query, limit, scope, workspace }: { query: string; limit?: number; scope?: 'workspace' | 'deps' | 'all'; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const results = db.searchNodes(query, limit ?? 10, scope ?? 'workspace');
         if (!results.length) {
           return txt('No symbols found matching "' + query + '" within scope ' + (scope ?? 'workspace') + '. Safe to create.');
         }
@@ -179,11 +359,13 @@ export class MCPServer {
         max_depth:  z.number().optional().default(2),
         max_tokens: z.number().optional().default(2500),
         mode:       z.enum(['short', 'deep']).optional().default('short'),
+        workspace:  z.string().optional().describe('Optional workspace override path')
       },
-      async ({ task, max_depth, max_tokens, mode }: { task: string; max_depth?: number; max_tokens?: number; mode: 'short' | 'deep' }) => {
-        this.db.refreshFromDiskIfChanged();
-        const ctx    = this.contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500, mode);
-        const output = this.contextBuilder.buildSystemPromptInjection(ctx, mode);
+      async ({ task, max_depth, max_tokens, mode, workspace }: { task: string; max_depth?: number; max_tokens?: number; mode: 'short' | 'deep'; workspace?: string }) => {
+        const { db, contextBuilder } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const ctx    = contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500, mode);
+        const output = contextBuilder.buildSystemPromptInjection(ctx, mode);
         const header = [
           '## CodeLens Context: "' + task + '" (' + mode + ' mode)',
           'Symbols: ' + ctx.subgraph.nodes.length + ' | ~' + ctx.tokenEstimate + ' tokens',
@@ -202,11 +384,13 @@ export class MCPServer {
       + 'Use this to map incoming or outgoing call dependencies before editing a shared symbol.',
       {
         symbol: z.string().describe('Name of the symbol (function or method) to query'),
-        direction: z.enum(['callers', 'callees', 'both']).optional().default('both').describe('Query incoming callers, outgoing callees, or both')
+        direction: z.enum(['callers', 'callees', 'both']).optional().default('both').describe('Query incoming callers, outgoing callees, or both'),
+        workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ symbol, direction }: { symbol: string; direction: 'callers' | 'callees' | 'both' }) => {
-        this.db.refreshFromDiskIfChanged();
-        const targets = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
+      async ({ symbol, direction, workspace }: { symbol: string; direction: 'callers' | 'callees' | 'both'; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const targets = db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!targets.length) { return txt('"' + symbol + '" not found in graph.'); }
         
         const lines: string[] = [];
@@ -214,8 +398,8 @@ export class MCPServer {
           lines.push('## Symbol: ' + t.name + ' @ ' + this.rel(t.filePath, workspaceRoot) + ':' + t.line);
           
           if (direction === 'callers' || direction === 'both') {
-            const callers = this.db.getEdgesTo(t.id, 'calls')
-              .map(e => this.db.getNode(e.fromId)).filter(Boolean) as GraphNode[];
+            const callers = db.getEdgesTo(t.id, 'calls')
+              .map(e => db.getNode(e.fromId)).filter(Boolean) as GraphNode[];
             lines.push('### Callers (Incoming):');
             lines.push(callers.length
               ? callers.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
@@ -224,8 +408,8 @@ export class MCPServer {
           }
           
           if (direction === 'callees' || direction === 'both') {
-            const callees = this.db.getEdgesFrom(t.id, 'calls')
-              .map(e => this.db.getNode(e.toId)).filter(Boolean) as GraphNode[];
+            const callees = db.getEdgesFrom(t.id, 'calls')
+              .map(e => db.getNode(e.toId)).filter(Boolean) as GraphNode[];
             lines.push('### Callees (Outgoing):');
             lines.push(callees.length
               ? callees.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
@@ -243,13 +427,18 @@ export class MCPServer {
       'codelens_impact',
       'Calculate the transitive impact radius/dependency tree of changing a symbol. '
       + 'Use before major refactoring (Tier 4) to list all files and symbols that may break or require updates.',
-      { symbol: z.string(), depth: z.number().optional().default(3) },
-      async ({ symbol, depth }: { symbol: string; depth?: number }) => {
-        this.db.refreshFromDiskIfChanged();
-        const targets = this.db.searchNodes(symbol, 3).filter(n => n.name === symbol);
+      {
+        symbol: z.string(),
+        depth: z.number().optional().default(3),
+        workspace: z.string().optional().describe('Optional workspace override path')
+      },
+      async ({ symbol, depth, workspace }: { symbol: string; depth?: number; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const targets = db.searchNodes(symbol, 3).filter(n => n.name === symbol);
         if (!targets.length) { return txt('"' + symbol + '" not found.'); }
         const t = targets[0];
-        const { nodes, edges } = this.db.bfsExpand([t.id], depth ?? 3);
+        const { nodes, edges } = db.bfsExpand([t.id], depth ?? 3);
         const impacted = nodes.filter(n => n.id !== t.id && edges.some(e => e.fromId === n.id || e.toId === n.id));
         const lines = [
           '## Impact: "' + symbol + '"',
@@ -273,10 +462,15 @@ export class MCPServer {
       'Retrieve detailed schema information and signature for a single symbol by name. '
       + 'Set with_snippet=true to inspect its code block/body. '
       + 'Use this instead of reading a whole file when you only need to understand or view the implementation of one specific class or function.',
-      { symbol: z.string(), with_snippet: z.boolean().optional().default(false) },
-      async ({ symbol, with_snippet }: { symbol: string; with_snippet?: boolean }) => {
-        this.db.refreshFromDiskIfChanged();
-        const results = this.db.searchNodes(symbol, 5).filter(n => n.name === symbol);
+      {
+        symbol: z.string(),
+        with_snippet: z.boolean().optional().default(false),
+        workspace: z.string().optional().describe('Optional workspace override path')
+      },
+      async ({ symbol, with_snippet, workspace }: { symbol: string; with_snippet?: boolean; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const results = db.searchNodes(symbol, 5).filter(n => n.name === symbol);
         if (!results.length) { return txt('"' + symbol + '" not found.'); }
         const lines: string[] = [];
         for (const node of results.slice(0, 3)) {
@@ -289,8 +483,8 @@ export class MCPServer {
           }
           const imp = this.buildImportStmt(node, workspaceRoot);
           if (imp) { lines.push('- Import as: ' + imp); }
-          const callerCount = this.db.getEdgesTo(node.id, 'calls').length;
-          const calleeCount = this.db.getEdgesFrom(node.id, 'calls').length;
+          const callerCount = db.getEdgesTo(node.id, 'calls').length;
+          const calleeCount = db.getEdgesFrom(node.id, 'calls').length;
           if (callerCount) { lines.push('- Callers: ' + callerCount + ' (run codelens_callers)'); }
           if (calleeCount) { lines.push('- Callees: ' + calleeCount + ' (run codelens_callees)'); }
           if (node.undefinedRefs?.length) {
@@ -315,12 +509,14 @@ export class MCPServer {
       + 'Supply a filter to search file paths, or set scope="deps" to find package.json, configuration files, or type definitions.',
       {
         filter: z.string().optional(),
-        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace')
+        scope: z.enum(['workspace', 'deps', 'all']).optional().default('workspace'),
+        workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ filter, scope }: { filter?: string; scope?: 'workspace' | 'deps' | 'all' }) => {
-        this.db.refreshFromDiskIfChanged();
+      async ({ filter, scope, workspace }: { filter?: string; scope?: 'workspace' | 'deps' | 'all'; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
         const classifier = new FileClassifier();
-        const allFiles   = this.db.getAllFiles(scope ?? 'workspace');
+        const allFiles   = db.getAllFiles(scope ?? 'workspace');
         const groups     = classifier.groupFiles(allFiles);
         const lines      = ['## Workspace (' + allFiles.length + ' files, scope: ' + (scope ?? 'workspace') + ')', ''];
         for (const [label, files] of groups) {
@@ -344,13 +540,15 @@ export class MCPServer {
       'Query installed packages and their metadata. Use when the task involves dependencies, versions, types, or package configuration.',
       {
         packageName: z.string().optional().describe('Specific package to look up, e.g. "lodash" or "@types/react". Omit to list all top-level packages.'),
-        queryType: z.enum(['info', 'exports', 'types', 'dependents']).optional().default('info').describe('What to retrieve: package info, exported symbols, type definitions, or files that import this package.')
+        queryType: z.enum(['info', 'exports', 'types', 'dependents']).optional().default('info').describe('What to retrieve: package info, exported symbols, type definitions, or files that import this package.'),
+        workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ packageName, queryType }: { packageName?: string; queryType?: 'info' | 'exports' | 'types' | 'dependents' }) => {
-        this.db.refreshFromDiskIfChanged();
+      async ({ packageName, queryType, workspace }: { packageName?: string; queryType?: 'info' | 'exports' | 'types' | 'dependents'; workspace?: string }) => {
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
         
         if (packageName) {
-          const matches = this.db.getNodesByType('file').filter(n => 
+          const matches = db.getNodesByType('file').filter(n => 
             isNodeModulePath(n.filePath) && 
             n.filePath.replace(/\\/g, '/').toLowerCase().includes('/' + packageName.toLowerCase() + '/')
           );
@@ -377,7 +575,7 @@ export class MCPServer {
             }
           } else if (queryType === 'exports') {
             const symbols = matches.flatMap(m => 
-              this.db.getNodesByFile(m.filePath).filter(n => n.type !== 'file' && n.type !== 'import')
+              db.getNodesByFile(m.filePath).filter(n => n.type !== 'file' && n.type !== 'import')
             );
             if (!symbols.length) {
               lines.push('No exported symbols found in the type definitions for this package.');
@@ -393,7 +591,7 @@ export class MCPServer {
               lines.push('Type definition files:');
               for (const td of typeDefs) {
                 lines.push('### ' + this.rel(td.filePath, workspaceRoot));
-                const symbols = this.db.getNodesByFile(td.filePath).filter(n => n.type !== 'file' && n.type !== 'import');
+                const symbols = db.getNodesByFile(td.filePath).filter(n => n.type !== 'file' && n.type !== 'import');
                 lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ line ' + s.line + ' ' + (s.signature ? '`' + s.signature.slice(0, 100) + '`' : '')));
                 lines.push('');
               }
@@ -401,9 +599,9 @@ export class MCPServer {
           } else if (queryType === 'dependents') {
             const dependents = new Set<string>();
             for (const fileNode of matches) {
-              const edges = this.db.getEdgesTo(fileNode.id, 'depends-on' as any);
+              const edges = db.getEdgesTo(fileNode.id, 'depends-on' as any);
               for (const edge of edges) {
-                const node = this.db.getNode(edge.fromId);
+                const node = db.getNode(edge.fromId);
                 if (node) {
                   dependents.add(this.rel(node.filePath, workspaceRoot));
                 }
@@ -420,7 +618,7 @@ export class MCPServer {
           return txt(lines.join('\n'));
         } else {
           // List all top-level packages and configs
-          const allDeps = this.db.getAllFiles('deps');
+          const allDeps = db.getAllFiles('deps');
           const lines = ['## Index Dependencies & Configuration Files', ''];
           const packages = new Set<string>();
           const configs: string[] = [];
@@ -440,7 +638,7 @@ export class MCPServer {
             lines.push('### Packages:');
             for (const pkg of Array.from(packages).sort()) {
               // Try to find package version
-              const pkgJsonNode = this.db.getNodesByType('file').find(n => 
+              const pkgJsonNode = db.getNodesByType('file').find(n => 
                 isNodeModulePath(n.filePath) && 
                 n.filePath.toLowerCase().endsWith('/node_modules/' + pkg.toLowerCase() + '/package.json')
               );
@@ -466,11 +664,14 @@ export class MCPServer {
     tool(
       'codelens_status',
       'Graph health and statistics. Call when results seem missing or stale.',
-      {},
-      async () => {
-        this.db.refreshFromDiskIfChanged();
-        const stats  = this.db.getStats();
-        const issues = this.db.getNodesWithUndefinedRefs().length;
+      {
+        workspace: z.string().optional().describe('Optional workspace override path')
+      },
+      async ({ workspace }: { workspace?: string }) => {
+        const { db } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
+        const stats  = db.getStats();
+        const issues = db.getNodesWithUndefinedRefs().length;
         return txt([
           '## CodeLens Status',
           '- Files indexed: ' + stats.fileCount,
@@ -493,16 +694,19 @@ export class MCPServer {
         fileFilter: z.string().optional().describe('Optional file extension filter, e.g. ".ts" or ".md"'),
         inComments: z.boolean().optional().describe('Search in comments only'),
         inStrings: z.boolean().optional().describe('Search in string literals only'),
-        limit: z.number().optional().default(10).describe('Max results')
+        limit: z.number().optional().default(10).describe('Max results'),
+        workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ query, fileFilter, inComments, inStrings, limit }: {
+      async ({ query, fileFilter, inComments, inStrings, limit, workspace }: {
         query: string;
         fileFilter?: string;
         inComments?: boolean;
         inStrings?: boolean;
         limit?: number;
+        workspace?: string;
       }) => {
-        this.db.refreshFromDiskIfChanged();
+        const { db, textIndex, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        db.refreshFromDiskIfChanged();
         
         let tokenType: TextEntry['tokenType'] | undefined;
         if (inComments) {
@@ -511,7 +715,7 @@ export class MCPServer {
           tokenType = 'string_literal';
         }
 
-        const results = this.textIndex.search(query, {
+        const results = textIndex.search(query, {
           limit,
           fileFilter,
           tokenType,
@@ -548,7 +752,12 @@ export class MCPServer {
   }
 
   async stop(): Promise<void> {
-    this.logger?.summarise();
+    const registryPath = path.join(os.homedir(), '.codelens', 'active-workspaces.json');
+    try { fs.unwatchFile(registryPath); } catch {}
+    for (const ctx of this.workspaces.values()) {
+      ctx.logger?.summarise();
+      ctx.db?.close();
+    }
     try { await this.server?.close(); } catch { /* ignore */ }
   }
 

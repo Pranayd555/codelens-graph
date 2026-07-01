@@ -72,30 +72,53 @@ export class BackgroundScanner {
     this.onStatusChange?.('scanning');
 
     try {
-      console.log('[CodeLens] Background scan starting…');
+      console.log('[CodeLens] Background scan Phase 1 starting (excluding dependencies)…');
 
       const result = await this.scanner.scanWorkspace([workspaceRoot], {
         ...options,
-        // No progress callback — this is silent
+        excludeDeps: true,
         onProgress: undefined,
       });
 
       const dbStats = this.db.getStats();
-      const fullStats: GraphStats = {
+      const stats: GraphStats = {
         ...dbStats,
         lastBuilt:       Date.now(),
         buildDurationMs: result.durationMs,
       };
 
-      this.lastScanStats = fullStats;
-      console.log(`[CodeLens] Scan complete: ${result.filesScanned} files, ${result.nodesAdded} symbols in ${result.durationMs}ms`);
+      this.lastScanStats = stats;
+      console.log(`[CodeLens] Phase 1 scan complete: ${result.filesScanned} workspace files.`);
 
-      // Generate skill files immediately after scan
-      await this.generateSkills(workspaceRoot, fullStats);
-
-      this.onScanComplete?.(fullStats);
+      await this.generateSkills(workspaceRoot, stats);
+      this.onScanComplete?.(stats);
       this.onStatusChange?.('ready');
-      return fullStats;
+
+      // Phase 2: Background dependency scanning
+      setTimeout(async () => {
+        try {
+          console.log('[CodeLens] Phase 2 background dependency scan starting…');
+          const depResult = await this.scanner.scanWorkspace([workspaceRoot], {
+            ...options,
+            depsOnly: true,
+            onProgress: undefined,
+          });
+          const finalDbStats = this.db.getStats();
+          const finalStats: GraphStats = {
+            ...finalDbStats,
+            lastBuilt:       Date.now(),
+            buildDurationMs: stats.buildDurationMs + depResult.durationMs,
+          };
+          this.lastScanStats = finalStats;
+          console.log(`[CodeLens] Phase 2 scan complete: ${depResult.filesScanned} dependency files.`);
+          await this.generateSkills(workspaceRoot, finalStats);
+          this.onScanComplete?.(finalStats);
+        } catch (err) {
+          console.error('[CodeLens] Background dependency scan failed:', err);
+        }
+      }, 300);
+
+      return stats;
 
     } catch (err) {
       console.error('[CodeLens] Background scan failed:', err);

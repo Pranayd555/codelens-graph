@@ -165,8 +165,14 @@ export class GraphDB {
   }
 
   close(): void {
-    if (this.dirty) { this.persist(); }
-    this.db.close();
+    if (this.db) {
+      if (this.dirty) {
+        try { this.persist(); } catch {}
+      }
+      try { this.db.close(); } catch {}
+    }
+    this.initPromise = null;
+    this.dirty = false;
   }
 
   // sql.js keeps the database in process memory. The extension writes the

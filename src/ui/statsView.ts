@@ -40,6 +40,8 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
         copyMcpConfig: 'codelens-graph.copyMcpConfig',
         showContext:   'codelens-graph.showContext',
         showMcpUsage:  'codelens-graph.showMcpUsage',
+        addConfig:     'codelens-graph.regenerateSkills',
+        clearConfig:   'codelens-graph.clearConfig',
       };
       if (map[cmd]) { vscode.commands.executeCommand(map[cmd]); }
     });
@@ -223,6 +225,8 @@ body {
     <button class="btn btn-secondary" onclick="send('showGraph')">⬡ Open Graph Explorer</button>
     <button class="btn btn-secondary" onclick="send('searchSymbol')">⌕ Search Symbol</button>
     <button class="btn btn-secondary" onclick="send('showContext')">⊙ Preview Agent Context</button>
+    <button class="btn btn-secondary" onclick="send('addConfig')">⚙ Add Configuration to IDE</button>
+    <button class="btn btn-secondary" onclick="send('clearConfig')">🗑 Clear Configuration Files</button>
   </div>
 
 </div>

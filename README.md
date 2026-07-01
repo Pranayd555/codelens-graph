@@ -1,10 +1,23 @@
 # CodeLens Graph
 
-> A VS Code extension that builds a live knowledge graph of your codebase and exposes it as an MCP server — so AI agents find the right symbols instantly, use the minimum tokens needed, and never hallucinate about what already exists.
+> A VS Code extension that builds a live codebase knowledge graph for AI agents (Cursor, Claude Code, Antigravity, Windsurf, Copilot) to reduce token consumption, prevent hallucinations, and build precise context via Model Context Protocol (MCP).
 
 ![CodeLens Graph Demo](assets/codelens-graph.gif)
 
 **GitHub:** [github.com/pranayd555/codelens-graph](https://github.com/pranayd555/codelens-graph)
+
+---
+
+## Why CodeLens Graph? Return on Investment (ROI)
+
+When an AI agent runs in a medium-to-large project, it often resorts to scanning the entire directory or dumping multiple full files to understand context. This is incredibly slow and wastes massive amounts of tokens.
+
+CodeLens Graph fixes this by providing exact, targeted symbol subgraphs:
+
+| Search Method | Token Consumption | Execution Speed | Cost per Task |
+| :--- | :--- | :--- | :--- |
+| Brute-Force Folder Dump | 50k+ tokens | 15 - 30 seconds | High ($$$) |
+| **CodeLens Graph Context** | **< 2k tokens** | **< 1 second** | **Negligible ($)** |
 
 ---
 
@@ -53,7 +66,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.2.1.vsix
+code --install-extension codelens-graph-0.2.2.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
@@ -95,6 +108,7 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `CodeLens: Update Graph After Agent Run` | Re-index after agent changes |
 | `CodeLens: Regenerate AI Agent Skill Files` | Regenerate rules/MCP configs and prompt for IDE preferences |
 | `CodeLens: Show MCP Usage Report` | Show total agent tool calls and token savings |
+| `CodeLens: Clear Configuration Files and Reset State` | Clean up all CodeLens-generated rule files/configs and reset extension state |
 
 ---
 
