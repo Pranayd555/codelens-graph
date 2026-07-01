@@ -37,6 +37,49 @@ export class SkillGenerator {
     return written;
   }
 
+  clearAll(workspaceRoot: string): void {
+    // 1. Clean up IDE rule files
+    this.removeAll(workspaceRoot);
+
+    // 2. Clean up VS Code MCP configuration
+    this.removeVsCodeMcpConfig(workspaceRoot);
+
+    // 3. Clean up .codelens folder files
+    const codelensDir = path.join(workspaceRoot, '.codelens');
+    const codelensFiles = [
+      'README.md',
+      'mcp.json',
+      'instructions.md',
+      'codelens-graph.db',
+      'mcp-usage.jsonl'
+    ];
+    for (const file of codelensFiles) {
+      const fp = path.join(codelensDir, file);
+      if (fs.existsSync(fp)) {
+        try { fs.unlinkSync(fp); } catch {}
+      }
+    }
+
+    // 4. Delete directories if they are empty
+    const dirsToCheck = [
+      path.join(workspaceRoot, '.codelens'),
+      path.join(workspaceRoot, '.agents'),
+      path.join(workspaceRoot, '.cursor', 'rules'),
+      path.join(workspaceRoot, '.cursor'),
+    ];
+
+    for (const dir of dirsToCheck) {
+      if (fs.existsSync(dir)) {
+        try {
+          const files = fs.readdirSync(dir);
+          if (files.length === 0) {
+            fs.rmdirSync(dir);
+          }
+        } catch {}
+      }
+    }
+  }
+
   removeAll(workspaceRoot: string): void {
     const legacy = [
       '.cursor/rules/codelens.mdc',
@@ -182,7 +225,7 @@ Use \`codelens_search\` or \`codelens_files\` with \`scope: "deps"\`, or use \`c
       ...existing,
       servers: {
         ...(existing['servers'] as Record<string,unknown> ?? {}),
-        codelens: { command: 'node', args: [this.getMcpEntryPath(), this.toFwd(workspaceRoot)] },
+        codelens: { command: 'node', args: [this.getMcpEntryPath(), '--auto'] },
       },
     };
     try {
@@ -215,13 +258,12 @@ Use \`codelens_search\` or \`codelens_files\` with \`scope: "deps"\`, or use \`c
 
   private buildMcpConfig(workspaceRoot: string): string {
     const e = this.getMcpEntryPath();
-    const p = this.toFwd(workspaceRoot);
     return JSON.stringify({
       _comment: 'CodeLens Graph MCP config',
-      vscode:      { servers: { codelens: { command: 'node', args: [e, p] } } },
-      cursor:      { _add_to: '~/.cursor/mcp.json', codelens: { command: 'node', args: [e, p] } },
-      Claude:      { _add_to: '~/.claude.json', codelens: { type: 'stdio', command: 'node', args: [e, p] } },
-      Winsurf:     { _add_to: '~/.codeium/windsurf/mcp_config.json', codelens: { command: 'node', args: [e, p] } },
+      vscode:      { servers: { codelens: { command: 'node', args: [e, '--auto'] } } },
+      cursor:      { _add_to: '~/.cursor/mcp.json', codelens: { command: 'node', args: [e, '--auto'] } },
+      Claude:      { _add_to: '~/.claude.json', codelens: { type: 'stdio', command: 'node', args: [e, '--auto'] } },
+      Winsurf:     { _add_to: '~/.codeium/windsurf/mcp_config.json', codelens: { command: 'node', args: [e, '--auto'] } },
     }, null, 2);
   }
 

@@ -2,7 +2,7 @@
   "name": "codelens-graph",
   "displayName": "CodeLens Graph",
   "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "PranayDas",
   "repository": {
     "type": "git",
@@ -12,14 +12,27 @@
   "engines": {
     "vscode": "^1.95.0"
   },
+  "keywords": [
+    "ai agent",
+    "knowledge graph",
+    "context builder",
+    "token reduction",
+    "dependency graph"
+  ],
+  "galleryBanner": {
+    "color": "#f4845f",
+    "theme": "dark"
+  },
   "categories": [
-    "Other",
+    "AI",
     "Programming Languages",
+    "Visualization",
     "Linters",
     "Snippets",
     "Debuggers",
     "SCM Providers",
-    "Machine Learning"
+    "Machine Learning",
+    "Other"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -73,6 +86,10 @@
       {
         "command": "codelens-graph.showMcpUsage",
         "title": "CodeLens: Show MCP Usage Report"
+      },
+      {
+        "command": "codelens-graph.clearConfig",
+        "title": "CodeLens: Clear Configuration Files and Reset State"
       }
     ],
     "viewsContainers": {

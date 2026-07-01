@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path   from 'path';
 import * as crypto from 'crypto';
 import * as fs     from 'fs';
+import * as os     from 'os';
 
 import { GraphDB }            from './graph/graphDB';
 import { ASTParser }          from './ingestion/astParser';
@@ -31,6 +32,7 @@ let backgroundScanner: BackgroundScanner;
 let graphPanel:       vscode.WebviewPanel | undefined;
 let statusBarItem:    vscode.StatusBarItem;
 let statsViewProvider: StatsViewProvider;
+let currentStatus: StatusState = 'idle';
 
 // ─── activate ─────────────────────────────────────────────────────────────────
 
@@ -56,40 +58,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   // Start database initialization asynchronously in the background.
-  db.init().then(() => {
+  db.init().then(async () => {
     const cfg = getConfig();
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
     if (workspaceRoot) {
       const stats = db.getStats();
 
       if (stats.totalNodes === 0) {
-        // First install: show scanning status immediately so user knows it's working
-        setStatus('scanning');
-        backgroundScanner.scheduleInitialScan(workspaceRoot, {
-          excludePatterns:     cfg.excludePatterns,
-          supportedExtensions: cfg.supportedExtensions,
-        }, context);
-
-        // Prompt the user for IDE preferences on first install/activation
-        if (context.workspaceState.get('selectedIdes') === undefined) {
-          vscode.window.showInformationMessage(
-            'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
-            'Select IDEs',
-            'Skip'
-          ).then(async choice => {
+        // First install/activation with no graph: do other configurations first, then scan
+        try {
+          let ides = context.workspaceState.get<string[]>('selectedIdes');
+          if (ides === undefined) {
+            // Prompt the user for IDE preferences first (blocking)
+            const choice = await vscode.window.showInformationMessage(
+              'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
+              'Select IDEs',
+              'Skip'
+            );
             if (choice === 'Select IDEs') {
-              await getOrPromptSelectedIdes(context, true);
+              ides = await getOrPromptSelectedIdes(context, true);
             } else {
-              await context.workspaceState.update('selectedIdes', []);
+              ides = [];
+              await context.workspaceState.update('selectedIdes', ides);
             }
-            // Regenerate skills immediately with choice if scanner finished
-            const dbStats = db.getStats();
-            if (dbStats.totalNodes > 0) {
-              const fullStats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
-              const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
-              skillGenerator.generateAll(workspaceRoot, fullStats, ides);
-            }
-          });
+          }
+
+          // Do the other configurations first (README, mcp.json, instruction/agent files etc.)
+          const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
+          skillGenerator.generateAll(workspaceRoot, fullStats, ides);
+
+          // Now start the db parsing (background scan)
+          setStatus('scanning');
+          backgroundScanner.scheduleInitialScan(workspaceRoot, {
+            excludePatterns:     cfg.excludePatterns,
+            supportedExtensions: cfg.supportedExtensions,
+          }, context);
+        } catch (err) {
+          console.error('[CodeLens] Initial configuration/scan failed:', err);
+          setStatus('error');
         }
       } else {
         // Already have a graph — refresh skills and show ready
@@ -281,6 +287,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
       vscode.window.showInformationMessage(`CodeLens: Skills regenerated → ${written.join(', ')}`);
     }),
+
+    // Clear configuration files (user-triggered)
+    vscode.commands.registerCommand('codelens-graph.clearConfig', async () => {
+      const choice = await vscode.window.showWarningMessage(
+        'Are you sure you want to clear all configurations and directories created by CodeLens Graph?',
+        'Yes',
+        'Cancel'
+      );
+      if (choice !== 'Yes') { return; }
+
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+      if (!workspaceRoot) { return; }
+
+      // 1. Close and reset database connection
+      await db?.close();
+
+      // 2. Clear configurations and directories on disk
+      skillGenerator.clearAll(workspaceRoot);
+
+      // 3. Clear stored workspace state
+      await context.workspaceState.update('selectedIdes', undefined);
+
+      // 4. Reset extension status
+      setStatus('idle');
+      statsViewProvider?.refresh();
+
+      vscode.window.showInformationMessage('CodeLens Graph: Configurations and directories cleared successfully.');
+    }),
   );
 
   // ── 6. File system watcher → incremental graph updates ────────────────────
@@ -333,8 +367,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(fsWatcher);
   }
 
-  // ── 7. Auto-scan on activation (deferred to db.init() resolution) ────────
-
+  // ── 7. Active Workspace registry update ──────────────────────────────────
+  if (activeWorkspaceRoot) {
+    updateActiveWorkspaceRegistry(activeWorkspaceRoot);
+    context.subscriptions.push(
+      vscode.window.onDidChangeWindowState(e => {
+        if (e.focused) {
+          updateActiveWorkspaceRegistry(activeWorkspaceRoot);
+        }
+      })
+    );
+  }
 
   // Refresh savings display every 30s — updates while agent is actively working
   const savingsTimer = setInterval(refreshSavings, 30_000);
@@ -347,10 +390,63 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 // ─── deactivate ───────────────────────────────────────────────────────────────
 
 export function deactivate(): void {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (workspaceRoot) {
+    updateActiveWorkspaceRegistry(workspaceRoot, true);
+  }
   backgroundScanner?.dispose();
   fileWatcher?.dispose();
   db?.close();
   console.log('[CodeLens Graph] Deactivated');
+}
+
+function updateActiveWorkspaceRegistry(workspacePath: string, remove = false): void {
+  try {
+    const registryDir = path.join(os.homedir(), '.codelens');
+    const registryPath = path.join(registryDir, 'active-workspaces.json');
+    
+    fs.mkdirSync(registryDir, { recursive: true });
+    
+    let registry: { windows: Record<string, { path: string; lastActive: number }> } = { windows: {} };
+    if (fs.existsSync(registryPath)) {
+      try {
+        registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+      } catch {
+        // ignore corruption
+      }
+    }
+    
+    if (!registry.windows) {
+      registry.windows = {};
+    }
+    
+    const currentPid = String(process.pid);
+    
+    if (remove) {
+      delete registry.windows[currentPid];
+    } else {
+      registry.windows[currentPid] = {
+        path: workspacePath,
+        lastActive: Date.now()
+      };
+    }
+    
+    // Clean up stale PIDs
+    for (const pid of Object.keys(registry.windows)) {
+      if (pid === currentPid) { continue; }
+      try {
+        process.kill(Number(pid), 0);
+      } catch (err: any) {
+        if (err.code === 'ESRCH') {
+          delete registry.windows[pid];
+        }
+      }
+    }
+    
+    fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[CodeLens] Failed to update active workspace registry:', err);
+  }
 }
 
 // ─── manualBuild ──────────────────────────────────────────────────────────────
@@ -364,6 +460,8 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
     return;
   }
 
+  // 1. Prompt for configurations first before graph is built
+  const ides = await getOrPromptSelectedIdes(context);
   const workspaceRoot = folders[0].uri.fsPath;
   const cfg = getConfig();
   setStatus('scanning');
@@ -374,9 +472,11 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
     cancellable: false,
   }, async (progress) => {
     try {
+      // 2. Build DB for all files except node_modules (Phase 1)
       const result = await scanner.scanWorkspace([workspaceRoot], {
         excludePatterns:     cfg.excludePatterns,
         supportedExtensions: cfg.supportedExtensions,
+        excludeDeps:         true,
         onProgress: (current, total, filePath) => {
           progress.report({
             message:   `${Math.round((current / total) * 100)}%  ${path.basename(filePath)}`,
@@ -388,17 +488,32 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
       const dbStats = db.getStats();
       const stats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: result.durationMs };
 
+      // 3. Make configs, side panel, and graph panel visible/ready
+      const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
       setStatus('ready', dbStats.totalNodes, dbStats.totalEdges);
       refreshAll();
 
-      // Generate / update skill files
-      const ides = await getOrPromptSelectedIdes(context);
-      const written = skillGenerator.generateAll(workspaceRoot, stats, ides);
-
       vscode.window.showInformationMessage(
-        `CodeLens Graph: ${result.filesScanned} files · ${result.nodesAdded} symbols · ${result.durationMs}ms` +
-        ` | Skills → ${written.length} agent rule files updated`
+        `CodeLens Graph: Workspace files scanned. Dependency parsing is continuing in the background.`
       );
+
+      // 4. Parse node_modules in the background (Phase 2)
+      setTimeout(async () => {
+        try {
+          const depResult = await scanner.scanWorkspace([workspaceRoot], {
+            excludePatterns:     cfg.excludePatterns,
+            supportedExtensions: cfg.supportedExtensions,
+            depsOnly:            true,
+          });
+          const finalDbStats = db.getStats();
+          const finalStats: GraphStats = { ...finalDbStats, lastBuilt: Date.now(), buildDurationMs: stats.buildDurationMs + depResult.durationMs };
+          skillGenerator.generateAll(workspaceRoot, finalStats, ides);
+          refreshAll();
+        } catch (err) {
+          console.error('[CodeLens] Background dependency manual scan failed:', err);
+        }
+      }, 300);
+
     } catch (err: any) {
       console.error('[CodeLens] Manual build failed:', err);
       vscode.window.showErrorMessage(`CodeLens build failed: ${err?.message || err}`);
@@ -459,6 +574,9 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
       vscode.commands.executeCommand('codelens-graph.buildGraph');
     }
     if (msg.command === 'ready') {
+      // Send current status so panel knows if it's scanning
+      graphPanel?.webview.postMessage({ command: 'setStatus', status: currentStatus });
+
       // Webview JS finished loading. Only push if version changed!
       const currentVersion = db.getVersion();
       if (currentVersion !== lastSentVersion) {
@@ -660,6 +778,11 @@ function getConfig() {
 type StatusState = 'idle' | 'scanning' | 'updating' | 'ready' | 'error';
 
 function setStatus(state: StatusState, nodes?: number, edges?: number): void {
+  currentStatus = state;
+  statsViewProvider?.setStatus(state);
+  if (graphPanel) {
+    graphPanel.webview.postMessage({ command: 'setStatus', status: state });
+  }
   switch (state) {
     case 'scanning':
       statusBarItem.text    = '$(loading~spin) CodeLens: scanning…';

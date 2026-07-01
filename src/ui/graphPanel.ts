@@ -618,7 +618,23 @@ window.addEventListener('message', ev => {
 
   if (msg.command === 'setStatus') {
     const el = document.getElementById('loading-text');
-    if (el) { el.textContent = msg.text || 'Processing…'; }
+    const loading = document.getElementById('loading');
+    const empty = document.getElementById('empty-state');
+
+    if (msg.status === 'scanning' || msg.status === 'updating') {
+      if (loading) {
+        loading.style.display = 'block';
+        if (el) { el.textContent = msg.status === 'scanning' ? 'Building knowledge graph…' : 'Updating graph after agent run…'; }
+      }
+      if (empty) { empty.style.display = 'none'; }
+    } else if (msg.status === 'ready' || msg.status === 'idle') {
+      const hasNodes = RAW.nodes && RAW.nodes.length > 0;
+      if (loading) { loading.style.display = 'none'; }
+      if (empty) { empty.style.display = hasNodes ? 'none' : 'block'; }
+    } else if (msg.status === 'error') {
+      if (loading) { loading.style.display = 'none'; }
+      if (empty) { empty.style.display = 'block'; }
+    }
   }
 });
 
