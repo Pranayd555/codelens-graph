@@ -7,6 +7,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private lastStats: object | null = null;
   private lastIssues = 0;
+  private status = 'idle';
 
   constructor(private db: GraphDB, private context: vscode.ExtensionContext) {}
 
@@ -28,6 +29,10 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(msg => {
       const cmd = msg.command as string;
+      if (cmd === 'ready') {
+        this.sendData();
+        return;
+      }
       const map: Record<string, string> = {
         buildGraph:    'codelens-graph.buildGraph',
         showGraph:     'codelens-graph.showGraph',
@@ -40,6 +45,11 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     });
 
     setTimeout(() => this.sendData(), 200);
+  }
+
+  setStatus(state: string): void {
+    this.status = state;
+    this.sendData();
   }
 
   async refresh(): Promise<void> {
@@ -66,7 +76,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     const issues = this.db.getNodesWithUndefinedRefs().length;
     this.lastStats  = stats;
     this.lastIssues = issues;
-    this.view.webview.postMessage({ command: 'update', stats, issues });
+    this.view.webview.postMessage({ command: 'update', stats, issues, status: this.status });
   }
 
   private getHtml(): string {
@@ -228,7 +238,7 @@ const TC = {
 };
 
 window.addEventListener('message', ev => {
-  const { command, stats, issues, tokens, calls } = ev.data;
+  const { command, stats, issues, tokens, calls, status } = ev.data;
 
   if (command === 'updateSavings') {
     const sec = document.getElementById('savings-section');
@@ -245,10 +255,24 @@ window.addEventListener('message', ev => {
   if (command !== 'update') { return; }
 
   const empty = !stats || stats.totalNodes === 0;
+  const isParsing = status === 'scanning' || status === 'updating';
+
+  if (empty) {
+    if (isParsing) {
+      document.getElementById('skeleton').style.display    = 'block';
+      document.getElementById('empty-state').style.display = 'none';
+      document.getElementById('main').style.display        = 'none';
+    } else {
+      document.getElementById('skeleton').style.display    = 'none';
+      document.getElementById('empty-state').style.display = 'block';
+      document.getElementById('main').style.display        = 'none';
+    }
+    return;
+  }
+
   document.getElementById('skeleton').style.display    = 'none';
-  document.getElementById('empty-state').style.display = empty ? 'block' : 'none';
-  document.getElementById('main').style.display        = empty ? 'none'  : 'block';
-  if (empty) { return; }
+  document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('main').style.display        = 'block';
 
   document.getElementById('v-nodes').textContent  = fmt(stats.totalNodes);
   document.getElementById('v-edges').textContent  = fmt(stats.totalEdges);

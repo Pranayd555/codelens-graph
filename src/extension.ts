@@ -56,40 +56,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   // Start database initialization asynchronously in the background.
-  db.init().then(() => {
+  db.init().then(async () => {
     const cfg = getConfig();
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
     if (workspaceRoot) {
       const stats = db.getStats();
 
       if (stats.totalNodes === 0) {
-        // First install: show scanning status immediately so user knows it's working
-        setStatus('scanning');
-        backgroundScanner.scheduleInitialScan(workspaceRoot, {
-          excludePatterns:     cfg.excludePatterns,
-          supportedExtensions: cfg.supportedExtensions,
-        }, context);
-
-        // Prompt the user for IDE preferences on first install/activation
-        if (context.workspaceState.get('selectedIdes') === undefined) {
-          vscode.window.showInformationMessage(
-            'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
-            'Select IDEs',
-            'Skip'
-          ).then(async choice => {
+        // First install/activation with no graph: do other configurations first, then scan
+        try {
+          let ides = context.workspaceState.get<string[]>('selectedIdes');
+          if (ides === undefined) {
+            // Prompt the user for IDE preferences first
+            const choice = await vscode.window.showInformationMessage(
+              'CodeLens Graph: Which IDEs would you like to install automatic configurations for?',
+              'Select IDEs',
+              'Skip'
+            );
             if (choice === 'Select IDEs') {
-              await getOrPromptSelectedIdes(context, true);
+              ides = await getOrPromptSelectedIdes(context, true);
             } else {
-              await context.workspaceState.update('selectedIdes', []);
+              ides = [];
+              await context.workspaceState.update('selectedIdes', ides);
             }
-            // Regenerate skills immediately with choice if scanner finished
-            const dbStats = db.getStats();
-            if (dbStats.totalNodes > 0) {
-              const fullStats: GraphStats = { ...dbStats, lastBuilt: Date.now(), buildDurationMs: 0 };
-              const ides = context.workspaceState.get<string[]>('selectedIdes') ?? [];
-              skillGenerator.generateAll(workspaceRoot, fullStats, ides);
-            }
-          });
+          }
+
+          // Do the other configurations first (README, mcp.json, instruction/agent files etc.)
+          const fullStats: GraphStats = { ...stats, lastBuilt: Date.now(), buildDurationMs: 0 };
+          skillGenerator.generateAll(workspaceRoot, fullStats, ides);
+
+          // Now start the db parsing (background scan)
+          setStatus('scanning');
+          backgroundScanner.scheduleInitialScan(workspaceRoot, {
+            excludePatterns:     cfg.excludePatterns,
+            supportedExtensions: cfg.supportedExtensions,
+          }, context);
+        } catch (err) {
+          console.error('[CodeLens] Initial configuration/scan failed:', err);
+          setStatus('error');
         }
       } else {
         // Already have a graph — refresh skills and show ready
@@ -660,6 +664,7 @@ function getConfig() {
 type StatusState = 'idle' | 'scanning' | 'updating' | 'ready' | 'error';
 
 function setStatus(state: StatusState, nodes?: number, edges?: number): void {
+  statsViewProvider?.setStatus(state);
   switch (state) {
     case 'scanning':
       statusBarItem.text    = '$(loading~spin) CodeLens: scanning…';
