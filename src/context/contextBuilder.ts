@@ -39,20 +39,16 @@ export class ContextBuilder {
 
   // ── Main build ────────────────────────────────────────────────────────────
 
-  build(taskDescription: string, maxDepth = 2, maxTokenBudget = 2000, mode: 'short' | 'deep' = 'short'): AgentContext {
+  build(taskDescription: string, maxDepth = 2, maxTokenBudget = 2000, mode: 'short' | 'deep' = 'short', scope: 'workspace' | 'deps' | 'all' = 'workspace'): AgentContext {
     const keywords   = extractKeywords(taskDescription);
 
-    const isAskedNodeModule = /node_modules|node\s+module|dependency|dependencies|npm|yarn|pnpm/i.test(taskDescription) || keywords.some(kw => kw === 'node_modules' || kw === 'package' || kw === 'dependency');
-    const isAskedConfigs = /config|readme|settings|\.json|\.config/i.test(taskDescription) || keywords.some(kw => kw === 'config' || kw === 'readme' || kw === 'package' || kw === 'settings');
-
-    let depVisibility: 'full' | 'metadata' | 'hidden' = 'metadata';
-    if (taskDescription.length < 15 || maxTokenBudget < 1000) {
-      depVisibility = 'hidden';
-    } else if (isAskedNodeModule || isAskedConfigs) {
+    let depVisibility: 'full' | 'metadata' | 'hidden' = 'hidden';
+    if (scope === 'all' || scope === 'deps') {
       depVisibility = 'full';
+    } else {
+      depVisibility = 'hidden';
     }
 
-    const scope: 'workspace' | 'all' = depVisibility === 'full' ? 'all' : 'workspace';
     const entryNodes = this.findEntryPoints(keywords, scope);
     const entryIds   = entryNodes.map(n => n.id);
 
@@ -60,8 +56,11 @@ export class ContextBuilder {
     const filteredNodes = nodes.filter(n => {
       const isNm = isNodeModulePath(n.filePath);
       const isCfg = isConfigPath(n.filePath);
-      if (depVisibility === 'hidden' || depVisibility === 'metadata') {
+      if (scope === 'workspace') {
         return !isNm && !isCfg;
+      }
+      if (scope === 'deps') {
+        return isNm || isCfg;
       }
       return true;
     });
@@ -70,10 +69,10 @@ export class ContextBuilder {
     const { trimmedNodes, trimmedEdges } = this.trimToBudget(scored, edges, maxTokenBudget);
 
     // ── IMPROVEMENT 3: rich warnings with exact location + snippet ────────────
-    const warnings   = this.generateWarnings(trimmedNodes, taskDescription);
+    const warnings   = this.generateWarnings(trimmedNodes, taskDescription, scope);
 
     // ── IMPROVEMENT 4: category hints so agent finds files without grep ───────
-    const existingFiles   = this.db.getAllFiles('workspace');
+    const existingFiles   = this.db.getAllFiles(scope);
 
     // ── IMPROVEMENT 1+2: diagnoses include import path + undefined refs ───────
     const diagnoses  = this.buildDiagnoses(trimmedNodes, taskDescription);
@@ -96,7 +95,7 @@ export class ContextBuilder {
 
   // ── Entry point discovery ─────────────────────────────────────────────────
 
-  private findEntryPoints(keywords: string[], scope: 'workspace' | 'all'): GraphNode[] {
+  private findEntryPoints(keywords: string[], scope: 'workspace' | 'deps' | 'all'): GraphNode[] {
     const found = new Map<string, GraphNode>();
     for (const kw of keywords) {
       for (const node of this.db.searchNodes(kw, 10, scope)) {
@@ -164,7 +163,7 @@ export class ContextBuilder {
   // ── IMPROVEMENT 3: Warnings with exact context ────────────────────────────
   // Now includes: exact file:line, the signature, and which callers use it.
 
-  private generateWarnings(nodes: GraphNode[], task: string): string[] {
+  private generateWarnings(nodes: GraphNode[], task: string, scope: 'workspace' | 'deps' | 'all' = 'workspace'): string[] {
     const warnings: string[] = [];
     const taskL    = task.toLowerCase();
     const keywords = extractKeywords(task);
@@ -198,7 +197,7 @@ export class ContextBuilder {
     }
 
     // File-level warnings with category context
-    const allFiles = this.db.getAllFiles();
+    const allFiles = this.db.getAllFiles(scope);
     for (const fp of allFiles) {
       const basename = path.basename(fp).toLowerCase();
       for (const kw of keywords) {
@@ -410,7 +409,10 @@ export class ContextBuilder {
     lines.push('### All workspace files:');
     const groups = this.classifier.groupFiles(context.existingFiles);
     for (const [label, files] of groups) {
-      lines.push(`**${label}:** ${files.map(f => path.basename(f)).join(', ')}`);
+      const maxShow = 15;
+      const shown = files.slice(0, maxShow).map(f => path.basename(f)).join(', ');
+      const extra = files.length > maxShow ? ` (+ ${files.length - maxShow} more)` : '';
+      lines.push(`**${label}:** ${shown}${extra}`);
     }
 
     return lines.join('\n');

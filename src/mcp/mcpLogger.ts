@@ -23,15 +23,16 @@ export interface ToolCallLog {
 
 // Approximate token cost per tool call (based on typical response sizes)
 const TOOL_TOKEN_COST: Record<string, number> = {
-  codelens_triage:  10,
-  codelens_search:  50,
-  codelens_node:    80,
-  codelens_files:   120,
-  codelens_callees: 100,
-  codelens_callers: 100,
-  codelens_context: 400,
-  codelens_impact:  300,
-  codelens_status:  30,
+  codelens_triage:       10,
+  codelens_search:       50,
+  codelens_node:         80,
+  codelens_files:        120,
+  codelens_relations:    100,
+  codelens_context:      400,
+  codelens_impact:       300,
+  codelens_status:       30,
+  codelens_text_search:  60,
+  codelens_dependencies: 80,
 };
 
 export class MCPLogger {

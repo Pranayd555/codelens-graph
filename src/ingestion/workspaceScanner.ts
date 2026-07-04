@@ -3,7 +3,7 @@ import * as path from 'path';
 import { ASTParser } from './astParser';
 import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
-import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile } from '../utils';
+import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile, matchPathFilter } from '../utils';
 import { TextIndex } from '../indexing/textIndex';
 
 export interface ScanOptions {
@@ -431,33 +431,6 @@ export class WorkspaceScanner {
   // Supports: **/foo/**, **/foo, foo/**, foo, *.ext
 
   private matchesGlob(relPath: string, name: string, pattern: string): boolean {
-    // Normalise pattern separators
-    const p = pattern.replace(/\\/g, '/').replace(/^\/|\/$/g, '');
-
-    // Convert glob to regex
-    // 1. Escape regex special chars except * and /
-    let regexStr = p
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')   // escape special chars
-      .replace(/\*\*\//g, '(?:.+/)?')          // **/ = any depth prefix (optional)
-      .replace(/\/\*\*/g, '(?:/.+)?')          // /** = any depth suffix (optional)
-      .replace(/\*/g, '[^/]*');                 // * = any single segment chars
-
-    // Anchor: if no ** prefix, match from start or after a /
-    if (!p.startsWith('**')) {
-      regexStr = '(?:^|/)' + regexStr;
-    }
-
-    try {
-      const regex = new RegExp(regexStr + '(?:/|$)');
-      if (regex.test(relPath)) { return true; }
-      // Also match against bare name for patterns like "node_modules"
-      if (regex.test(name))    { return true; }
-    } catch {
-      // Fallback: simple segment inclusion
-      const seg = p.replace(/\*/g, '').replace(/\//g, '');
-      if (seg && (relPath.includes(seg) || name === seg)) { return true; }
-    }
-
-    return false;
+    return matchPathFilter(relPath, pattern) || matchPathFilter(name, pattern);
   }
 }

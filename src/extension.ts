@@ -16,7 +16,7 @@ import { getGraphPanelHtml, toWebviewData } from './ui/graphPanel';
 import { readRecentLogs, formatUsageReport } from './mcp/mcpLogger';
 import { StatsViewProvider }   from './ui/statsView';
 import { GraphStats }         from './types';
-import { isNodeModulePath }   from './utils';
+import { isNodeModulePath, matchPathFilter }   from './utils';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -330,8 +330,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // node_modules / dist / .angular etc never trigger a re-index.
     const isExcludedPath = (fsPath: string): boolean => {
       const rel = path.relative(workspaceRoot, fsPath).replace(/\\/g, '/');
-      const FAST_EXCLUDE = /(?:^|[/\\])(?:node_modules|\.codelens|\.angular|\.next|\.nuxt|\.vite|\.turbo|dist|build|\.git|\.trae|\.cursor|__pycache__|\.venv|target|vendor)(?:[/\\]|$)/;
-      return FAST_EXCLUDE.test(rel);
+      const FAST_EXCLUDE = /(?:^|[/\\])(?:node_modules|\.codelens|\.angular|\.next|\.nuxt|\.vite|\.turbo|dist|build|out|output|\.git|\.trae|\.cursor|__pycache__|\.venv|target|vendor)(?:[/\\]|$)/;
+      if (FAST_EXCLUDE.test(rel)) { return true; }
+      
+      const basename = path.basename(fsPath);
+      for (const pattern of cfg.excludePatterns) {
+        if (matchPathFilter(rel, pattern) || matchPathFilter(basename, pattern)) {
+          return true;
+        }
+      }
+      return false;
     };
 
     fsWatcher.onDidChange(async uri => {
