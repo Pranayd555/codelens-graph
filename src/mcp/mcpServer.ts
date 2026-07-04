@@ -8,7 +8,7 @@ import { ContextBuilder } from '../context/contextBuilder';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
-import { isConfigPath, isNodeModulePath } from '../utils';
+import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
 import { TextIndex, TextEntry } from '../indexing/textIndex';
 
 // ─── Task tier classifier ─────────────────────────────────────────────────────
@@ -359,12 +359,20 @@ export class MCPServer {
         max_depth:  z.number().optional().default(2),
         max_tokens: z.number().optional().default(2500),
         mode:       z.enum(['short', 'deep']).optional().default('short'),
+        scope:      z.enum(['workspace', 'deps', 'all']).optional().default('workspace').describe('Filter context to: "workspace" (default, excludes node_modules/configs), "deps" (only node_modules and configs), or "all" (includes everything). Use "deps" or "all" only if the task explicitly requires inspecting external dependencies or config files.'),
         workspace:  z.string().optional().describe('Optional workspace override path')
       },
-      async ({ task, max_depth, max_tokens, mode, workspace }: { task: string; max_depth?: number; max_tokens?: number; mode: 'short' | 'deep'; workspace?: string }) => {
+      async ({ task, max_depth, max_tokens, mode, scope, workspace }: {
+        task: string;
+        max_depth?: number;
+        max_tokens?: number;
+        mode: 'short' | 'deep';
+        scope?: 'workspace' | 'deps' | 'all';
+        workspace?: string;
+      }) => {
         const { db, contextBuilder } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
-        const ctx    = contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500, mode);
+        const ctx    = contextBuilder.build(task, max_depth ?? 2, max_tokens ?? 2500, mode, scope ?? 'workspace');
         const output = contextBuilder.buildSystemPromptInjection(ctx, mode);
         const header = [
           '## CodeLens Context: "' + task + '" (' + mode + ' mode)',
@@ -401,9 +409,16 @@ export class MCPServer {
             const callers = db.getEdgesTo(t.id, 'calls')
               .map(e => db.getNode(e.fromId)).filter(Boolean) as GraphNode[];
             lines.push('### Callers (Incoming):');
-            lines.push(callers.length
-              ? callers.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
-              : '  No callers found in indexed codebase.');
+            if (callers.length > 0) {
+              const maxCallers = 30;
+              const shownCallers = callers.slice(0, maxCallers);
+              lines.push(...shownCallers.map(c => '  - ' + this.fmtNode(c, workspaceRoot)));
+              if (callers.length > maxCallers) {
+                lines.push(`  - ... and ${callers.length - maxCallers} more callers.`);
+              }
+            } else {
+              lines.push('  No callers found in indexed codebase.');
+            }
             lines.push('');
           }
           
@@ -411,9 +426,16 @@ export class MCPServer {
             const callees = db.getEdgesFrom(t.id, 'calls')
               .map(e => db.getNode(e.toId)).filter(Boolean) as GraphNode[];
             lines.push('### Callees (Outgoing):');
-            lines.push(callees.length
-              ? callees.map(c => '  - ' + this.fmtNode(c, workspaceRoot)).join('\n')
-              : '  No outgoing calls found.');
+            if (callees.length > 0) {
+              const maxCallees = 30;
+              const shownCallees = callees.slice(0, maxCallees);
+              lines.push(...shownCallees.map(c => '  - ' + this.fmtNode(c, workspaceRoot)));
+              if (callees.length > maxCallees) {
+                lines.push(`  - ... and ${callees.length - maxCallees} more callees.`);
+              }
+            } else {
+              lines.push('  No outgoing calls found.');
+            }
             lines.push('');
           }
         }
@@ -440,16 +462,21 @@ export class MCPServer {
         const t = targets[0];
         const { nodes, edges } = db.bfsExpand([t.id], depth ?? 3);
         const impacted = nodes.filter(n => n.id !== t.id && edges.some(e => e.fromId === n.id || e.toId === n.id));
+        const maxImpacted = 50;
+        const shownImpacted = impacted.slice(0, maxImpacted);
         const lines = [
           '## Impact: "' + symbol + '"',
           'Definition: ' + this.rel(t.filePath, workspaceRoot) + ':' + t.line,
           'Signature: ' + (t.signature?.slice(0, 120) ?? 'N/A'),
           '',
           impacted.length + ' affected symbol(s):',
-          ...impacted.map(n => '  - [' + n.type + '] ' + n.name + ' @ ' + this.rel(n.filePath, workspaceRoot) + ':' + n.line),
+          ...shownImpacted.map(n => '  - [' + n.type + '] ' + n.name + ' @ ' + this.rel(n.filePath, workspaceRoot) + ':' + n.line),
         ];
+        if (impacted.length > maxImpacted) {
+          lines.push(`  - ... and ${impacted.length - maxImpacted} more symbols.`);
+        }
         if (t.undefinedRefs?.length) {
-          lines.push('', 'Existing undefined refs: ' + t.undefinedRefs.join(', '));
+          lines.push('', 'Existing undefined refs: ' + t.undefinedRefs.slice(0, 20).join(', ') + (t.undefinedRefs.length > 20 ? ` (+ ${t.undefinedRefs.length - 20} more)` : ''));
         }
         return txt(lines.join('\n'));
       }
@@ -465,15 +492,27 @@ export class MCPServer {
       {
         symbol: z.string(),
         with_snippet: z.boolean().optional().default(false),
+        filePath: z.string().optional().describe('Optional file path (absolute, relative, or suffix) to disambiguate if multiple symbols share the same name.'),
         workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ symbol, with_snippet, workspace }: { symbol: string; with_snippet?: boolean; workspace?: string }) => {
+      async ({ symbol, with_snippet, filePath, workspace }: { symbol: string; with_snippet?: boolean; filePath?: string; workspace?: string }) => {
         const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
         const results = db.searchNodes(symbol, 5).filter(n => n.name === symbol);
-        if (!results.length) { return txt('"' + symbol + '" not found.'); }
+        
+        let filteredResults = results;
+        if (filePath) {
+          const normQueryPath = filePath.replace(/\\/g, '/').toLowerCase();
+          filteredResults = results.filter(n => {
+            const normNodePath = n.filePath.replace(/\\/g, '/').toLowerCase();
+            const normRelPath = this.rel(n.filePath, workspaceRoot).toLowerCase();
+            return normNodePath.endsWith(normQueryPath) || normRelPath.endsWith(normQueryPath);
+          });
+        }
+
+        if (!filteredResults.length) { return txt('"' + symbol + '" not found' + (filePath ? ' inside file matching ' + filePath : '') + '.'); }
         const lines: string[] = [];
-        for (const node of results.slice(0, 3)) {
+        for (const node of filteredResults.slice(0, 3)) {
           lines.push('## [' + node.type + '] ' + node.name);
           lines.push('- File: ' + this.rel(node.filePath, workspaceRoot) + ':' + node.line);
           if (node.signature)   { lines.push('- Signature: ' + node.signature.slice(0, 200)); }
@@ -485,8 +524,8 @@ export class MCPServer {
           if (imp) { lines.push('- Import as: ' + imp); }
           const callerCount = db.getEdgesTo(node.id, 'calls').length;
           const calleeCount = db.getEdgesFrom(node.id, 'calls').length;
-          if (callerCount) { lines.push('- Callers: ' + callerCount + ' (run codelens_callers)'); }
-          if (calleeCount) { lines.push('- Callees: ' + calleeCount + ' (run codelens_callees)'); }
+          if (callerCount) { lines.push('- Callers: ' + callerCount + ' (run codelens_relations with direction callers)'); }
+          if (calleeCount) { lines.push('- Callees: ' + calleeCount + ' (run codelens_relations with direction callees)'); }
           if (node.undefinedRefs?.length) {
             lines.push('- Undefined refs: ' + node.undefinedRefs.join(', '));
           }
@@ -526,7 +565,12 @@ export class MCPServer {
             continue;
           }
           lines.push('### ' + label + ' (' + files.length + ')');
-          lines.push(...files.map(f => '  - ' + this.rel(f, workspaceRoot)));
+          const maxFilesToShow = filter ? files.length : 30;
+          const shownFiles = files.slice(0, maxFilesToShow);
+          lines.push(...shownFiles.map(f => '  - ' + this.rel(f, workspaceRoot)));
+          if (files.length > maxFilesToShow) {
+            lines.push(`  - ... and ${files.length - maxFilesToShow} more files. Use a filter to narrow search.`);
+          }
           lines.push('');
         }
         return txt(lines.join('\n'));
@@ -589,10 +633,16 @@ export class MCPServer {
               lines.push('No type definition files found for this package.');
             } else {
               lines.push('Type definition files:');
-              for (const td of typeDefs) {
+              const maxTypeDefsToShow = 10;
+              const shownTypeDefs = typeDefs.slice(0, maxTypeDefsToShow);
+              for (const td of shownTypeDefs) {
                 lines.push('### ' + this.rel(td.filePath, workspaceRoot));
                 const symbols = db.getNodesByFile(td.filePath).filter(n => n.type !== 'file' && n.type !== 'import');
                 lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ line ' + s.line + ' ' + (s.signature ? '`' + s.signature.slice(0, 100) + '`' : '')));
+                lines.push('');
+              }
+              if (typeDefs.length > maxTypeDefsToShow) {
+                lines.push(`### ... and ${typeDefs.length - maxTypeDefsToShow} more type definition files.`);
                 lines.push('');
               }
             }
@@ -697,7 +747,7 @@ export class MCPServer {
         limit: z.number().optional().default(10).describe('Max results'),
         workspace: z.string().optional().describe('Optional workspace override path')
       },
-      async ({ query, fileFilter, inComments, inStrings, limit, workspace }: {
+      async ({ query, fileFilter, inComments, inStrings, limit = 10, workspace }: {
         query: string;
         fileFilter?: string;
         inComments?: boolean;
@@ -705,39 +755,190 @@ export class MCPServer {
         limit?: number;
         workspace?: string;
       }) => {
-        const { db, textIndex, workspaceRoot } = await this.getWorkspaceContext(workspace);
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
-        
-        let tokenType: TextEntry['tokenType'] | undefined;
-        if (inComments) {
-          tokenType = 'comment';
-        } else if (inStrings) {
-          tokenType = 'string_literal';
+
+        // 1. Normalize and decode query
+        let decoded = query;
+        try {
+          decoded = decodeURIComponent(query);
+        } catch {}
+        const normalizedQuery = decoded.trim();
+
+        if (!normalizedQuery) {
+          return txt('Empty search query.');
         }
 
-        const results = textIndex.search(query, {
-          limit,
-          fileFilter,
-          tokenType,
-          fuzzy: true
-        });
+        // 2. Determine regex status
+        const isRegex = /[|*?+{}()[\]^$\\&]/.test(normalizedQuery);
+        let regex: RegExp | null = null;
+        if (isRegex) {
+          try {
+            regex = new RegExp(normalizedQuery, 'i');
+          } catch (e) {
+            // fallback to substring search if invalid regex
+          }
+        }
+
+        const resultsMap = new Map<string, { filePath: string; line: number; rawText: string; source: 'graph' | 'filesystem'; type: string }>();
+
+        // Heuristics for token types
+        const isLineComment = (lineText: string) => {
+          const t = lineText.trim();
+          return t.startsWith('//') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('#');
+        };
+        const isLineString = (lineText: string) => {
+          const t = lineText.trim();
+          return (t.includes('"') || t.includes("'") || t.includes('`')) && 
+                 !t.includes('function') && !t.includes('class') && !t.includes('const');
+        };
+
+        const matchesQuery = (lineText: string) => {
+          if (inComments && !isLineComment(lineText)) return false;
+          if (inStrings && !isLineString(lineText)) return false;
+          
+          if (regex) {
+            return regex.test(lineText);
+          }
+          return lineText.toLowerCase().includes(normalizedQuery.toLowerCase());
+        };
+
+        let graphMatchedCount = 0;
+
+        // 3. Layer 1: Graph Search (only if not searching comments/strings specifically)
+        if (!inComments && !inStrings) {
+          const graphNodes = db.searchNodes(normalizedQuery, limit * 3, 'workspace');
+          for (const node of graphNodes) {
+            // Apply file filter
+            if (fileFilter && !matchPathFilter(node.filePath, fileFilter, workspaceRoot)) {
+              continue;
+            }
+
+            // Read the exact line for verification
+            try {
+              if (fs.existsSync(node.filePath)) {
+                const content = fs.readFileSync(node.filePath, 'utf-8');
+                const linesList = content.split('\n');
+                const lineIndex = node.line - 1;
+                const lineText = linesList[lineIndex];
+                if (lineText !== undefined && matchesQuery(lineText)) {
+                  const key = `${node.filePath}:${node.line}`;
+                  resultsMap.set(key, {
+                    filePath: node.filePath,
+                    line: node.line,
+                    rawText: lineText.trim(),
+                    source: 'graph',
+                    type: node.type
+                  });
+                  graphMatchedCount++;
+                  if (resultsMap.size >= limit) {
+                    break;
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+
+        let filesystemScanTriggered = false;
+        let filesMatchedFilter = 0;
+        let candidateFilesCount = 0;
+
+        // 4. Layer 2: Filesystem Scan Fallback
+        if (resultsMap.size < limit) {
+          filesystemScanTriggered = true;
+          const candidateFiles = db.getAllFiles('workspace');
+          candidateFilesCount = candidateFiles.length;
+
+          const filteredFiles = fileFilter
+            ? candidateFiles.filter(f => {
+                const ok = matchPathFilter(f, fileFilter, workspaceRoot);
+                if (ok) filesMatchedFilter++;
+                return ok;
+              })
+            : candidateFiles;
+
+          if (!fileFilter) {
+            filesMatchedFilter = candidateFiles.length;
+          }
+
+          for (const filePath of filteredFiles) {
+            if (resultsMap.size >= limit) {
+              break;
+            }
+
+            try {
+              if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf-8');
+                // Heuristic: skip binary files or huge files
+                if (content.includes('\u0000') || content.length > 2 * 1024 * 1024) {
+                  continue;
+                }
+                const linesList = content.split('\n');
+                for (let i = 0; i < linesList.length; i++) {
+                  const lineText = linesList[i];
+                  if (matchesQuery(lineText)) {
+                    const lineNo = i + 1;
+                    const key = `${filePath}:${lineNo}`;
+                    if (!resultsMap.has(key)) {
+                      resultsMap.set(key, {
+                        filePath,
+                        line: lineNo,
+                        rawText: lineText.trim(),
+                        source: 'filesystem',
+                        type: isLineComment(lineText) ? 'comment' : (isLineString(lineText) ? 'string_literal' : 'code')
+                      });
+                      if (resultsMap.size >= limit) {
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+
+        const results = Array.from(resultsMap.values());
 
         if (results.length === 0) {
-          return txt('No matches found for "' + query + '".');
+          let msg = 'No matches found for "' + normalizedQuery + '".';
+          if (fileFilter && filesMatchedFilter === 0) {
+            msg += '\n\n⚠️ Warning: The fileFilter "' + fileFilter + '" matched 0 of the ' + candidateFilesCount + ' files in the workspace index. Check your pattern prefix or spelling.';
+          } else {
+            msg += '\n\nGraph may be stale. Run codelens_status to check index freshness.';
+          }
+          return txt(msg);
         }
 
         const lines = [
-          '## Text Search Results for "' + query + '" (' + results.length + ' matches):',
+          '## Text Search Results for "' + normalizedQuery + '" (' + results.length + ' matches):',
           ''
         ];
 
         for (const entry of results) {
           const relPath = path.relative(workspaceRoot, entry.filePath).replace(/\\/g, '/');
-          lines.push('### [' + entry.tokenType + '] ' + relPath + ':' + entry.line);
+          lines.push('### [' + entry.type + '] ' + relPath + ':' + entry.line + ' (' + entry.source + ')');
           lines.push('```');
           lines.push(entry.rawText);
           lines.push('```');
           lines.push('');
+        }
+
+        // Diagnostics block
+        lines.push('---');
+        if (filesystemScanTriggered) {
+          lines.push('*Matched via hybrid search: graph nodes pre-filter + filesystem scan fallback.*');
+        } else {
+          lines.push('*Matched via graph nodes.*');
+        }
+
+        if (fileFilter && filesMatchedFilter === 0) {
+          lines.push('⚠️ *Warning: The fileFilter "' + fileFilter + '" matched 0 files in the workspace index. Checked ' + candidateFilesCount + ' files.*');
+        }
+
+        if (graphMatchedCount === 0 && results.length > 0) {
+          lines.push('💡 *Tip: No symbols matched this query directly, but filesystem search succeeded. Graph may be stale. Run codelens_status to check index freshness.*');
         }
 
         return txt(lines.join('\n'));
@@ -769,8 +970,7 @@ export class MCPServer {
 
   private fmtNode(n: GraphNode, root: string): string {
     const sig  = n.signature ? '  ->  ' + n.signature.slice(0, 80) : '';
-    const warn = n.undefinedRefs?.length ? '  [undef:' + n.undefinedRefs.join(',') + ']' : '';
-    return '[' + n.type + '] ' + n.name + ' @ ' + this.rel(n.filePath, root) + ':' + n.line + sig + warn;
+    return '[' + n.type + '] ' + n.name + ' @ ' + this.rel(n.filePath, root) + ':' + n.line + sig;
   }
 
   private buildImportStmt(node: GraphNode, root: string): string | null {

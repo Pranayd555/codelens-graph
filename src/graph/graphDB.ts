@@ -305,26 +305,59 @@ export class GraphDB {
   searchNodes(query: string, limit = 20, scope: 'workspace' | 'deps' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
     
+    // Normalize and decode query
+    let decoded = query;
+    try {
+      decoded = decodeURIComponent(query);
+    } catch {}
+    decoded = decoded.trim();
+
+    // Split on pipe (|) if present
+    const tokens = decoded.split('|')
+      .map(t => t.trim())
+      .filter(t => t.length >= 2 && /\w+/.test(t));
+
+    if (tokens.length === 0) {
+      return [];
+    }
+
     let scopeSql = '';
     if (scope === 'workspace') {
       scopeSql = "AND file_path NOT LIKE '%node_modules%'";
     } else if (scope === 'deps') {
-      // In SQLite, look for node_modules or common config extensions to filter database nodes quickly
       scopeSql = "AND (file_path LIKE '%node_modules%' OR file_path LIKE '%.json' OR file_path LIKE '%.md')";
     }
 
-    const stmt = this.db.prepare(`
-      SELECT * FROM nodes
-      WHERE (lower(name) LIKE lower(?) OR lower(signature) LIKE lower(?))
-      ${scopeSql}
+    // Dynamic WHERE clause
+    const conditions: string[] = [];
+    const bindParams: any[] = [];
+
+    for (const token of tokens) {
+      conditions.push('(lower(name) LIKE lower(?) OR lower(signature) LIKE lower(?) OR lower(doc_comment) LIKE lower(?))');
+      const likeParam = `%${token}%`;
+      bindParams.push(likeParam, likeParam, likeParam);
+    }
+
+    // ORDER BY logic: prioritize exact name match for the first token, or generally matching name
+    const orderSql = `
       ORDER BY
         CASE WHEN lower(name) = lower(?) THEN 0
              WHEN lower(name) LIKE lower(?) THEN 1
              ELSE 2 END, name
+    `;
+    bindParams.push(tokens[0], `${tokens[0]}%`);
+
+    const sql = `
+      SELECT * FROM nodes
+      WHERE (${conditions.join(' OR ')})
+      ${scopeSql}
+      ${orderSql}
       LIMIT ?
-    `);
-    const like = `%${query}%`;
-    stmt.bind([like, like, query, `${query}%`, limit]);
+    `;
+    bindParams.push(limit);
+
+    const stmt = this.db.prepare(sql);
+    stmt.bind(bindParams);
     const results: GraphNode[] = [];
     while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
     stmt.free();

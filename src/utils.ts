@@ -67,3 +67,55 @@ export function shouldIndexNodeModuleFile(filePath: string): boolean {
 
   return false;
 }
+
+export function matchPathFilter(filePath: string, filter: string, workspaceRoot?: string): boolean {
+  const normPath = filePath.replace(/\\/g, '/');
+  const name = normPath.split('/').pop() || '';
+  
+  let relPath = normPath;
+  if (workspaceRoot) {
+    const normRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/$/, '');
+    if (normPath.startsWith(normRoot)) {
+      relPath = normPath.slice(normRoot.length).replace(/^\//, '');
+    }
+  }
+
+  const p = filter.replace(/\\/g, '/').replace(/^\/|\/$/g, '');
+
+  if (/^\.[a-zA-Z0-9]+$/.test(p)) {
+    return relPath.endsWith(p) || normPath.endsWith(p);
+  }
+
+  let regexStr = p.replace(/[.+^$()|[\]\\]/g, '\\$&');
+
+  regexStr = regexStr.replace(/{([^}]+)}/g, (_, group) => {
+    return '(' + group.split(',').map((s: string) => s.trim()).join('|') + ')';
+  });
+
+  regexStr = regexStr
+    .replace(/\*\*\//g, '(?:.+/)?')
+    .replace(/\/\*\*/g, '(?:/.+)?')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]');
+
+  if (!p.startsWith('**')) {
+    regexStr = '(?:^|/)' + regexStr;
+  }
+
+  try {
+    const regex = new RegExp('^' + regexStr + '$', 'i');
+    if (regex.test(relPath)) { return true; }
+    
+    const relaxedRegex = new RegExp(regexStr + '$', 'i');
+    if (relaxedRegex.test(relPath) || relaxedRegex.test(normPath)) { return true; }
+    
+    const nameRegex = new RegExp('^' + regexStr + '$', 'i');
+    if (nameRegex.test(name)) { return true; }
+  } catch {
+    const seg = p.replace(/\*/g, '').replace(/\//g, '').replace(/{|}|,/g, '');
+    if (seg && (relPath.includes(seg) || name === seg)) { return true; }
+  }
+
+  return false;
+}
+

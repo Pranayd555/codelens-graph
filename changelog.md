@@ -4,6 +4,22 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [0.2.3] - 2026-07-04
+
+### Added
+- **Multi-Token Search Support**: Added pipe-delimited (`|`) search parsing to `codelens_search` (dynamic SQLite LIKE query OR groups with priority ordering).
+- **Unified Glob Matching**: Integrated a unified glob matcher (`matchPathFilter`) for consistent exclusions across background scanning, text indexing, and extension watcher.
+
+### Changed
+- **Context Bloat Prevention**: Capped output size for `codelens_files` (max 30), `codelens_relations` (max 30), `codelens_impact` (max 50), `codelens_dependencies` types (max 10), and prompt-injected workspace files (max 15) to prevent context bloating.
+- **Node Format Cleanup**: Removed verbose `[undef:...]` list tags from `fmtNode` signature representations to keep agent context clean.
+
+### Fixed
+- **Watcher Exclusions**: Fixed VS Code watcher exclusions to correctly ignore compiler output directories (`out/`, `output/`) and respect user-configured `excludePatterns`.
+- **MCP Suggestions**: Fixed `codelens_node` callers/callees tool recommendations to suggest `codelens_relations` instead of non-existent legacy endpoints.
+
+---
+
 ## [0.2.2] - 2026-07-01
 
 ### Added
