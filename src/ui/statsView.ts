@@ -55,6 +55,11 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
   }
 
   async refresh(): Promise<void> {
+    if (this.status === 'idle' && !this.db.isInitialized()) {
+      this.lastStats  = null;
+      this.lastIssues = 0;
+      return;
+    }
     await this.db.ensureInit();
     if (!this.view?.visible) {
       const stats  = this.db.getStats();
@@ -73,6 +78,10 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
 
   private async sendData(): Promise<void> {
     if (!this.view) { return; }
+    if (this.status === 'idle' && !this.db.isInitialized()) {
+      this.view.webview.postMessage({ command: 'update', stats: null, issues: 0, status: this.status });
+      return;
+    }
     await this.db.ensureInit();
     const stats  = this.db.getStats();
     const issues = this.db.getNodesWithUndefinedRefs().length;
@@ -179,7 +188,10 @@ body {
       <div class="stat-card"><div class="value" id="v-nodes">–</div><div class="label">Symbols</div></div>
       <div class="stat-card"><div class="value" id="v-edges">–</div><div class="label">Relations</div></div>
       <div class="stat-card"><div class="value" id="v-files">–</div><div class="label">Files</div></div>
-      <div class="stat-card" id="card-issues"><div class="value" id="v-issues">–</div><div class="label">Issues</div></div>
+      <div class="stat-card" id="card-issues" title="Broken References: Symbols referencing names that are not defined, imported, or standard built-ins."><div class="value" id="v-issues">–</div><div class="label">Issues</div></div>
+    </div>
+    <div class="sav-hint" style="margin-top: 8px; font-size: 10px; line-height: 1.3;">
+      💡 <strong>Issues</strong> are symbols referencing names that are not defined, imported, or standard built-ins (potential typos or broken references).
     </div>
   </div>
 

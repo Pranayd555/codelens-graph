@@ -4,6 +4,24 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [0.2.4] - 2026-07-10
+
+### Added
+- **Dependency Symbols Configuration Option**: Added `codeLensGraph.indexDependencySymbols` setting to allow users to toggle indexing of internal symbols (classes, methods, functions, variables) from dependencies in `node_modules`. Disabling this reduces SQLite database size and scanner memory overhead on large codebases.
+
+### Changed
+- **Optimized Text Search Index**: Refactored the line-by-line text index storage inside `graphDB.ts` from a flat `text_index` table to a relational `files` and `file_lines` schema, reducing duplication.
+- **Improved Undefined References Filtering**: Optimized `getNodesWithUndefinedRefs` to filter out references that are already defined as symbols within the workspace.
+
+### Fixed
+- **VS Code Watcher Auto-reinit Fix**: Reset `this.db = undefined` inside the `close()` method in `graphDB.ts` to ensure that `isInitialized()` returns `false` after database closure. This prevents the VS Code file watcher or sidebar from automatically re-initializing the database and recreating the `.codelens` folder/files on subsequent file events.
+- **Robust Configuration Reset (`clearConfig`)**:
+  - Automatically removes the `.codelens/` ignore section from `.gitignore` on reset.
+  - Replaced hardcoded file unlinking fallback with a dynamic directory scanner (`fs.readdirSync`), ensuring transient SQLite files are fully cleaned up.
+  - Recursively removes empty parent directories (`.codelens`, `.agents`, `.cursor/rules`, etc.) when empty.
+
+---
+
 ## [0.2.3] - 2026-07-04
 
 ### Added

@@ -2,7 +2,7 @@
   "name": "codelens-graph",
   "displayName": "CodeLens Graph",
   "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "PranayDas",
   "repository": {
     "type": "git",
@@ -179,6 +179,11 @@
             "**/.build/**"
           ],
           "description": "Glob patterns for directories and files to exclude from graph indexing."
+        },
+        "codeLensGraph.indexDependencySymbols": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether to index all internal symbols (classes, interfaces, methods, functions, variables) from dependencies in node_modules. Keeping this false drastically reduces database size and memory usage on large codebases."
         },
         "codeLensGraph.supportedExtensions": {
           "type": "array",

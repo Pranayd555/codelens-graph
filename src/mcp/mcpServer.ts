@@ -69,6 +69,7 @@ export class MCPServer {
     logger: MCPLogger;
   }>();
   private defaultWorkspaceRoot = '';
+  private runningScans = new Set<string>();
 
   constructor() {
     this.setupRegistryWatcher();
@@ -182,35 +183,44 @@ export class MCPServer {
       const db = new GraphDB(dbDir);
       await db.init();
 
-      // Check if graph is empty, scan now (blocks until done — first run only)
+      // Check if graph is empty, scan in background if not already running
       const stats = db.getStats();
       if (stats.totalNodes === 0) {
-        console.error(`[CodeLens MCP] Graph empty — indexing ${resolvedPath}…`);
-        const parser  = new ASTParser();
-        const scanner = new WorkspaceScanner(parser, db);
+        if (!this.runningScans.has(resolvedPath)) {
+          this.runningScans.add(resolvedPath);
+          console.error(`[CodeLens MCP] Graph empty — starting background index for ${resolvedPath}…`);
+          const parser  = new ASTParser();
+          const scanner = new WorkspaceScanner(parser, db);
 
-        await scanner.scanWorkspace([resolvedPath], {
-          excludePatterns: [
-            '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
-            '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
-            '**/.turbo/**', '**/.parcel-cache/**', '**/.cache/**', '**/.angular/**',
-            '**/coverage/**', '**/.nyc_output/**', '**/playwright-report/**', '**/test-results/**',
-            '**/__pycache__/**', '**/.venv/**', '**/venv/**', '**/.pytest_cache/**',
-            '**/.mypy_cache/**', '**/site-packages/**', '**/*.egg-info/**',
-            '**/vendor/**', '**/target/**', '**/.gradle/**', '**/.m2/**', '**/obj/**',
-            '**/.git/**', '**/.hg/**', '**/.svn/**', '**/.idea/**', '**/.vs/**',
-            '**/.vscode/**', '**/.cursor/**', '**/.trae/**', '**/.codelens/**',
-            '**/DerivedData/**', '**/xcuserdata/**', '**/.build/**',
-          ],
-          supportedExtensions: [
-            '.ts','.tsx','.js','.jsx','.mjs',
-            '.py','.go','.rs','.java','.cs',
-            '.cpp','.c','.rb','.php','.swift','.kt',
-          ],
-        });
-
-        const newStats = db.getStats();
-        console.error(`[CodeLens MCP] Indexed ${newStats.fileCount} files, ${newStats.totalNodes} symbols`);
+          scanner.scanWorkspace([resolvedPath], {
+            excludePatterns: [
+              '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
+              '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
+              '**/.turbo/**', '**/.parcel-cache/**', '**/.cache/**', '**/.angular/**',
+              '**/coverage/**', '**/.nyc_output/**', '**/playwright-report/**', '**/test-results/**',
+              '**/__pycache__/**', '**/.venv/**', '**/venv/**', '**/.pytest_cache/**',
+              '**/.mypy_cache/**', '**/site-packages/**', '**/*.egg-info/**',
+              '**/vendor/**', '**/target/**', '**/.gradle/**', '**/.m2/**', '**/obj/**',
+              '**/.git/**', '**/.hg/**', '**/.svn/**', '**/.idea/**', '**/.vs/**',
+              '**/.vscode/**', '**/.cursor/**', '**/.trae/**', '**/.codelens/**',
+              '**/DerivedData/**', '**/xcuserdata/**', '**/.build/**',
+            ],
+            supportedExtensions: [
+              '.ts','.tsx','.js','.jsx','.mjs',
+              '.py','.go','.rs','.java','.cs',
+              '.cpp','.c','.rb','.php','.swift','.kt',
+            ],
+          }).then((result) => {
+            const newStats = db.getStats();
+            console.error(`[CodeLens MCP] Background index finished. Indexed ${newStats.fileCount} files, ${newStats.totalNodes} symbols. Errors: ${result.errors.length}`);
+          }).catch((err) => {
+            console.error(`[CodeLens MCP] Background index failed:`, err);
+          }).finally(() => {
+            this.runningScans.delete(resolvedPath);
+          });
+        } else {
+          console.error(`[CodeLens MCP] Graph empty — background indexing already in progress for ${resolvedPath}`);
+        }
       } else {
         console.error(`[CodeLens MCP] Graph loaded: ${stats.totalNodes} symbols in ${stats.fileCount} files`);
       }
@@ -333,7 +343,14 @@ export class MCPServer {
         db.refreshFromDiskIfChanged();
         const results = db.searchNodes(query, limit ?? 10, scope ?? 'workspace');
         if (!results.length) {
-          return txt('No symbols found matching "' + query + '" within scope ' + (scope ?? 'workspace') + '. Safe to create.');
+          let msg = 'No symbols found matching "' + query + '" within scope ' + (scope ?? 'workspace') + '.';
+          if (scope === 'deps' || scope === 'all') {
+            const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
+            if (!hasIndexedDts) {
+              msg += '\n\nTip: Dependency symbol indexing is disabled by default to prevent IDE lagging. You can enable it by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.';
+            }
+          }
+          return txt(msg + ' Safe to create.');
         }
         const lines = [
           'Found ' + results.length + ' symbol(s) matching "' + query + '" inside scope ' + (scope ?? 'workspace') + ':',
@@ -623,6 +640,11 @@ export class MCPServer {
             );
             if (!symbols.length) {
               lines.push('No exported symbols found in the type definitions for this package.');
+              const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
+              if (!hasIndexedDts) {
+                lines.push('');
+                lines.push('Tip: Exported symbols and type definitions from node_modules are not indexed by default to optimize performance. You can enable them by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.');
+              }
             } else {
               lines.push('Exported symbols:');
               lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ ' + this.rel(s.filePath, workspaceRoot) + ':' + s.line));
@@ -631,6 +653,11 @@ export class MCPServer {
             const typeDefs = matches.filter(n => n.name.endsWith('.d.ts'));
             if (!typeDefs.length) {
               lines.push('No type definition files found for this package.');
+              const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
+              if (!hasIndexedDts) {
+                lines.push('');
+                lines.push('Tip: Exported symbols and type definitions from node_modules are not indexed by default to optimize performance. You can enable them by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.');
+              }
             } else {
               lines.push('Type definition files:');
               const maxTypeDefsToShow = 10;
@@ -840,75 +867,38 @@ export class MCPServer {
           }
         }
 
-        let filesystemScanTriggered = false;
-        let filesMatchedFilter = 0;
-        let candidateFilesCount = 0;
+        let databaseScanTriggered = false;
 
-        // 4. Layer 2: Filesystem Scan Fallback
+        // 4. Layer 2: Database Scan Fallback
         if (resultsMap.size < limit) {
-          filesystemScanTriggered = true;
-          const candidateFiles = db.getAllFiles('workspace');
-          candidateFilesCount = candidateFiles.length;
+          databaseScanTriggered = true;
+          const dbResults = db.searchFileLines(
+            normalizedQuery,
+            fileFilter,
+            inComments,
+            inStrings,
+            limit - resultsMap.size,
+            workspaceRoot
+          );
 
-          const filteredFiles = fileFilter
-            ? candidateFiles.filter(f => {
-                const ok = matchPathFilter(f, fileFilter, workspaceRoot);
-                if (ok) filesMatchedFilter++;
-                return ok;
-              })
-            : candidateFiles;
-
-          if (!fileFilter) {
-            filesMatchedFilter = candidateFiles.length;
-          }
-
-          for (const filePath of filteredFiles) {
-            if (resultsMap.size >= limit) {
-              break;
+          for (const r of dbResults) {
+            const key = `${r.filePath}:${r.line}`;
+            if (!resultsMap.has(key)) {
+              resultsMap.set(key, {
+                filePath: r.filePath,
+                line: r.line,
+                rawText: r.rawText,
+                source: 'database' as any,
+                type: r.type
+              });
             }
-
-            try {
-              if (fs.existsSync(filePath)) {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                // Heuristic: skip binary files or huge files
-                if (content.includes('\u0000') || content.length > 2 * 1024 * 1024) {
-                  continue;
-                }
-                const linesList = content.split('\n');
-                for (let i = 0; i < linesList.length; i++) {
-                  const lineText = linesList[i];
-                  if (matchesQuery(lineText)) {
-                    const lineNo = i + 1;
-                    const key = `${filePath}:${lineNo}`;
-                    if (!resultsMap.has(key)) {
-                      resultsMap.set(key, {
-                        filePath,
-                        line: lineNo,
-                        rawText: lineText.trim(),
-                        source: 'filesystem',
-                        type: isLineComment(lineText) ? 'comment' : (isLineString(lineText) ? 'string_literal' : 'code')
-                      });
-                      if (resultsMap.size >= limit) {
-                        break;
-                      }
-                    }
-                  }
-                }
-              }
-            } catch {}
           }
         }
 
         const results = Array.from(resultsMap.values());
 
         if (results.length === 0) {
-          let msg = 'No matches found for "' + normalizedQuery + '".';
-          if (fileFilter && filesMatchedFilter === 0) {
-            msg += '\n\n⚠️ Warning: The fileFilter "' + fileFilter + '" matched 0 of the ' + candidateFilesCount + ' files in the workspace index. Check your pattern prefix or spelling.';
-          } else {
-            msg += '\n\nGraph may be stale. Run codelens_status to check index freshness.';
-          }
-          return txt(msg);
+          return txt('No matches found for "' + normalizedQuery + '".\n\nGraph may be stale. Run codelens_status to check index freshness.');
         }
 
         const lines = [
@@ -927,21 +917,48 @@ export class MCPServer {
 
         // Diagnostics block
         lines.push('---');
-        if (filesystemScanTriggered) {
-          lines.push('*Matched via hybrid search: graph nodes pre-filter + filesystem scan fallback.*');
+        if (databaseScanTriggered) {
+          lines.push('*Matched via hybrid search: graph nodes pre-filter + database scan fallback.*');
         } else {
           lines.push('*Matched via graph nodes.*');
         }
 
-        if (fileFilter && filesMatchedFilter === 0) {
-          lines.push('⚠️ *Warning: The fileFilter "' + fileFilter + '" matched 0 files in the workspace index. Checked ' + candidateFilesCount + ' files.*');
-        }
-
         if (graphMatchedCount === 0 && results.length > 0) {
-          lines.push('💡 *Tip: No symbols matched this query directly, but filesystem search succeeded. Graph may be stale. Run codelens_status to check index freshness.*');
+          lines.push('💡 *Tip: No symbols matched this query directly, but database search succeeded. Graph may be stale. Run codelens_status to check index freshness.*');
         }
 
         return txt(lines.join('\n'));
+      }
+    );
+
+    // ── codelens_clear_config ────────────────────────────────────────────────
+    tool(
+      'codelens_clear_config',
+      'Completely removes all CodeLens-generated configuration and rule files from the workspace. '
+      + 'This includes mcp.json, instruction markdown files, and IDE rules.',
+      {
+        workspace: z.string().optional().describe('Optional workspace override path')
+      },
+      async ({ workspace }: { workspace?: string }) => {
+        const { workspaceRoot } = await this.getWorkspaceContext(workspace);
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { SkillGenerator } = require('../agent/skillGenerator');
+        const { GraphDB } = require('../graph/graphDB');
+        const dbDir = path.join(workspaceRoot, '.codelens');
+        const db = new GraphDB(dbDir);
+        const skillGenerator = new SkillGenerator(db);
+
+        // 1. Close and reset database connection if open
+        const activeCtx = this.workspaces.get(workspaceRoot);
+        if (activeCtx) {
+          await activeCtx.db.close();
+          this.workspaces.delete(workspaceRoot);
+        }
+
+        // 2. Clear configurations and directories on disk
+        skillGenerator.clearAll(workspaceRoot);
+
+        return txt('CodeLens Graph: Configurations and directories cleared successfully.');
       }
     );
 
@@ -949,7 +966,7 @@ export class MCPServer {
 
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
-    console.error('[CodeLens MCP] Server ready — 10 tools on stdio');
+    console.error('[CodeLens MCP] Server ready — 11 tools on stdio');
   }
 
   async stop(): Promise<void> {

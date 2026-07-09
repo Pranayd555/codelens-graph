@@ -44,7 +44,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 
 ---
 
-## MCP Tools (10 total)
+## MCP Tools (11 total)
 
 | Tool | Purpose | When to use |
 |------|---------|-------------|
@@ -58,6 +58,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 | `codelens_node` | Full details + snippet for one symbol | Any tier |
 | `codelens_files` | File structure by category | Project orientation |
 | `codelens_status` | Graph health + statistics | Debugging |
+| `codelens_clear_config` | Clear all CodeLens configuration & rule files | State reset / uninstall |
 
 ---
 
@@ -66,7 +67,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.2.3.vsix
+code --install-extension codelens-graph-0.2.4.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
@@ -120,6 +121,7 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `codeLensGraph.maxGraphDepth` | `2` | BFS hops from entry points |
 | `codeLensGraph.maxTokenBudget` | `2000` | Token cap for agent context |
 | `codeLensGraph.excludePatterns` | `node_modules, dist…` | Folders to skip |
+| `codeLensGraph.indexDependencySymbols` | `false` | Deeply index internal symbols inside `node_modules` |
 | `codeLensGraph.supportedExtensions` | `.ts .js .py .go .rs…` | Languages to parse |
 
 ---

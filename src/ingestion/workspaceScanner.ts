@@ -7,11 +7,13 @@ import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile, matchPathFil
 import { TextIndex } from '../indexing/textIndex';
 
 export interface ScanOptions {
-  excludePatterns:     string[];
-  supportedExtensions: string[];
-  onProgress?:         (current: number, total: number, filePath: string) => void;
-  excludeDeps?:         boolean;
-  depsOnly?:            boolean;
+  excludePatterns:        string[];
+  supportedExtensions:    string[];
+  onProgress?:            (current: number, total: number, filePath: string) => void;
+  excludeDeps?:           boolean;
+  depsOnly?:              boolean;
+  indexDependencySymbols?: boolean;
+  force?:                 boolean;
 }
 
 export interface ScanResult {
@@ -189,34 +191,79 @@ export class WorkspaceScanner {
       }
     }
 
+    const fileNodes = this.db.getNodesByType('file');
+    const fileNodeMap = new Map<string, any>();
+    for (const node of fileNodes) {
+      fileNodeMap.set(path.normalize(node.filePath), node);
+    }
+
+    let lastPersistTime = Date.now();
+    let unsavedChanges = false;
+
     for (let i = 0; i < allFiles.length; i++) {
       const filePath = allFiles[i];
       options.onProgress?.(i + 1, total, filePath);
 
       try {
+        let fileStat: fs.Stats;
+        try {
+          fileStat = fs.statSync(filePath);
+        } catch (e) {
+          result.errors.push(`${filePath}: Stat failed: ${e}`);
+          result.filesSkipped++;
+          continue;
+        }
+
+        const existingFile = fileNodeMap.get(path.normalize(filePath));
+        const isUnmodified = existingFile && existingFile.size === fileStat.size && existingFile.lastModified === fileStat.mtimeMs;
+        if (!options.force && isUnmodified) {
+          result.filesSkipped++;
+          continue;
+        }
+
         const parsed = await this.parser.parseFileAsync(filePath);
         if (parsed.parseErrors.length) { result.errors.push(...parsed.parseErrors); }
 
+        this.db.deleteNodesByFile(filePath);
+
         if (parsed.nodes.length > 0) {
-          this.db.deleteNodesByFile(filePath);
           this.db.upsertNodes(parsed.nodes);
           this.db.upsertEdges(parsed.edges);
           this.db.upsertCallRefs(parsed.callRefs);
-          await this.textIndex.buildForFile(filePath, parsed.language);
+          if (!isNodeModulePath(filePath)) {
+            await this.textIndex.buildForFile(filePath, parsed.language);
+          }
           result.nodesAdded += parsed.nodes.length;
           result.edgesAdded += parsed.edges.length;
           result.filesScanned++;
+          unsavedChanges = true;
         } else {
-          result.filesSkipped++;
+          this.db.deleteTextEntriesByFile(filePath);
+          result.filesScanned++;
+          unsavedChanges = true;
         }
       } catch (err) {
         result.errors.push(`${filePath}: ${err}`);
         result.filesSkipped++;
       }
+
+      if (unsavedChanges && (Date.now() - lastPersistTime > 30000)) {
+        try {
+          this.db.persist();
+          lastPersistTime = Date.now();
+          unsavedChanges = false;
+        } catch (err) {
+          result.errors.push(`Intermediate persist failed: ${err}`);
+        }
+      }
     }
 
-    this.db.resolveWorkspaceRelationships();
-    this.db.persist();
+    try {
+      this.db.resolveWorkspaceRelationships();
+      this.db.persist();
+    } catch (err) {
+      result.errors.push(`Final persist failed: ${err}`);
+    }
     result.edgesAdded = this.db.getStats().totalEdges;
     result.durationMs = Date.now() - start;
     return result;
@@ -233,7 +280,9 @@ export class WorkspaceScanner {
       this.db.upsertNodes(parsed.nodes);
       this.db.upsertEdges(parsed.edges);
       this.db.upsertCallRefs(parsed.callRefs);
-      await this.textIndex.buildForFile(filePath, parsed.language);
+      if (!isNodeModulePath(filePath)) {
+        await this.textIndex.buildForFile(filePath, parsed.language);
+      }
     }
     if (resolveRelationships) {
       const currentSymbols = parsed.nodes
@@ -268,7 +317,7 @@ export class WorkspaceScanner {
       // Limit node_modules files to depth 3 relative to node_modules
       const parts = relPath.split('/');
       if (parts.length > 5) { return false; }
-      return shouldIndexNodeModuleFile(absolutePath);
+      return shouldIndexNodeModuleFile(absolutePath, options.indexDependencySymbols);
     }
 
     if (isConfig && CONFIG_EXTS.has(ext)) {
@@ -347,7 +396,7 @@ export class WorkspaceScanner {
         if (this.shouldExcludeFile(entry.name, relPath, userPatterns)) {
           const isConfig = isConfigPath(fullPath);
           const isNm = inNodeModules;
-          const allowed = (isNm && shouldIndexNodeModuleFile(fullPath)) || (isConfig && CONFIG_EXTS.has(path.extname(entry.name).toLowerCase()));
+          const allowed = (isNm && shouldIndexNodeModuleFile(fullPath, options.indexDependencySymbols)) || (isConfig && CONFIG_EXTS.has(path.extname(entry.name).toLowerCase()));
           if (!allowed) {
             continue;
           }
@@ -357,7 +406,7 @@ export class WorkspaceScanner {
         const isConfig = isConfigPath(fullPath);
         
         if (inNodeModules) {
-          if (shouldIndexNodeModuleFile(fullPath)) {
+          if (shouldIndexNodeModuleFile(fullPath, options.indexDependencySymbols)) {
             results.push(fullPath);
           }
         } else {

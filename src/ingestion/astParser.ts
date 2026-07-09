@@ -36,6 +36,33 @@ const KEYWORDS = new Set([
   'pub', 'use', 'type', 'and', 'or', 'not'
 ]);
 
+const TEST_HOOKS = new Set([
+  'describe', 'it', 'test', 'beforeeach', 'aftereach', 'beforeall', 'afterall', 'before', 'after', 'setup', 'teardown', 'suite', 'expect'
+]);
+
+const FUNCTION_AST_TYPES = new Set([
+  'function_declaration',
+  'function_expression',
+  'arrow_function',
+  'method_definition',
+  'function_definition',
+  'async_function_def',
+  'method_declaration',
+  'function_item',
+  'constructor_declaration',
+]);
+
+function isInsideFunctionOrMethod(node: any): boolean {
+  let curr = node.parent;
+  while (curr) {
+    if (FUNCTION_AST_TYPES.has(curr.type)) {
+      return true;
+    }
+    curr = curr.parent;
+  }
+  return false;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 export function makeNodeId(filePath: string, name: string, line: number): string {
@@ -204,10 +231,16 @@ export class TreeSitterParser {
       const Parser = require('web-tree-sitter');
       // Resolve tree-sitter.wasm — in dist/wasm/ when bundled, otherwise node_modules
       const treeSitterWasm = require('path').join(this.wasmDir, 'tree-sitter.wasm');
-      const fallbackWasm   = require('path').join(
-        require('path').dirname(require.resolve('web-tree-sitter')), 'tree-sitter.wasm'
-      );
-      const wasmPath = require('fs').existsSync(treeSitterWasm) ? treeSitterWasm : fallbackWasm;
+      let wasmPath = treeSitterWasm;
+      if (!require('fs').existsSync(wasmPath)) {
+        try {
+          wasmPath = require('path').join(
+            require('path').dirname(require.resolve('web-tree-sitter')), 'tree-sitter.wasm'
+          );
+        } catch (resolveErr) {
+          console.warn('[CodeLens] Failed to resolve fallback tree-sitter path:', resolveErr);
+        }
+      }
       await Parser.init({ locateFile: () => wasmPath });
       this.Parser = Parser;
       this.initialised = true;
@@ -300,6 +333,12 @@ export class TreeSitterParser {
         fileImportedNames.push(...names);
         const line = node.startPosition.row + 1;
         const importId = makeNodeId(filePath, `__import__${names.join(',')}`, line);
+        
+        // Skip creating import GraphNodes for node_modules files
+        if (isNodeModulePath(filePath)) {
+          return;
+        }
+
         nodes.push({
           id: importId, type: 'import',
           name: this.getImportSource(node, content) ?? names.join(','),
@@ -314,6 +353,19 @@ export class TreeSitterParser {
       }
     });
 
+    // ── Pre-collect all declared names in this file for scope analysis ─────
+    const fileDefinedSymbols: string[] = [];
+    this.walkTree(tree.rootNode, (tsNode: any) => {
+      const ourType = query.nodeTypes[tsNode.type];
+      if (!ourType) { return; }
+      const name = this.getNodeName(tsNode, query.nameField, content);
+      if (!name || name === '__file__') { return; }
+      if (KEYWORDS.has(name.toLowerCase())) { return; }
+      if (TEST_HOOKS.has(name.toLowerCase())) { return; }
+      if (ourType === 'variable' && isInsideFunctionOrMethod(tsNode)) { return; }
+      fileDefinedSymbols.push(name);
+    });
+
     // ── Walk all declaration nodes ─────────────────────────────────────────
     this.walkTree(tree.rootNode, (tsNode: any) => {
       const ourType = query.nodeTypes[tsNode.type];
@@ -323,6 +375,9 @@ export class TreeSitterParser {
       const name = this.getNodeName(tsNode, query.nameField, content);
       if (!name || name === '__file__') { return; }
       if (KEYWORDS.has(name.toLowerCase())) { return; }
+      if (TEST_HOOKS.has(name.toLowerCase())) { return; }
+      if (ourType === 'variable' && isInsideFunctionOrMethod(tsNode)) { return; }
+      if (isNodeModulePath(filePath) && ['function', 'method', 'variable', 'import'].includes(ourType)) { return; }
 
       const line    = tsNode.startPosition.row + 1;
       const endLine = tsNode.endPosition.row + 1;
@@ -349,11 +404,14 @@ export class TreeSitterParser {
       let instantiates:  string[] | undefined;
 
       if (ourType === 'function' || ourType === 'method') {
+        const bodyNode = (query.bodyField ? tsNode.childForFieldName?.(query.bodyField) : null) ?? tsNode;
         const body = query.bodyField
           ? tsNode.childForFieldName?.(query.bodyField)?.text ?? ''
           : content.slice(tsNode.startIndex, tsNode.endIndex);
 
-        const scope = this.analyseScope(body, params ?? [], fileImportedNames, fileModuleLevelVars, language);
+        const parentVars = this.collectParentScopes(tsNode, language, content);
+
+        const scope = this.analyseScope(body, params ?? [], fileImportedNames, fileModuleLevelVars, language, fileDefinedSymbols, bodyNode, parentVars);
         if (scope.undefinedRefs.length)  undefinedRefs = scope.undefinedRefs;
         if (scope.localVars.length)      localVars     = scope.localVars;
         if (scope.instantiates.length)   instantiates  = scope.instantiates;
@@ -546,14 +604,28 @@ export class TreeSitterParser {
         const nameNode = child.childForFieldName?.('pattern') ?? child.childForFieldName?.('name') ?? child;
         const typeNode = child.childForFieldName?.('type');
         const defNode  = child.childForFieldName?.('value');
-        const name     = nameNode.text.replace(/^\.\.\./, '').trim();
-        if (name && /^\w+$/.test(name)) {
-          params.push({
-            name,
-            type:         typeNode?.text?.replace(/^:\s*/, '').trim(),
-            defaultValue: defNode?.text?.trim(),
-            rest:         child.text.startsWith('...'),
+        
+        if (nameNode.type === 'object_pattern' || nameNode.type === 'array_pattern') {
+          this.walkTree(nameNode, (n: any) => {
+            if (n.type === 'identifier' || n.type === 'shorthand_property_identifier_pattern' || n.type === 'shorthand_property_identifier') {
+              if (this.isDeclarationIdentifier(n)) {
+                params.push({
+                  name: n.text.trim(),
+                  rest: false
+                });
+              }
+            }
           });
+        } else {
+          const name     = nameNode.text.replace(/^\.\.\./, '').trim();
+          if (name && /^\w+$/.test(name)) {
+            params.push({
+              name,
+              type:         typeNode?.text?.replace(/^:\s*/, '').trim(),
+              defaultValue: defNode?.text?.trim(),
+              rest:         child.text.startsWith('...'),
+            });
+          }
         }
       }
     }
@@ -595,28 +667,277 @@ export class TreeSitterParser {
 
   // ── Scope analysis (same logic as before, now applied to real AST bodies) ─
 
+  private stripStringsAndComments(code: string): string {
+    let result = '';
+    let i = 0;
+    const len = code.length;
+    while (i < len) {
+      const char = code[i];
+      const next = code[i + 1];
+
+      if (char === '/' && next === '/') {
+        i += 2;
+        while (i < len && code[i] !== '\n') { i++; }
+      } else if (char === '/' && next === '*') {
+        i += 2;
+        while (i < len && !(code[i] === '*' && code[i + 1] === '/')) { i++; }
+        i += 2;
+      } else if (char === '"' || char === "'") {
+        const quote = char;
+        i++;
+        while (i < len && code[i] !== quote) {
+          if (code[i] === '\\') { i += 2; }
+          else { i++; }
+        }
+        i++;
+      } else if (char === '`') {
+        i++;
+        while (i < len && code[i] !== '`') {
+          if (code[i] === '\\') { i += 2; }
+          else { i++; }
+        }
+        i++;
+      } else if (char === '/') {
+        let j = i + 1;
+        let isRegex = false;
+        while (j < len && code[j] !== '\n') {
+          if (code[j] === '\\') {
+            j += 2;
+          } else if (code[j] === '/') {
+            isRegex = true;
+            break;
+          } else {
+            j++;
+          }
+        }
+        if (isRegex) {
+          i = j + 1;
+        } else {
+          result += char;
+          i++;
+        }
+      } else {
+        result += char;
+        i++;
+      }
+    }
+    return result;
+  }
+
+  private stripTypeAnnotations(code: string): string {
+    let result = '';
+    let i = 0;
+    const len = code.length;
+    while (i < len) {
+      if (code[i] === ':') {
+        let j = i + 1;
+        let depth = 0;
+        let angleDepth = 0;
+        let foundEnd = false;
+        let hasSeenNonWhitespace = false;
+        while (j < len) {
+          const c = code[j];
+          if (c === ' ' || c === '\t' || c === '\r') {
+            j++;
+            continue;
+          }
+          if (c === '{' || c === '[' || c === '(') {
+            if (c === '{' && depth === 0 && hasSeenNonWhitespace) {
+              foundEnd = true;
+              break;
+            }
+            depth++;
+            j++;
+            hasSeenNonWhitespace = true;
+          } else if (c === '}' || c === ']' || c === ')') {
+            if (depth > 0) {
+              depth--;
+              j++;
+            } else {
+              foundEnd = true;
+              break;
+            }
+            hasSeenNonWhitespace = true;
+          } else if (c === '<') {
+            angleDepth++;
+            j++;
+            hasSeenNonWhitespace = true;
+          } else if (c === '>') {
+            if (angleDepth > 0) {
+              angleDepth--;
+              j++;
+            } else {
+              j++;
+            }
+            hasSeenNonWhitespace = true;
+          } else if (c === '=' || c === ';') {
+            if (depth === 0) {
+              foundEnd = true;
+              break;
+            } else {
+              j++;
+            }
+            hasSeenNonWhitespace = true;
+          } else if (c === ',' || c === '\n') {
+            if (depth === 0) {
+              foundEnd = true;
+              break;
+            } else {
+              j++;
+            }
+            hasSeenNonWhitespace = true;
+          } else {
+            j++;
+            hasSeenNonWhitespace = true;
+          }
+        }
+        if (foundEnd) {
+          i = j;
+        } else {
+          result += code[i];
+          i++;
+        }
+      } else {
+        result += code[i];
+        i++;
+      }
+    }
+    return result;
+  }
+
+  private extractNestedParameters(body: string): string[] {
+    const params: string[] = [];
+
+    // 1. Arrow functions with parentheses: (a, b) =>
+    const arrowParenPat = /\(([^()]*?)\)\s*=>/g;
+    let m: RegExpExecArray | null;
+    while ((m = arrowParenPat.exec(body)) !== null) {
+      const rawParams = m[1];
+      rawParams.split(',').forEach(p => {
+        const name = p.trim().replace(/[{}[\]]/g, '').split(':')[0].trim();
+        if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name)) {
+          params.push(name);
+        }
+      });
+    }
+
+    // 2. Arrow functions without parentheses: a =>
+    const arrowNoParenPat = /(?<!\w)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>/g;
+    while ((m = arrowNoParenPat.exec(body)) !== null) {
+      params.push(m[1]);
+    }
+
+    // 3. Regular functions: function foo(a, b)
+    const funcPat = /\bfunction\s*\w*\s*\(([^()]*?)\)/g;
+    while ((m = funcPat.exec(body)) !== null) {
+      const rawParams = m[1];
+      rawParams.split(',').forEach(p => {
+        const name = p.trim().replace(/[{}[\]]/g, '').split(':')[0].trim();
+        if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name)) {
+          params.push(name);
+        }
+      });
+    }
+
+    return params;
+  }
+
+  private isDeclarationIdentifier(n: any): boolean {
+    let curr = n;
+    while (curr) {
+      const pType = curr.parent?.type;
+      if (!pType) { break; }
+      const parent = curr.parent;
+      if (pType === 'function_declaration' && parent.childForFieldName('name')?.id === curr.id) { return true; }
+      if (pType === 'class_declaration' && parent.childForFieldName('name')?.id === curr.id) { return true; }
+      if (pType === 'method_definition' && parent.childForFieldName('name')?.id === curr.id) { return true; }
+      if (pType === 'variable_declarator' && parent.childForFieldName('name')?.id === curr.id) { return true; }
+      if (pType === 'formal_parameters') { return true; }
+      if (pType === 'arrow_function' && parent.childForFieldName('parameter')?.id === curr.id) { return true; }
+      if (pType === 'catch_clause' && parent.childForFieldName('parameter')?.id === curr.id) { return true; }
+      if (pType === 'import_specifier' || pType === 'import_clause' || pType === 'namespace_import') { return true; }
+      if (pType === 'pair' && parent.childForFieldName('key')?.id === curr.id) { return true; }
+      if (pType === 'for_in_statement' && parent.childForFieldName('left')?.id === curr.id) { return true; }
+      curr = curr.parent;
+    }
+    return false;
+  }
+
+  private collectParentScopes(node: any, language: string, content: string): string[] {
+    const parentVars: string[] = [];
+    const query = LANG_QUERIES[language];
+    if (!query) { return []; }
+
+    let curr = node.parent;
+    while (curr) {
+      // 1. If it's a function or method definition, collect its parameters
+      if (FUNCTION_AST_TYPES.has(curr.type)) {
+        const paramsField = query.paramsField;
+        const paramsNode = paramsField ? curr.childForFieldName?.(paramsField) : null;
+        if (paramsNode) {
+          const params = this.extractParams(paramsNode, content);
+          if (params) {
+            params.forEach(p => parentVars.push(p.name));
+          }
+        }
+      }
+
+      // 2. If it's a statement block, look at all declaration statements inside it
+      if (curr.type === 'statement_block') {
+        for (let i = 0; i < curr.childCount; i++) {
+          const child = curr.child(i);
+          // Only look at children that appear BEFORE our node starts
+          if (child.startIndex >= node.startIndex) { break; }
+          
+          const ourType = query.nodeTypes[child.type];
+          if (ourType === 'variable' || ourType === 'function' || ourType === 'class' || ourType === 'interface' || ourType === 'enum') {
+            const name = this.getNodeName(child, query.nameField, content);
+            if (name) { parentVars.push(name); }
+          }
+        }
+      }
+
+      curr = curr.parent;
+    }
+
+    return parentVars;
+  }
+
   private analyseScope(
     body: string, params: Param[],
     fileImportedNames: string[], fileModuleLevelVars: string[],
-    language: string
+    language: string,
+    fileDefinedSymbols: string[] = [],
+    bodyAstNode: any = null,
+    parentVars: string[] = []
   ): { undefinedRefs: string[]; localVars: string[]; instantiates: string[] } {
+    const withoutStrings = this.stripStringsAndComments(body);
+    const cleanBody = this.stripTypeAnnotations(withoutStrings);
     const localVars: string[] = [];
     const localPatterns: RegExp[] = language === 'python'
       ? [/^\s+(\w+)\s*=/gm, /for\s+(\w+)\s+in/g, /except\s+\w+\s+as\s+(\w+)/g]
-      : [/(?:const|let|var)\s+(\w+)\s*=/g, /(?:const|let|var)\s+\{([^}]+)\}/g,
+      : [/(?:const|let|var)\s+(\w+)/g, /(?:const|let|var)\s+\{([^}]+)\}/g,
+         /(?:const|let|var)\s+\[([^\]]+)\]/g,
          /for\s*\(\s*(?:const|let|var)\s+(\w+)/g, /catch\s*\(\s*(\w+)\s*\)/g];
 
     for (const pat of localPatterns) {
       pat.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = pat.exec(body)) !== null) {
-        const cap = m[1];
+      while ((m = pat.exec(cleanBody)) !== null) {
+        let cap = m[1];
         if (!cap) { continue; }
+        cap = cap.trim();
         if (cap.includes(',')) {
           cap.split(',').map(s => s.trim().replace(/[:\s=].*/, ''))
             .filter(s => /^\w+$/.test(s)).forEach(v => localVars.push(v));
         } else if (/^\w+$/.test(cap)) { localVars.push(cap); }
       }
+    }
+
+    // Extract parameters from nested arrow functions or callbacks inside the body
+    if (language === 'typescript' || language === 'javascript' || language === 'tsx') {
+      const nestedParams = this.extractNestedParameters(cleanBody);
+      localVars.push(...nestedParams);
     }
 
     const JS_BUILTINS = new Set([
@@ -630,28 +951,56 @@ export class TreeSitterParser {
       'try','catch','finally','class','extends','import','export',
       'const','let','var','function','yield','from','of','in',
       'fs','path','http','https','crypto','os','events','util',
+      'decodeURIComponent','encodeURIComponent','decodeURI','encodeURI',
+      'URL','URLSearchParams','fetch','Request','Response','Headers','parseInt',
+      'parseFloat','isNaN','isFinite','structuredClone','AbortController','AbortSignal',
     ]);
 
     const inScope = new Set([
       ...params.map(p => p.name),
       ...localVars, ...fileImportedNames, ...fileModuleLevelVars,
+      ...fileDefinedSymbols,
+      ...parentVars,
       ...JS_BUILTINS,
     ]);
 
     const instantiates: string[] = [];
     const newPat = /\bnew\s+([A-Z]\w*)\s*\(/g;
     let nm: RegExpExecArray | null;
-    while ((nm = newPat.exec(body)) !== null) { instantiates.push(nm[1]); }
+    while ((nm = newPat.exec(cleanBody)) !== null) { instantiates.push(nm[1]); }
 
     const undefinedRefs: string[] = [];
     const seen = new Set<string>();
-    const usePat = /(?<![.\w])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:\(|\.)/g;
-    let um: RegExpExecArray | null;
-    while ((um = usePat.exec(body)) !== null) {
-      const n = um[1];
-      if (seen.has(n) || inScope.has(n) || n.length <= 1) { continue; }
-      seen.add(n);
-      undefinedRefs.push(n);
+
+    if ((language === 'typescript' || language === 'javascript' || language === 'tsx') && bodyAstNode) {
+      // Pass 1: pre-collect all local declaration identifiers inside the body node
+      this.walkTree(bodyAstNode, (n: any) => {
+        if (n.type === 'identifier' || n.type === 'shorthand_property_identifier_pattern' || n.type === 'shorthand_property_identifier') {
+          if (this.isDeclarationIdentifier(n)) {
+            inScope.add(n.text.trim());
+          }
+        }
+      });
+
+      // Pass 2: check reference identifiers
+      this.walkTree(bodyAstNode, (n: any) => {
+        if (n.type !== 'identifier') { return; }
+        if (this.isDeclarationIdentifier(n)) { return; }
+        const name = n.text.trim();
+        if (seen.has(name) || inScope.has(name) || name.length <= 1) { return; }
+        seen.add(name);
+        undefinedRefs.push(name);
+      });
+    } else {
+      // Fallback to regex-based reference scan (used for python or if bodyAstNode is not available)
+      const usePat = /(?<![.\w])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:\(|\.)/g;
+      let um: RegExpExecArray | null;
+      while ((um = usePat.exec(cleanBody)) !== null) {
+        const n = um[1];
+        if (seen.has(n) || inScope.has(n) || n.length <= 1) { continue; }
+        seen.add(n);
+        undefinedRefs.push(n);
+      }
     }
 
     return {
@@ -712,6 +1061,8 @@ class RegexFallbackParser {
         const m = r.exec(lines[i]);
         if (!m || !m[1] || m[1] === '__file__') { continue; }
         if (KEYWORDS.has(m[1].toLowerCase())) { continue; }
+        if (TEST_HOOKS.has(m[1].toLowerCase())) { continue; }
+        if (isNodeModulePath(filePath) && ['function', 'method', 'variable', 'import'].includes(t)) { continue; }
         const nid = makeNodeId(filePath, m[1], i + 1);
         nodes.push({
           id: nid, type: t, name: m[1], filePath,

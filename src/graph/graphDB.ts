@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import {
   GraphNode, GraphEdge, GraphSnapshot, GraphStats, NodeType, EdgeType, CallReference
 } from '../types';
-import { isConfigPath, isNodeModulePath } from '../utils';
+import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -60,14 +60,17 @@ const SCHEMA = `
     line        INTEGER NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS text_index (
-    word        TEXT NOT NULL,
-    file_path   TEXT NOT NULL,
+  CREATE TABLE IF NOT EXISTS files (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    path        TEXT UNIQUE NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS file_lines (
+    file_id     INTEGER NOT NULL,
     line        INTEGER NOT NULL,
-    text        TEXT NOT NULL,
     raw_text    TEXT NOT NULL,
     token_type  TEXT NOT NULL,
-    PRIMARY KEY (word, file_path, line)
+    PRIMARY KEY (file_id, line)
   );
 
   CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(file_path);
@@ -78,9 +81,15 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_edges_type  ON edges(type);
   CREATE INDEX IF NOT EXISTS idx_call_refs_from   ON call_refs(from_id);
   CREATE INDEX IF NOT EXISTS idx_call_refs_symbol ON call_refs(symbol_name);
-  CREATE INDEX IF NOT EXISTS idx_text_index_word  ON text_index(word);
-  CREATE INDEX IF NOT EXISTS idx_text_index_file  ON text_index(file_path);
+  CREATE INDEX IF NOT EXISTS idx_file_lines_file  ON file_lines(file_id);
 `;
+
+export interface FileLine {
+  filePath: string;
+  line: number;
+  rawText: string;
+  tokenType: string;
+}
 
 // ─── GraphDB ──────────────────────────────────────────────────────────────────
 
@@ -95,6 +104,10 @@ export class GraphDB {
 
   constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
+  }
+
+  isInitialized(): boolean {
+    return this.initPromise !== null && this.db !== undefined;
   }
 
   getVersion(): number {
@@ -120,6 +133,36 @@ export class GraphDB {
         try {
           const data = fs.readFileSync(this.dbPath);
           this.db = new this.SQL.Database(data);
+
+          // Schema validation: if file_lines does not exist OR text_index exists, trigger a rebuild for optimization
+          // Schema validation: trigger a rebuild if file_lines or files does not exist,
+          // or if file_lines has the old 'file_path' column.
+          let hasOldSchema = false;
+          try {
+            const res1 = this.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='file_lines'");
+            const hasFileLines = res1.length > 0 && res1[0].values.length > 0;
+            const res2 = this.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='files'");
+            const hasFiles = res2.length > 0 && res2[0].values.length > 0;
+            
+            if (!hasFileLines || !hasFiles) {
+              hasOldSchema = true;
+            } else {
+              const res3 = this.db.exec("PRAGMA table_info(file_lines)");
+              const columns = res3[0].values.map((v: any) => v[1]);
+              if (columns.includes('file_path')) {
+                hasOldSchema = true;
+              }
+            }
+          } catch {}
+
+          if (hasOldSchema) {
+            console.log('[CodeLens] Old schema detected (or text_index exists), rebuilding database for optimization…');
+            this.db.close();
+            try {
+              fs.unlinkSync(this.dbPath);
+            } catch {}
+            this.db = new this.SQL.Database();
+          }
         } catch (err) {
           console.warn(`[CodeLens] Failed to load database from disk (${this.dbPath}), falling back to a fresh DB:`, err);
           this.db = new this.SQL.Database();
@@ -170,6 +213,7 @@ export class GraphDB {
         try { this.persist(); } catch {}
       }
       try { this.db.close(); } catch {}
+      this.db = undefined as any;
     }
     this.initPromise = null;
     this.dirty = false;
@@ -288,11 +332,35 @@ export class GraphDB {
   // Nodes that have undefined references — pre-diagnosed issues
   getNodesWithUndefinedRefs(scope: 'workspace' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
+
+    // 1. Get all defined symbol names in the database
+    const stmtDefined = this.db.prepare(
+      `SELECT DISTINCT name FROM nodes WHERE type NOT IN ('file', 'import')`
+    );
+    const definedNames = new Set<string>();
+    while (stmtDefined.step()) {
+      const row = stmtDefined.getAsObject();
+      if (row.name) {
+        definedNames.add((row.name as string).trim());
+      }
+    }
+    stmtDefined.free();
+
+    // 2. Query nodes with undefined references and filter them
     const stmt = this.db.prepare(
       `SELECT * FROM nodes WHERE undefined_refs IS NOT NULL AND undefined_refs != '[]' ORDER BY file_path, line`
     );
     const results: GraphNode[] = [];
-    while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
+    while (stmt.step()) {
+      const node = this.rowToNode(stmt.getAsObject());
+      if (node.undefinedRefs && node.undefinedRefs.length > 0) {
+        const filteredRefs = node.undefinedRefs.filter(ref => !definedNames.has(ref));
+        if (filteredRefs.length > 0) {
+          node.undefinedRefs = filteredRefs;
+          results.push(node);
+        }
+      }
+    }
     stmt.free();
 
     if (scope === 'all') { return results; }
@@ -379,6 +447,7 @@ export class GraphDB {
       this.db.run('DELETE FROM call_refs WHERE from_id = ?', [n.id]);
     }
     this.db.run('DELETE FROM nodes WHERE file_path = ?', [filePath]);
+    this.deleteTextEntriesByFile(filePath);
   }
 
   getAllFiles(scope: 'workspace' | 'deps' | 'all' = 'workspace'): string[] {
@@ -832,18 +901,34 @@ export class GraphDB {
 
   // ── Text Index Operations ──────────────────────────────────────────────────
 
-  addTextEntries(entries: any[]): void {
+  addFileLines(lines: FileLine[]): void {
+    if (!lines.length) { return; }
     this.prepareWrite();
     this.db.run('BEGIN');
     try {
-      const stmt = this.db.prepare(`
-        INSERT OR IGNORE INTO text_index (word, file_path, line, text, raw_text, token_type)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      for (const e of entries) {
-        stmt.run([e.word, e.filePath, e.line, e.text, e.rawText, e.tokenType]);
+      const filePath = lines[0].filePath;
+
+      // 1. Get or insert file_id
+      this.db.run('INSERT OR IGNORE INTO files (path) VALUES (?)', [filePath]);
+      const fileStmt = this.db.prepare('SELECT id FROM files WHERE path = ?');
+      fileStmt.bind([filePath]);
+      if (!fileStmt.step()) {
+        fileStmt.free();
+        throw new Error(`Failed to resolve file_id for path: ${filePath}`);
       }
-      stmt.free();
+      const fileId = fileStmt.getAsObject().id as number;
+      fileStmt.free();
+
+      // 2. Insert lines
+      const lineStmt = this.db.prepare(`
+        INSERT OR IGNORE INTO file_lines (file_id, line, raw_text, token_type)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const line of lines) {
+        lineStmt.run([fileId, line.line, line.rawText, line.tokenType]);
+      }
+      lineStmt.free();
+
       this.db.run('COMMIT');
     } catch (e) {
       this.db.run('ROLLBACK');
@@ -851,30 +936,125 @@ export class GraphDB {
     }
   }
 
-  deleteTextEntriesByFile(filePath: string): void {
-    this.prepareWrite();
-    this.db.run('DELETE FROM text_index WHERE file_path = ?', [filePath]);
+  addTextEntries(entries: any[]): void {
+    // Kept for backward compatibility. Map entries to FileLines.
+    const uniqueLines = new Map<string, any>();
+    for (const e of entries) {
+      const key = `${e.filePath}:${e.line}`;
+      if (!uniqueLines.has(key)) {
+        uniqueLines.set(key, e);
+      }
+    }
+    const lines: FileLine[] = Array.from(uniqueLines.values()).map(e => ({
+      filePath: e.filePath,
+      line: e.line,
+      rawText: e.rawText,
+      tokenType: e.tokenType,
+    }));
+    this.addFileLines(lines);
   }
 
-  getTextEntriesByWord(word: string, exact: boolean): any[] {
+  deleteFileLinesByFile(filePath: string): void {
+    this.prepareWrite();
+    this.db.run('DELETE FROM file_lines WHERE file_id IN (SELECT id FROM files WHERE path = ?)', [filePath]);
+    this.db.run('DELETE FROM files WHERE path = ?', [filePath]);
+  }
+
+  deleteTextEntriesByFile(filePath: string): void {
+    this.deleteFileLinesByFile(filePath);
+  }
+
+  getTextEntriesByWord(word: string, _exact: boolean): any[] {
     this.refreshFromDiskIfChanged();
-    const query = exact
-      ? 'SELECT * FROM text_index WHERE word = ?'
-      : 'SELECT * FROM text_index WHERE word LIKE ?';
-    const param = exact ? word : `${word}%`;
+    const query = `SELECT f.path AS file_path, l.line, l.raw_text, l.token_type
+                   FROM file_lines l
+                   JOIN files f ON l.file_id = f.id
+                   WHERE lower(l.raw_text) LIKE ?`;
+    const param = `%${word.toLowerCase()}%`;
     const stmt = this.db.prepare(query);
     stmt.bind([param]);
     const results: any[] = [];
     while (stmt.step()) {
       const row = stmt.getAsObject();
       results.push({
-        word: row.word,
+        word: word,
         filePath: row.file_path,
         line: row.line as number,
-        text: row.text,
+        text: (row.raw_text as string).toLowerCase(),
         rawText: row.raw_text,
         tokenType: row.token_type,
       });
+    }
+    stmt.free();
+    return results;
+  }
+
+  searchFileLines(
+    normalizedQuery: string,
+    fileFilter?: string,
+    inComments?: boolean,
+    inStrings?: boolean,
+    limit = 10,
+    workspaceRoot?: string
+  ): Array<{ filePath: string; line: number; rawText: string; type: string }> {
+    this.refreshFromDiskIfChanged();
+
+    const isRegex = /[|*?+{}()[\]^$\\&]/.test(normalizedQuery);
+    let regex: RegExp | null = null;
+    if (isRegex) {
+      try {
+        regex = new RegExp(normalizedQuery, 'i');
+      } catch {}
+    }
+
+    const matchesQuery = (lineText: string) => {
+      if (regex) {
+        return regex.test(lineText);
+      }
+      return lineText.toLowerCase().includes(normalizedQuery.toLowerCase());
+    };
+
+    let sql = `
+      SELECT f.path AS file_path, l.line, l.raw_text, l.token_type
+      FROM file_lines l
+      JOIN files f ON l.file_id = f.id
+      WHERE f.path NOT LIKE '%node_modules%'
+    `;
+    const params: any[] = [];
+    if (!regex) {
+      sql += ' AND lower(l.raw_text) LIKE ?';
+      params.push(`%${normalizedQuery.toLowerCase()}%`);
+    }
+
+    const stmt = this.db.prepare(sql);
+    if (params.length) {
+      stmt.bind(params);
+    }
+
+    const results = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      const rawText = row.raw_text as string;
+      const filePath = row.file_path as string;
+
+      if (inComments && row.token_type !== 'comment') continue;
+      if (inStrings && row.token_type !== 'string_literal') continue;
+      if (regex && !matchesQuery(rawText)) continue;
+
+      if (fileFilter && !matchPathFilter(filePath, fileFilter, workspaceRoot)) {
+        continue;
+      }
+
+      results.push({
+        filePath,
+        line: row.line as number,
+        rawText,
+        type: row.token_type as string,
+      });
+
+      if (results.length >= limit) {
+        break;
+      }
     }
     stmt.free();
     return results;

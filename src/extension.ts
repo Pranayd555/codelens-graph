@@ -63,8 +63,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
     if (workspaceRoot) {
       const stats = db.getStats();
+      const isCleared = context.workspaceState.get<boolean>('graphCleared') ?? false;
 
       if (stats.totalNodes === 0) {
+        if (isCleared) {
+          setStatus('idle');
+          statsViewProvider?.refresh();
+          return;
+        }
         // First install/activation with no graph: do other configurations first, then scan
         try {
           let ides = context.workspaceState.get<string[]>('selectedIdes');
@@ -90,8 +96,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           // Now start the db parsing (background scan)
           setStatus('scanning');
           backgroundScanner.scheduleInitialScan(workspaceRoot, {
-            excludePatterns:     cfg.excludePatterns,
-            supportedExtensions: cfg.supportedExtensions,
+            excludePatterns:        cfg.excludePatterns,
+            supportedExtensions:    cfg.supportedExtensions,
+            indexDependencySymbols: cfg.indexDependencySymbols,
           }, context);
         } catch (err) {
           console.error('[CodeLens] Initial configuration/scan failed:', err);
@@ -229,8 +236,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
       setStatus('updating');
       await backgroundScanner.handleAgentRunComplete(files, workspaceRoot, {
-        excludePatterns:     cfg.excludePatterns,
-        supportedExtensions: cfg.supportedExtensions,
+        excludePatterns:        cfg.excludePatterns,
+        supportedExtensions:    cfg.supportedExtensions,
+        indexDependencySymbols: cfg.indexDependencySymbols,
       });
 
       vscode.window.setStatusBarMessage('$(check) CodeLens: graph updated after agent run', 3000);
@@ -290,30 +298,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Clear configuration files (user-triggered)
     vscode.commands.registerCommand('codelens-graph.clearConfig', async () => {
-      const choice = await vscode.window.showWarningMessage(
-        'Are you sure you want to clear all configurations and directories created by CodeLens Graph?',
-        'Yes',
-        'Cancel'
-      );
-      if (choice !== 'Yes') { return; }
+      try {
+        const choice = await vscode.window.showWarningMessage(
+          'Are you sure you want to clear all configurations and directories created by CodeLens Graph?',
+          'Yes',
+          'Cancel'
+        );
+        if (choice !== 'Yes') { return; }
 
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-      if (!workspaceRoot) { return; }
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+        if (!workspaceRoot) { return; }
 
-      // 1. Close and reset database connection
-      await db?.close();
+        // 1. Close and reset database connection
+        db?.close();
 
-      // 2. Clear configurations and directories on disk
-      skillGenerator.clearAll(workspaceRoot);
+        // 2. Clear configurations and directories on disk
+        skillGenerator.clearAll(workspaceRoot);
 
-      // 3. Clear stored workspace state
-      await context.workspaceState.update('selectedIdes', undefined);
+        // 3. Clear stored workspace state and set cleared flag
+        await context.workspaceState.update('selectedIdes', undefined);
+        await context.workspaceState.update('graphCleared', true);
 
-      // 4. Reset extension status
-      setStatus('idle');
-      statsViewProvider?.refresh();
+        // 4. Reset extension status
+        setStatus('idle');
+        statsViewProvider?.refresh();
 
-      vscode.window.showInformationMessage('CodeLens Graph: Configurations and directories cleared successfully.');
+        vscode.window.showInformationMessage('CodeLens Graph: Configurations and directories cleared successfully.');
+      } catch (err: any) {
+        vscode.window.showErrorMessage(`CodeLens: Failed to clear configurations: ${err?.message || err}`);
+      }
     }),
   );
 
@@ -344,16 +357,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     fsWatcher.onDidChange(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      if (currentStatus === 'idle' && !db.isInitialized()) { return; }
       await db.ensureInit();
       await backgroundScanner.handleFileChanged(uri.fsPath, workspaceRoot, {
-        excludePatterns:     cfg.excludePatterns,
-        supportedExtensions: cfg.supportedExtensions,
+        excludePatterns:        cfg.excludePatterns,
+        supportedExtensions:    cfg.supportedExtensions,
+        indexDependencySymbols: cfg.indexDependencySymbols,
       });
       refreshAll();
     });
 
     fsWatcher.onDidCreate(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      if (currentStatus === 'idle' && !db.isInitialized()) { return; }
       await db.ensureInit();
       await fileWatcher.handleFileCreate(uri.fsPath);
       refreshAll();
@@ -361,6 +377,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     fsWatcher.onDidDelete(async uri => {
       if (isExcludedPath(uri.fsPath)) { return; }
+      if (currentStatus === 'idle' && !db.isInitialized()) { return; }
       await db.ensureInit();
       const removedSymbols = db.getNodesByFile(uri.fsPath)
         .filter(node => node.type !== 'file' && node.type !== 'import')
@@ -461,6 +478,7 @@ function updateActiveWorkspaceRegistry(workspacePath: string, remove = false): v
 // Triggered by the user explicitly. Shows progress UI unlike background scan.
 
 async function manualBuild(context: vscode.ExtensionContext, _force = false): Promise<void> {
+  await context.workspaceState.update('graphCleared', false);
   await db.ensureInit();
   const folders = vscode.workspace.workspaceFolders;
   if (!folders?.length) {
@@ -482,9 +500,11 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
     try {
       // 2. Build DB for all files except node_modules (Phase 1)
       const result = await scanner.scanWorkspace([workspaceRoot], {
-        excludePatterns:     cfg.excludePatterns,
-        supportedExtensions: cfg.supportedExtensions,
-        excludeDeps:         true,
+        excludePatterns:        cfg.excludePatterns,
+        supportedExtensions:    cfg.supportedExtensions,
+        indexDependencySymbols: cfg.indexDependencySymbols,
+        excludeDeps:            true,
+        force:                  _force,
         onProgress: (current, total, filePath) => {
           progress.report({
             message:   `${Math.round((current / total) * 100)}%  ${path.basename(filePath)}`,
@@ -509,9 +529,11 @@ async function manualBuild(context: vscode.ExtensionContext, _force = false): Pr
       setTimeout(async () => {
         try {
           const depResult = await scanner.scanWorkspace([workspaceRoot], {
-            excludePatterns:     cfg.excludePatterns,
-            supportedExtensions: cfg.supportedExtensions,
-            depsOnly:            true,
+            excludePatterns:        cfg.excludePatterns,
+            supportedExtensions:    cfg.supportedExtensions,
+            indexDependencySymbols: cfg.indexDependencySymbols,
+            depsOnly:               true,
+            force:                  _force,
           });
           const finalDbStats = db.getStats();
           const finalStats: GraphStats = { ...finalDbStats, lastBuilt: Date.now(), buildDurationMs: stats.buildDurationMs + depResult.durationMs };
@@ -643,6 +665,10 @@ function refreshSavings(): void {
 
 function refreshGraphPanel(): void {
   if (!graphPanel?.visible) { return; }
+  if (currentStatus === 'idle' && !db.isInitialized()) {
+    graphPanel.webview.postMessage({ command: 'updateGraph', nodes: [], edges: [] });
+    return;
+  }
   lastSentVersion = db.getVersion();
   const data = buildGraphWebviewData();
   graphPanel.webview.postMessage({ command: 'updateGraph', ...data });
@@ -774,11 +800,12 @@ const DEFAULT_EXCLUDE_PATTERNS = [
 function getConfig() {
   const cfg = vscode.workspace.getConfiguration('codeLensGraph');
   return {
-    autoRebuildOnSave:   cfg.get<boolean>('autoRebuildOnSave', true),
-    maxGraphDepth:       cfg.get<number>('maxGraphDepth', 2),
-    maxTokenBudget:      cfg.get<number>('maxTokenBudget', 2000),
-    excludePatterns:     cfg.get<string[]>('excludePatterns', DEFAULT_EXCLUDE_PATTERNS),
-    supportedExtensions: cfg.get<string[]>('supportedExtensions',
+    autoRebuildOnSave:      cfg.get<boolean>('autoRebuildOnSave', true),
+    maxGraphDepth:          cfg.get<number>('maxGraphDepth', 2),
+    maxTokenBudget:         cfg.get<number>('maxTokenBudget', 2000),
+    excludePatterns:        cfg.get<string[]>('excludePatterns', DEFAULT_EXCLUDE_PATTERNS),
+    indexDependencySymbols: cfg.get<boolean>('indexDependencySymbols', false),
+    supportedExtensions:    cfg.get<string[]>('supportedExtensions',
       ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt']),
   };
 }
