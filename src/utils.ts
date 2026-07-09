@@ -45,7 +45,7 @@ export function isConfigPath(filePath: string): boolean {
   return false;
 }
 
-export function shouldIndexNodeModuleFile(filePath: string): boolean {
+export function shouldIndexNodeModuleFile(filePath: string, indexDependencySymbols?: boolean): boolean {
   const name = path.basename(filePath).toLowerCase();
   const normalized = filePath.replace(/\\/g, '/');
   const parts = normalized.split('/node_modules/');
@@ -55,8 +55,8 @@ export function shouldIndexNodeModuleFile(filePath: string): boolean {
   // Always: package.json, readme.md
   if (name === 'package.json' || name === 'readme.md') return true;
 
-  // .d.ts: only index.d.ts or types field entry points
-  if (name.endsWith('.d.ts')) {
+  // .d.ts: only index.d.ts or types field entry points if indexDependencySymbols is enabled
+  if (name.endsWith('.d.ts') && indexDependencySymbols === true) {
     const segs = afterNodeModules.split('/');
     const isScoped = segs[0]?.startsWith('@');
     const maxParts = isScoped ? 3 : 2; // e.g. @types/react/index.d.ts (3) vs lodash/index.d.ts (2)

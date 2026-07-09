@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { GraphDB } from '../graph/graphDB';
+import { GraphDB, FileLine } from '../graph/graphDB';
 
 export interface TextEntry {
   filePath: string;
@@ -10,48 +10,36 @@ export interface TextEntry {
 }
 
 export class TextIndex {
-  private stopWords = new Set(['the', 'a', 'is', 'to', 'of', 'and', 'in']);
-
   constructor(private db: GraphDB) {}
 
   async buildForFile(filePath: string, language: string): Promise<void> {
     try {
       const content = await fs.promises.readFile(filePath, 'utf-8');
       const lines = content.split('\n');
-      const entries: Array<TextEntry & { word: string }> = [];
+      const fileLines: FileLine[] = [];
       
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const normalized = line.toLowerCase().trim();
+        const trimmed = line.trim();
         
         // Skip empty lines
-        if (!normalized) continue;
+        if (!trimmed) continue;
         
         // Classify the line
         const tokenType = this.classifyLine(line, language);
         
-        const entryBase = {
+        fileLines.push({
           filePath,
           line: i + 1,
-          text: normalized,
-          rawText: line.trim(),
+          rawText: trimmed,
           tokenType,
-        };
-        
-        // Index every meaningful word
-        const words = this.extractWords(normalized);
-        for (const word of words) {
-          entries.push({
-            word,
-            ...entryBase,
-          });
-        }
+        });
       }
 
       // Clear old entries for this file and insert new ones
-      this.db.deleteTextEntriesByFile(filePath);
-      if (entries.length > 0) {
-        this.db.addTextEntries(entries);
+      this.db.deleteFileLinesByFile(filePath);
+      if (fileLines.length > 0) {
+        this.db.addFileLines(fileLines);
       }
     } catch (err) {
       console.warn(`[CodeLens] Failed to build text index for ${filePath}:`, err);
@@ -85,13 +73,6 @@ export class TextIndex {
     return 'unknown';
   }
   
-  private extractWords(text: string): string[] {
-    return text
-      .replace(/[^a-z0-9_]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 2 && !this.stopWords.has(w));
-  }
-  
   // ─── Search API ─────────────────────────────────────────────────────────
   
   search(query: string, options: {
@@ -100,58 +81,22 @@ export class TextIndex {
     tokenType?: TextEntry['tokenType'];
     fuzzy?: boolean;         // allow partial matches
   } = {}): TextEntry[] {
-    const { limit = 20, fileFilter, tokenType, fuzzy = true } = options;
-    const queryWords = this.extractWords(query.toLowerCase());
+    const { limit = 20, fileFilter, tokenType } = options;
     
-    if (!queryWords.length) return [];
-    
-    // Score-based ranking
-    const scores = new Map<string, number>(); // entry key -> score
-    const entries = new Map<string, TextEntry>();
-    
-    for (const word of queryWords) {
-      const exactMatches = this.db.getTextEntriesByWord(word, true);
-      
-      for (const entry of exactMatches) {
-        // Apply filters
-        if (fileFilter && !entry.filePath.endsWith(fileFilter)) continue;
-        if (tokenType && entry.tokenType !== tokenType) continue;
-        
-        const key = `${entry.filePath}:${entry.line}`;
-        const currentScore = scores.get(key) || 0;
-        
-        // Score: +3 for exact word match
-        scores.set(key, currentScore + 3);
-        entries.set(key, entry);
-      }
-      
-      // Fuzzy: prefix matches
-      if (fuzzy) {
-        const fuzzyMatches = this.db.getTextEntriesByWord(word, false);
-        for (const entry of fuzzyMatches) {
-          // Skip exact matches we already scored
-          if (entry.word === word) continue;
-          
-          if (fileFilter && !entry.filePath.endsWith(fileFilter)) continue;
-          if (tokenType && entry.tokenType !== tokenType) continue;
-          
-          const key = `${entry.filePath}:${entry.line}`;
-          if (scores.has(key) && exactMatches.some(m => m.filePath === entry.filePath && m.line === entry.line)) {
-            continue;
-          }
-          
-          scores.set(key, (scores.get(key) || 0) + 1);
-          entries.set(key, entry);
-        }
-      }
-    }
-    
-    // Sort by score, return top entries
-    const sorted = [...scores.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, limit)
-      .map(([key]) => entries.get(key)!);
-    
-    return sorted;
+    const dbResults = this.db.searchFileLines(
+      query,
+      fileFilter,
+      tokenType === 'comment',
+      tokenType === 'string_literal',
+      limit
+    );
+
+    return dbResults.map(r => ({
+      filePath: r.filePath,
+      line: r.line,
+      text: r.rawText.toLowerCase(),
+      rawText: r.rawText,
+      tokenType: r.type as any,
+    }));
   }
 }

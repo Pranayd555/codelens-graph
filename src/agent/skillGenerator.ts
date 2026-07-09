@@ -46,26 +46,30 @@ export class SkillGenerator {
 
     // 3. Clean up .codelens folder files
     const codelensDir = path.join(workspaceRoot, '.codelens');
-    const codelensFiles = [
-      'README.md',
-      'mcp.json',
-      'instructions.md',
-      'codelens-graph.db',
-      'mcp-usage.jsonl'
-    ];
-    for (const file of codelensFiles) {
-      const fp = path.join(codelensDir, file);
-      if (fs.existsSync(fp)) {
-        try { fs.unlinkSync(fp); } catch {}
+    try {
+      if (fs.existsSync(codelensDir)) {
+        fs.rmSync(codelensDir, { recursive: true, force: true });
       }
+    } catch {
+      // Fallback if rmSync fails (e.g. file lock or permissions issues)
+      try {
+        const files = fs.readdirSync(codelensDir);
+        for (const file of files) {
+          try { fs.unlinkSync(path.join(codelensDir, file)); } catch {}
+        }
+      } catch {}
     }
 
-    // 4. Delete directories if they are empty
+    // 4. Remove CodeLens entries from .gitignore
+    this.removeGitignore(workspaceRoot);
+
+    // 5. Delete directories if they are empty
     const dirsToCheck = [
       path.join(workspaceRoot, '.codelens'),
       path.join(workspaceRoot, '.agents'),
       path.join(workspaceRoot, '.cursor', 'rules'),
       path.join(workspaceRoot, '.cursor'),
+      path.join(workspaceRoot, '.vscode'),
     ];
 
     for (const dir of dirsToCheck) {
@@ -101,11 +105,9 @@ export class SkillGenerator {
           const cleaned = this.removeManagedSection(c);
           const trimmed = cleaned.trim();
           
-          // For .vscode/codelens.instructions.md, if only frontmatter remains, delete the file
-          const isOnlyFrontmatter = rel === '.vscode/codelens.instructions.md' &&
-            /^---\r?\napplyTo:\s*"[^"]*"\r?\n---$/i.test(trimmed);
-
-          if (trimmed && !isOnlyFrontmatter) {
+          // If only frontmatter or nothing remains, delete the file completely
+          const withoutFrontmatter = trimmed.replace(/^---[\s\S]*?---/, '').trim();
+          if (trimmed && withoutFrontmatter !== '') {
             fs.writeFileSync(fp, cleaned, 'utf-8');
           } else {
             fs.unlinkSync(fp);
@@ -347,6 +349,18 @@ ${instruction}
       const ex = fs.existsSync(gp) ? fs.readFileSync(gp,'utf-8') : '';
       if (!ex.includes('.codelens/')) {
         fs.appendFileSync(gp, '\n# CodeLens Graph local index\n.codelens/\n','utf-8');
+      }
+    } catch { /* ignore */ }
+  }
+
+  private removeGitignore(workspaceRoot: string): void {
+    const gp = path.join(workspaceRoot, '.gitignore');
+    if (!fs.existsSync(gp)) { return; }
+    try {
+      const content = fs.readFileSync(gp, 'utf-8');
+      const cleaned = content.replace(/\r?\n# CodeLens Graph local index\r?\n\.codelens\/\r?\n?/, '');
+      if (cleaned !== content) {
+        fs.writeFileSync(gp, cleaned, 'utf-8');
       }
     } catch { /* ignore */ }
   }
