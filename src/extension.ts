@@ -811,8 +811,9 @@ async function startup(context: vscode.ExtensionContext): Promise<void> {
     if (deactivated) { return; }
 
     // Never indexed, no folders selected, and very large: ask before indexing.
+    // (A graph rebuilt for a storage upgrade was indexed before — no need to ask.)
     const scope = currentScope();
-    if (stats.totalNodes === 0 && !scope.folders.length
+    if (stats.totalNodes === 0 && !scope.folders.length && !db.wasRebuiltForUpgrade()
         && !context.workspaceState.get<boolean>('codelens.indexEntireWorkspace')) {
       const fileCount = await backgroundScanner.countIndexableFiles(scope, scanOptions());
       if (fileCount > getConfig().largeWorkspaceThreshold) {

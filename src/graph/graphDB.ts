@@ -13,13 +13,29 @@ import {
 const SEARCH_TIME_BUDGET_MS = 3000;
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
+// Storage is keyed by integers and workspace-relative paths. Earlier versions
+// stored absolute-path string ids in every row and index (a node id is
+// "<absolute path>::<name>::<line>", an edge id concatenated two of them), which
+// made the DB ~5x larger — and sql.js keeps the whole DB, plus a full copy on
+// every save, in memory. The public API still speaks string ids: they are
+// rebuilt from (file path, key) on read.
+
+const SCHEMA_VERSION = '2';
 
 const SCHEMA = `
+  -- Path dictionary shared by nodes, call refs and the text index.
+  -- Paths are workspace-relative (absolute if outside the workspace).
+  CREATE TABLE IF NOT EXISTS files (
+    id    INTEGER PRIMARY KEY,
+    path  TEXT UNIQUE NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS nodes (
-    id              TEXT PRIMARY KEY,
+    nid             INTEGER PRIMARY KEY,
+    file_id         INTEGER NOT NULL,
+    key             TEXT NOT NULL,        -- node id without its "<file path>::" prefix
     type            TEXT NOT NULL,
     name            TEXT NOT NULL,
-    file_path       TEXT NOT NULL,
     line            INTEGER NOT NULL,
     end_line        INTEGER NOT NULL,
     language        TEXT NOT NULL,
@@ -37,12 +53,25 @@ const SCHEMA = `
     updated_at      INTEGER NOT NULL
   );
 
+  -- origin: 0 = parsed, 1 = resolved call (ref_id = call_refs.rid), 2 = resolved import
   CREATE TABLE IF NOT EXISTS edges (
-    id        TEXT PRIMARY KEY,
-    from_id   TEXT NOT NULL,
-    to_id     TEXT NOT NULL,
+    eid       INTEGER PRIMARY KEY,
+    from_nid  INTEGER NOT NULL,
+    to_nid    INTEGER NOT NULL,
     type      TEXT NOT NULL,
+    ref_id    INTEGER NOT NULL DEFAULT 0,
+    origin    INTEGER NOT NULL DEFAULT 0,
     metadata  TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS call_refs (
+    rid         INTEGER PRIMARY KEY,
+    from_nid    INTEGER NOT NULL,
+    file_id     INTEGER NOT NULL,
+    ref_key     TEXT NOT NULL,            -- call ref id without its "<from node id>::" prefix
+    symbol_name TEXT NOT NULL,
+    qualifier   TEXT,
+    line        INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS snapshots (
@@ -56,20 +85,6 @@ const SCHEMA = `
     removed_node_ids TEXT
   );
 
-  CREATE TABLE IF NOT EXISTS call_refs (
-    id          TEXT PRIMARY KEY,
-    from_id     TEXT NOT NULL,
-    file_path   TEXT NOT NULL,
-    symbol_name TEXT NOT NULL,
-    qualifier   TEXT,
-    line        INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS files (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    path        TEXT UNIQUE NOT NULL
-  );
-
   CREATE TABLE IF NOT EXISTS file_lines (
     file_id     INTEGER NOT NULL,
     line        INTEGER NOT NULL,
@@ -78,16 +93,15 @@ const SCHEMA = `
     PRIMARY KEY (file_id, line)
   );
 
-  CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(file_path);
-  CREATE INDEX IF NOT EXISTS idx_nodes_type  ON nodes(type);
-  CREATE INDEX IF NOT EXISTS idx_nodes_name  ON nodes(name);
-  CREATE INDEX IF NOT EXISTS idx_edges_from  ON edges(from_id);
-  CREATE INDEX IF NOT EXISTS idx_edges_to    ON edges(to_id);
-  CREATE INDEX IF NOT EXISTS idx_edges_type  ON edges(type);
-  CREATE INDEX IF NOT EXISTS idx_call_refs_from   ON call_refs(from_id);
-  CREATE INDEX IF NOT EXISTS idx_call_refs_symbol ON call_refs(symbol_name);
-  CREATE INDEX IF NOT EXISTS idx_file_lines_file  ON file_lines(file_id);
-  CREATE INDEX IF NOT EXISTS idx_call_refs_file   ON call_refs(file_path);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_key      ON nodes(file_id, key);
+  CREATE INDEX IF NOT EXISTS idx_nodes_type            ON nodes(type);
+  CREATE INDEX IF NOT EXISTS idx_nodes_name            ON nodes(name);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_key      ON edges(from_nid, to_nid, type, ref_id);
+  CREATE INDEX IF NOT EXISTS idx_edges_to              ON edges(to_nid);
+  CREATE INDEX IF NOT EXISTS idx_edges_ref             ON edges(ref_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_call_refs_key  ON call_refs(from_nid, ref_key);
+  CREATE INDEX IF NOT EXISTS idx_call_refs_symbol      ON call_refs(symbol_name);
+  CREATE INDEX IF NOT EXISTS idx_call_refs_file        ON call_refs(file_id);
 
   CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -110,6 +124,22 @@ const SCHEMA = `
   );
 `;
 
+const NODE_COLUMNS = `n.nid, n.file_id, n.key, n.type, n.name, n.line, n.end_line, n.language, n.signature,
+  n.return_type, n.params, n.modifiers, n.doc_comment, n.undefined_refs, n.local_vars, n.instantiates,
+  n.size, n.last_modified, n.hash, n.updated_at, f.path AS fpath`;
+const NODE_SELECT = `SELECT ${NODE_COLUMNS} FROM nodes n JOIN files f ON f.id = n.file_id`;
+const EDGE_SELECT = `
+  SELECT e.from_nid, e.to_nid, e.type, e.ref_id, e.metadata,
+         a.key AS akey, a.file_id AS afile, fa.path AS apath,
+         b.key AS bkey, b.file_id AS bfile, fb.path AS bpath
+  FROM edges e
+  JOIN nodes a  ON a.nid  = e.from_nid JOIN files fa ON fa.id = a.file_id
+  JOIN nodes b  ON b.nid  = e.to_nid   JOIN files fb ON fb.id = b.file_id`;
+
+// A key that is not "<file path>::…" (an id in an unexpected format) is stored
+// whole behind this marker.
+const RAW_ID_MARKER = '\u0000';
+
 export interface FileLine {
   filePath: string;
   line: number;
@@ -120,9 +150,6 @@ export interface FileLine {
 // ─── Relationship resolution helpers ─────────────────────────────────────────
 
 const IMPORT_EXTENSIONS = ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt'];
-
-// Upper bound for primary-key prefix range scans (largest code point sorts last in UTF-8).
-const MAX_CODE_POINT = String.fromCodePoint(0x10ffff);
 
 // A full resolve can take seconds on large workspaces; it commits and hands
 // the shared extension-host thread back this often.
@@ -137,6 +164,15 @@ interface ResolveCache {
   nodesByName:  Map<string, GraphNode[]>;
   nodesByFile:  Map<string, GraphNode[]>;
   wordPatterns: Map<string, RegExp>;
+}
+
+// A stored call reference, with the integer keys the resolver works with.
+interface CallRefRow {
+  rid: number;
+  fromNid: number;
+  filePath: string;
+  symbolName: string;
+  qualifier?: string;
 }
 
 // The path an import source points at, before trying extensions / index files.
@@ -172,6 +208,7 @@ function pathKey(p: string): string {
 export class GraphDB {
   private db!: Database;
   private dbPath: string;
+  private root: string | null;
   private SQL!: any;
   private fileVersion = '';
   private dirty = false;
@@ -187,15 +224,26 @@ export class GraphDB {
   private writeCount = 0;
   private undefinedRefCount: { key: string; count: number } | null = null;
   private statsCache: { key: string; stats: Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> } | null = null;
+  private initPromise: Promise<void> | null = null;
+  private version = 0;
+  private rebuiltForUpgrade = false;
+
+  // files.id <-> path caches (cleared whenever the DB is replaced).
+  private fileIds   = new Map<string, number>();   // stored path → id
+  private filePaths = new Map<number, string>();   // id → absolute path
+  // Integer key of each node object handed out, for internal use (resolver, edges).
+  private nids = new WeakMap<GraphNode, number>();
+  // Node id → nid for the nodes written by the latest upsertNodes call, so the
+  // edges and call refs of the same parse don't each need a lookup.
+  private recentNids = new Map<string, number>();
 
   private cacheKey(scope: string): string {
     return `${scope}:${this.version}:${this.writeCount}`;
   }
-  private initPromise: Promise<void> | null = null;
-  private version = 0;
 
   constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
+    this.root = this.getWorkspaceRoot();
   }
 
   isInitialized(): boolean {
@@ -204,6 +252,12 @@ export class GraphDB {
 
   getVersion(): number {
     return this.version;
+  }
+
+  // True when init() found a DB in an older storage format and started a new
+  // one (the next scan re-indexes the workspace).
+  wasRebuiltForUpgrade(): boolean {
+    return this.rebuiltForUpgrade;
   }
 
   // The DB lives at <workspace>/.codelens/, so the workspace is two levels up.
@@ -215,7 +269,7 @@ export class GraphDB {
 
   async init(): Promise<void> {
     if (this.initPromise) { return this.initPromise; }
-    
+
     this.initPromise = (async () => {
       // Resolve WASM file relative to bundle output (dist/wasm/) or node_modules
       const wasmDir = (() => {
@@ -223,7 +277,7 @@ export class GraphDB {
         const nmWasm   = require('path').join(__dirname, '..', '..', 'node_modules', 'sql.js', 'dist');
         return require('fs').existsSync(require('path').join(distWasm, 'sql-wasm.wasm')) ? distWasm : nmWasm;
       })();
-      
+
       const initSqlJs = require('sql.js') as typeof import('sql.js').default;
       this.SQL = await initSqlJs({
         locateFile: (file: string) => require('path').join(wasmDir, file),
@@ -237,34 +291,13 @@ export class GraphDB {
           this.db = new this.SQL.Database(data);
           this.fileVersion = loadedVersion;
 
-          // Schema validation: if file_lines does not exist OR text_index exists, trigger a rebuild for optimization
-          // Schema validation: trigger a rebuild if file_lines or files does not exist,
-          // or if file_lines has the old 'file_path' column.
-          let hasOldSchema = false;
-          try {
-            const res1 = this.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='file_lines'");
-            const hasFileLines = res1.length > 0 && res1[0].values.length > 0;
-            const res2 = this.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='files'");
-            const hasFiles = res2.length > 0 && res2[0].values.length > 0;
-            
-            if (!hasFileLines || !hasFiles) {
-              hasOldSchema = true;
-            } else {
-              const res3 = this.db.exec("PRAGMA table_info(file_lines)");
-              const columns = res3[0].values.map((v: any) => v[1]);
-              if (columns.includes('file_path')) {
-                hasOldSchema = true;
-              }
-            }
-          } catch {}
-
-          if (hasOldSchema) {
-            console.log('[CodeLens] Old schema detected (or text_index exists), rebuilding database for optimization…');
+          if (!this.hasCurrentSchema()) {
+            console.log('[CodeLens] Graph storage format changed — rebuilding the index once.');
             this.db.close();
-            try {
-              fs.unlinkSync(this.dbPath);
-            } catch {}
+            try { fs.unlinkSync(this.dbPath); } catch { /* ignore */ }
             this.db = new this.SQL.Database();
+            this.fileVersion = '';
+            this.rebuiltForUpgrade = true;
           }
         } catch (err) {
           console.warn(`[CodeLens] Failed to load database from disk (${this.dbPath}), falling back to a fresh DB:`, err);
@@ -274,7 +307,8 @@ export class GraphDB {
         this.db = new this.SQL.Database();
       }
       this.db.run(SCHEMA);
-      this.runMigrations();
+      this.db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)`, [SCHEMA_VERSION]);
+      this.clearCaches();
       this.loadMeta();
       this.version++;
       // DO NOT call this.persist() on init — avoid redundant slow write when no changes were made.
@@ -283,23 +317,24 @@ export class GraphDB {
     return this.initPromise;
   }
 
+  // An existing DB is current if its nodes table is integer-keyed (or it has
+  // no graph tables yet).
+  private hasCurrentSchema(): boolean {
+    try {
+      const tables = this.db.exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'nodes'`);
+      if (!tables.length || !tables[0].values.length) { return true; }
+      const columns = (this.db.exec('PRAGMA table_info(nodes)')[0]?.values ?? []).map(v => v[1]);
+      return columns.includes('nid') && columns.includes('file_id');
+    } catch {
+      return false;
+    }
+  }
+
   async ensureInit(): Promise<void> {
     if (!this.initPromise) {
       await this.init();
     }
     return this.initPromise!;
-  }
-
-  // Add columns that didn't exist in earlier schema versions
-  private runMigrations(): void {
-    const migrations = [
-      `ALTER TABLE nodes ADD COLUMN undefined_refs TEXT`,
-      `ALTER TABLE nodes ADD COLUMN local_vars TEXT`,
-      `ALTER TABLE nodes ADD COLUMN instantiates TEXT`,
-    ];
-    for (const sql of migrations) {
-      try { this.db.run(sql); } catch { /* column already exists */ }
-    }
   }
 
   private loadMeta(): void {
@@ -351,6 +386,7 @@ export class GraphDB {
       try { this.db.close(); } catch {}
       this.db = undefined as any;
     }
+    this.clearCaches();
     this.initPromise = null;
     this.dirty = false;
   }
@@ -372,6 +408,7 @@ export class GraphDB {
       this.db.close();
       this.db = replacement;
       this.db.run(SCHEMA);
+      this.clearCaches();
       this.loadMeta();
       this.fileVersion = currentVersion;
       this.version++;
@@ -400,97 +437,187 @@ export class GraphDB {
     this.writeCount++;
   }
 
+  // ── Paths and ids ─────────────────────────────────────────────────────────
+
+  private clearCaches(): void {
+    this.fileIds.clear();
+    this.filePaths.clear();
+    this.recentNids.clear();
+  }
+
+  private toStoredPath(absPath: string): string {
+    if (!this.root) { return absPath; }
+    const rel = path.relative(this.root, absPath);
+    return !rel || rel.startsWith('..') || path.isAbsolute(rel) ? absPath : rel;
+  }
+
+  private toAbsPath(stored: string): string {
+    return !this.root || path.isAbsolute(stored) ? stored : path.join(this.root, stored);
+  }
+
+  private absPathOf(fileId: number, stored: string): string {
+    let abs = this.filePaths.get(fileId);
+    if (abs === undefined) {
+      abs = this.toAbsPath(stored);
+      this.filePaths.set(fileId, abs);
+      this.fileIds.set(stored, fileId);
+    }
+    return abs;
+  }
+
+  private fileIdFor(absPath: string, create: boolean): number | null {
+    const stored = this.toStoredPath(absPath);
+    let id = this.fileIds.get(stored);
+    if (id !== undefined) { return id; }
+    const found = this.db.exec('SELECT id FROM files WHERE path = ?', [stored])[0]?.values[0]?.[0];
+    if (found !== undefined) {
+      id = Number(found);
+    } else if (create) {
+      this.db.run('INSERT INTO files (path) VALUES (?)', [stored]);
+      id = Number(this.db.exec('SELECT last_insert_rowid()')[0].values[0][0]);
+    } else {
+      return null;
+    }
+    this.fileIds.set(stored, id);
+    this.filePaths.set(id, this.toAbsPath(stored));
+    return id;
+  }
+
+  private forgetFile(fileId: number): void {
+    const abs = this.filePaths.get(fileId);
+    if (abs !== undefined) { this.fileIds.delete(this.toStoredPath(abs)); }
+    this.filePaths.delete(fileId);
+  }
+
+  // Splits a node id into the part after its "<file path>::" prefix.
+  private keyFor(id: string, filePath: string): string {
+    return id.startsWith(filePath + '::') ? id.slice(filePath.length + 2) : RAW_ID_MARKER + id;
+  }
+
+  private idFrom(key: string, fileId: number, storedPath: string): string {
+    return key.startsWith(RAW_ID_MARKER) ? key.slice(1) : `${this.absPathOf(fileId, storedPath)}::${key}`;
+  }
+
+  // Node id → nid. Ids are "<absolute file path>::<key>"; file paths never
+  // contain "::", so the first prefix naming a known file is the right one.
+  private nidOf(id: string): number | null {
+    const recent = this.recentNids.get(id);
+    if (recent !== undefined) { return recent; }
+    for (let idx = id.indexOf('::'); idx !== -1; idx = id.indexOf('::', idx + 2)) {
+      const fileId = this.fileIdFor(id.slice(0, idx), false);
+      if (fileId === null) { continue; }
+      const nid = this.db.exec('SELECT nid FROM nodes WHERE file_id = ? AND key = ?', [fileId, id.slice(idx + 2)])[0]?.values[0]?.[0];
+      if (nid !== undefined) { return Number(nid); }
+    }
+    const raw = this.db.exec('SELECT nid FROM nodes WHERE key = ?', [RAW_ID_MARKER + id])[0]?.values[0]?.[0];
+    return raw === undefined ? null : Number(raw);
+  }
+
   // ── Node operations ───────────────────────────────────────────────────────
 
   upsertNode(node: GraphNode): void {
-    this.prepareWrite();
-    this.writesSinceResolve = true;
-    this.db.run(`
-      INSERT INTO nodes
-        (id,type,name,file_path,line,end_line,language,signature,return_type,
-         params,modifiers,doc_comment,undefined_refs,local_vars,instantiates,
-         size,last_modified,hash,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET
-        type=excluded.type, name=excluded.name, file_path=excluded.file_path,
-        line=excluded.line, end_line=excluded.end_line, language=excluded.language,
-        signature=excluded.signature, return_type=excluded.return_type,
-        params=excluded.params, modifiers=excluded.modifiers,
-        doc_comment=excluded.doc_comment, undefined_refs=excluded.undefined_refs,
-        local_vars=excluded.local_vars, instantiates=excluded.instantiates,
-        size=excluded.size, last_modified=excluded.last_modified,
-        hash=excluded.hash, updated_at=excluded.updated_at
-    `, [
-      node.id, node.type, node.name, node.filePath,
-      node.line, node.endLine, node.language,
-      node.signature ?? null, node.returnType ?? null,
-      node.params        ? JSON.stringify(node.params)        : null,
-      node.modifiers     ? JSON.stringify(node.modifiers)     : null,
-      node.docComment    ?? null,
-      node.undefinedRefs ? JSON.stringify(node.undefinedRefs) : null,
-      node.localVars     ? JSON.stringify(node.localVars)     : null,
-      node.instantiates  ? JSON.stringify(node.instantiates)  : null,
-      node.size ?? null, node.lastModified ?? null,
-      node.hash ?? null, node.updatedAt,
-    ]);
+    this.upsertNodes([node]);
   }
 
   upsertNodes(nodes: GraphNode[]): void {
     this.prepareWrite();
+    this.recentNids.clear();
+    if (!nodes.length) { return; }
+    this.writesSinceResolve = true;
     this.db.run('BEGIN');
-    try { for (const n of nodes) { this.upsertNode(n); } this.db.run('COMMIT'); }
-    catch (e) { this.db.run('ROLLBACK'); throw e; }
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO nodes
+          (file_id,key,type,name,line,end_line,language,signature,return_type,
+           params,modifiers,doc_comment,undefined_refs,local_vars,instantiates,
+           size,last_modified,hash,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(file_id, key) DO UPDATE SET
+          type=excluded.type, name=excluded.name,
+          line=excluded.line, end_line=excluded.end_line, language=excluded.language,
+          signature=excluded.signature, return_type=excluded.return_type,
+          params=excluded.params, modifiers=excluded.modifiers,
+          doc_comment=excluded.doc_comment, undefined_refs=excluded.undefined_refs,
+          local_vars=excluded.local_vars, instantiates=excluded.instantiates,
+          size=excluded.size, last_modified=excluded.last_modified,
+          hash=excluded.hash, updated_at=excluded.updated_at
+        RETURNING nid
+      `);
+      try {
+        for (const node of nodes) {
+          const fileId = this.fileIdFor(node.filePath, true)!;
+          stmt.bind([
+            fileId, this.keyFor(node.id, node.filePath), node.type, node.name,
+            node.line, node.endLine, node.language,
+            node.signature ?? null, node.returnType ?? null,
+            node.params        ? JSON.stringify(node.params)        : null,
+            node.modifiers     ? JSON.stringify(node.modifiers)     : null,
+            node.docComment    ?? null,
+            node.undefinedRefs ? JSON.stringify(node.undefinedRefs) : null,
+            node.localVars     ? JSON.stringify(node.localVars)     : null,
+            node.instantiates  ? JSON.stringify(node.instantiates)  : null,
+            node.size ?? null, node.lastModified ?? null,
+            node.hash ?? null, node.updatedAt,
+          ]);
+          if (stmt.step()) { this.recentNids.set(node.id, Number(stmt.get()[0])); }
+          stmt.reset();
+        }
+      } finally {
+        stmt.free();
+      }
+      this.db.run('COMMIT');
+    } catch (e) {
+      this.db.run('ROLLBACK');
+      this.recentNids.clear();
+      throw e;
+    }
   }
 
   getNode(id: string): GraphNode | null {
     this.refreshFromDiskIfChanged();
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE id = ?');
-    stmt.bind([id]);
-    if (stmt.step()) { const row = stmt.getAsObject(); stmt.free(); return this.rowToNode(row); }
-    stmt.free(); return null;
+    const nid = this.nidOf(id);
+    return nid === null ? null : this.queryNodes(`${NODE_SELECT} WHERE n.nid = ?`, [nid])[0] ?? null;
   }
 
   getNodesByFile(filePath: string): GraphNode[] {
     this.refreshFromDiskIfChanged();
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE file_path = ? ORDER BY line');
-    stmt.bind([filePath]);
-    const results: GraphNode[] = [];
-    while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free(); return results;
+    const fileId = this.fileIdFor(filePath, false);
+    if (fileId === null) { return []; }
+    return this.queryNodes(`${NODE_SELECT} WHERE n.file_id = ? ORDER BY n.line, n.nid`, [fileId]);
   }
 
   getNodesByType(type: NodeType): GraphNode[] {
     this.refreshFromDiskIfChanged();
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE type = ? ORDER BY name');
-    stmt.bind([type]);
+    return this.queryNodes(`${NODE_SELECT} WHERE n.type = ? ORDER BY n.name, n.nid`, [type]);
+  }
+
+  private queryNodes(sql: string, params: unknown[] = []): GraphNode[] {
+    const stmt = this.db.prepare(sql);
+    if (params.length) { stmt.bind(params as any[]); }
     const results: GraphNode[] = [];
     while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free(); return results;
+    stmt.free();
+    return results;
   }
 
   // Nodes that have undefined references — pre-diagnosed issues
   // Same count as getNodesWithUndefinedRefs('workspace').length, but reads only
-  // the two columns it needs and is cached until the graph next changes on disk.
+  // the columns it needs and is cached until the graph next changes.
   // The stats panel asks for it after every update.
   countNodesWithUndefinedRefs(): number {
     this.refreshFromDiskIfChanged();
     const key = this.cacheKey('undefined-refs');
     if (this.undefinedRefCount?.key === key) { return this.undefinedRefCount.count; }
 
-    const definedNames = new Set<string>();
-    const defined = this.db.prepare(`SELECT DISTINCT name FROM nodes WHERE type NOT IN ('file', 'import')`);
-    while (defined.step()) {
-      const name = defined.get()[0];
-      if (name) { definedNames.add(String(name).trim()); }
-    }
-    defined.free();
-
+    const definedNames = this.definedSymbolNames();
     let count = 0;
     const stmt = this.db.prepare(
-      `SELECT file_path, undefined_refs FROM nodes WHERE undefined_refs IS NOT NULL AND undefined_refs != '[]'`
+      `SELECT n.file_id, f.path, n.undefined_refs FROM nodes n JOIN files f ON f.id = n.file_id
+       WHERE n.undefined_refs IS NOT NULL AND n.undefined_refs != '[]'`
     );
     while (stmt.step()) {
-      const [filePath, refsJson] = stmt.get() as [string, string];
+      const [fileId, stored, refsJson] = stmt.get() as [number, string, string];
+      const filePath = this.absPathOf(fileId, stored);
       if (isNodeModulePath(filePath) || isConfigPath(filePath)) { continue; }
       let refs: unknown;
       try { refs = JSON.parse(refsJson); } catch { continue; }
@@ -502,29 +629,24 @@ export class GraphDB {
     return count;
   }
 
+  private definedSymbolNames(): Set<string> {
+    const names = new Set<string>();
+    const stmt = this.db.prepare(`SELECT DISTINCT name FROM nodes WHERE type NOT IN ('file', 'import')`);
+    while (stmt.step()) {
+      const name = stmt.get()[0];
+      if (name) { names.add(String(name).trim()); }
+    }
+    stmt.free();
+    return names;
+  }
+
   getNodesWithUndefinedRefs(scope: 'workspace' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
-
-    // 1. Get all defined symbol names in the database
-    const stmtDefined = this.db.prepare(
-      `SELECT DISTINCT name FROM nodes WHERE type NOT IN ('file', 'import')`
-    );
-    const definedNames = new Set<string>();
-    while (stmtDefined.step()) {
-      const row = stmtDefined.getAsObject();
-      if (row.name) {
-        definedNames.add((row.name as string).trim());
-      }
-    }
-    stmtDefined.free();
-
-    // 2. Query nodes with undefined references and filter them
-    const stmt = this.db.prepare(
-      `SELECT * FROM nodes WHERE undefined_refs IS NOT NULL AND undefined_refs != '[]' ORDER BY file_path, line`
-    );
+    const definedNames = this.definedSymbolNames();
     const results: GraphNode[] = [];
-    while (stmt.step()) {
-      const node = this.rowToNode(stmt.getAsObject());
+    for (const node of this.queryNodes(
+      `${NODE_SELECT} WHERE n.undefined_refs IS NOT NULL AND n.undefined_refs != '[]' ORDER BY f.path, n.line, n.nid`
+    )) {
       if (node.undefinedRefs && node.undefinedRefs.length > 0) {
         const filteredRefs = node.undefinedRefs.filter(ref => !definedNames.has(ref));
         if (filteredRefs.length > 0) {
@@ -533,18 +655,14 @@ export class GraphDB {
         }
       }
     }
-    stmt.free();
 
     if (scope === 'all') { return results; }
-
-    return results.filter(n => {
-      return !isNodeModulePath(n.filePath) && !isConfigPath(n.filePath);
-    });
+    return results.filter(n => !isNodeModulePath(n.filePath) && !isConfigPath(n.filePath));
   }
 
   searchNodes(query: string, limit = 20, scope: 'workspace' | 'deps' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
-    
+
     // Normalize and decode query
     let decoded = query;
     try {
@@ -563,17 +681,15 @@ export class GraphDB {
 
     let scopeSql = '';
     if (scope === 'workspace') {
-      scopeSql = "AND file_path NOT LIKE '%node_modules%'";
+      scopeSql = "AND f.path NOT LIKE '%node_modules%'";
     } else if (scope === 'deps') {
-      scopeSql = "AND (file_path LIKE '%node_modules%' OR file_path LIKE '%.json' OR file_path LIKE '%.md')";
+      scopeSql = "AND (f.path LIKE '%node_modules%' OR f.path LIKE '%.json' OR f.path LIKE '%.md')";
     }
 
-    // Dynamic WHERE clause
     const conditions: string[] = [];
     const bindParams: any[] = [];
-
     for (const token of tokens) {
-      conditions.push('(lower(name) LIKE lower(?) OR lower(signature) LIKE lower(?) OR lower(doc_comment) LIKE lower(?))');
+      conditions.push('(lower(n.name) LIKE lower(?) OR lower(n.signature) LIKE lower(?) OR lower(n.doc_comment) LIKE lower(?))');
       const likeParam = `%${token}%`;
       bindParams.push(likeParam, likeParam, likeParam);
     }
@@ -581,20 +697,15 @@ export class GraphDB {
     // ORDER BY logic: prioritize exact name match for the first token, or generally matching name
     const orderSql = `
       ORDER BY
-        CASE WHEN lower(name) = lower(?) THEN 0
-             WHEN lower(name) LIKE lower(?) THEN 1
-             ELSE 2 END, name
+        CASE WHEN lower(n.name) = lower(?) THEN 0
+             WHEN lower(n.name) LIKE lower(?) THEN 1
+             ELSE 2 END, n.name, n.nid
     `;
     bindParams.push(tokens[0], `${tokens[0]}%`);
 
     // The config-file filter below runs in JS, so the limit is applied after
     // it — otherwise config files could use up the limit and hide symbols.
-    const sql = `
-      SELECT * FROM nodes
-      WHERE (${conditions.join(' OR ')})
-      ${scopeSql}
-      ${orderSql}
-    `;
+    const sql = `${NODE_SELECT} WHERE (${conditions.join(' OR ')}) ${scopeSql} ${orderSql}`;
     const keep = (n: GraphNode) =>
       scope === 'workspace' ? !isConfigPath(n.filePath)
       : scope === 'deps' ? (isNodeModulePath(n.filePath) || isConfigPath(n.filePath))
@@ -616,7 +727,7 @@ export class GraphDB {
   // Replaces the stored manifest. Returns false (and writes nothing) when it is
   // unchanged, so refreshing it after every scan doesn't force a DB write.
   replacePackages(packages: PackageInfo[]): boolean {
-    const root = this.getWorkspaceRoot();
+    const root = this.root;
     const rel = (p: string | null) => (p && root ? path.relative(root, p).split(path.sep).join('/') : p);
     const rows = packages.map(p => [
       p.name, p.declaredRange, p.kind, JSON.stringify(p.declaredIn.map(rel)), p.installed ? 1 : 0,
@@ -644,7 +755,7 @@ export class GraphDB {
 
   getPackages(): PackageInfo[] {
     this.refreshFromDiskIfChanged();
-    const root = this.getWorkspaceRoot();
+    const root = this.root;
     const abs = (p: unknown) => (typeof p === 'string' && p ? (root ? path.join(root, p) : p) : null);
     const res = this.db.exec('SELECT name, declared_range, kind, declared_in, installed, version, dir, types, main, readme FROM packages ORDER BY name');
     return (res[0]?.values ?? []).map(r => ({
@@ -665,13 +776,16 @@ export class GraphDB {
   getFilesImporting(packageName: string): string[] {
     this.refreshFromDiskIfChanged();
     const stmt = this.db.prepare(
-      `SELECT DISTINCT file_path FROM nodes
-       WHERE type = 'import' AND (name = ? OR substr(name, 1, ?) = ?)
-       ORDER BY file_path`
+      `SELECT DISTINCT f.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id
+       WHERE n.type = 'import' AND (n.name = ? OR substr(n.name, 1, ?) = ?)
+       ORDER BY f.path`
     );
     stmt.bind([packageName, packageName.length + 1, packageName + '/']);
     const files: string[] = [];
-    while (stmt.step()) { files.push(String(stmt.get()[0])); }
+    while (stmt.step()) {
+      const [fileId, stored] = stmt.get() as [number, string];
+      files.push(this.absPathOf(fileId, stored));
+    }
     stmt.free();
     return files;
   }
@@ -680,76 +794,114 @@ export class GraphDB {
   // stale — re-parsing an empty file must not force a full resolve.
   deleteNodesByFile(filePath: string): boolean {
     this.prepareWrite();
-    // Delete edges referencing nodes in this file first (no FK cascade in sql.js)
-    const nodes = this.getNodesByFile(filePath);
-    if (nodes.length) { this.writesSinceResolve = true; }
-    for (const n of nodes) {
-      this.db.run('DELETE FROM edges WHERE from_id = ? OR to_id = ?', [n.id, n.id]);
-      this.db.run('DELETE FROM call_refs WHERE from_id = ?', [n.id]);
+    const fileId = this.fileIdFor(filePath, false);
+    if (fileId === null) { return false; }
+    const count = Number(this.db.exec('SELECT COUNT(*) FROM nodes WHERE file_id = ?', [fileId])[0]?.values[0]?.[0] ?? 0);
+    if (count) {
+      this.writesSinceResolve = true;
+      // No FK cascade in sql.js: drop edges and call refs touching these nodes first.
+      this.db.run(`DELETE FROM edges WHERE from_nid IN (SELECT nid FROM nodes WHERE file_id = ?)
+                                    OR to_nid IN (SELECT nid FROM nodes WHERE file_id = ?)`, [fileId, fileId]);
+      this.db.run('DELETE FROM call_refs WHERE from_nid IN (SELECT nid FROM nodes WHERE file_id = ?)', [fileId]);
+      this.db.run('DELETE FROM nodes WHERE file_id = ?', [fileId]);
     }
-    this.db.run('DELETE FROM nodes WHERE file_path = ?', [filePath]);
-    this.deleteTextEntriesByFile(filePath);
-    return nodes.length > 0;
+    this.db.run('DELETE FROM file_lines WHERE file_id = ?', [fileId]);
+    this.dropFileIfUnused(fileId);
+    for (const [id] of this.recentNids) { if (id.startsWith(filePath + '::')) { this.recentNids.delete(id); } }
+    return count > 0;
+  }
+
+  private dropFileIfUnused(fileId: number): void {
+    this.db.run(`DELETE FROM files WHERE id = ?
+                   AND NOT EXISTS (SELECT 1 FROM nodes WHERE file_id = ?)
+                   AND NOT EXISTS (SELECT 1 FROM call_refs WHERE file_id = ?)
+                   AND NOT EXISTS (SELECT 1 FROM file_lines WHERE file_id = ?)`, [fileId, fileId, fileId, fileId]);
+    if (this.db.getRowsModified() > 0) { this.forgetFile(fileId); }
   }
 
   getAllFiles(scope: 'workspace' | 'deps' | 'all' = 'workspace'): string[] {
     this.refreshFromDiskIfChanged();
+    return this.indexedFiles(scope).map(f => f.path);
+  }
+
+  // Files that have a file node, as [id, absolute path], ordered by path.
+  private indexedFiles(scope: 'workspace' | 'deps' | 'all'): Array<{ id: number; path: string }> {
     const stmt = this.db.prepare(
-      `SELECT DISTINCT file_path FROM nodes WHERE type = 'file' ORDER BY file_path`
+      `SELECT DISTINCT f.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.type = 'file' ORDER BY f.path`
     );
-    const results: string[] = [];
-    while (stmt.step()) { results.push(stmt.getAsObject()['file_path'] as string); }
+    const results: Array<{ id: number; path: string }> = [];
+    while (stmt.step()) {
+      const [fileId, stored] = stmt.get() as [number, string];
+      results.push({ id: fileId, path: this.absPathOf(fileId, stored) });
+    }
     stmt.free();
 
     if (scope === 'all') { return results; }
-
-    return results.filter(fp => {
+    return results.filter(({ path: fp }) => {
       const isNm = isNodeModulePath(fp);
       const isCfg = isConfigPath(fp);
-      if (scope === 'workspace') {
-        return !isNm && !isCfg;
-      } else {
-        return isNm || isCfg;
-      }
+      return scope === 'workspace' ? (!isNm && !isCfg) : (isNm || isCfg);
     });
   }
 
   // ── Edge operations ───────────────────────────────────────────────────────
 
   upsertEdge(edge: GraphEdge): void {
-    this.prepareWrite();
-    this.writesSinceResolve = true;
-    this.db.run(`INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)`, [
-      edge.id, edge.fromId, edge.toId, edge.type,
-      edge.metadata ? JSON.stringify(edge.metadata) : null,
-    ]);
+    this.upsertEdges([edge]);
   }
 
+  // Edges whose endpoints are not stored nodes are skipped.
   upsertEdges(edges: GraphEdge[]): void {
     this.prepareWrite();
+    if (!edges.length) { return; }
+    this.writesSinceResolve = true;
     this.db.run('BEGIN');
-    try { for (const e of edges) { this.upsertEdge(e); } this.db.run('COMMIT'); }
-    catch (e) { this.db.run('ROLLBACK'); throw e; }
+    try {
+      const stmt = this.db.prepare(
+        'INSERT OR REPLACE INTO edges (from_nid,to_nid,type,ref_id,origin,metadata) VALUES (?,?,?,0,0,?)'
+      );
+      try {
+        for (const edge of edges) {
+          const fromNid = this.nidOf(edge.fromId);
+          const toNid = this.nidOf(edge.toId);
+          if (fromNid === null || toNid === null) { continue; }
+          stmt.run([fromNid, toNid, edge.type, edge.metadata ? JSON.stringify(edge.metadata) : null]);
+        }
+      } finally {
+        stmt.free();
+      }
+      this.db.run('COMMIT');
+    } catch (e) {
+      this.db.run('ROLLBACK');
+      throw e;
+    }
   }
 
   getEdgesFrom(nodeId: string, type?: EdgeType): GraphEdge[] {
     this.refreshFromDiskIfChanged();
-    const sql  = type ? 'SELECT * FROM edges WHERE from_id=? AND type=?' : 'SELECT * FROM edges WHERE from_id=?';
-    const stmt = this.db.prepare(sql);
-    stmt.bind(type ? [nodeId, type] : [nodeId]);
-    const results: GraphEdge[] = [];
-    while (stmt.step()) { results.push(this.rowToEdge(stmt.getAsObject())); }
-    stmt.free(); return results;
+    const nid = this.nidOf(nodeId);
+    if (nid === null) { return []; }
+    return type
+      ? this.queryEdges(`${EDGE_SELECT} WHERE e.from_nid = ? AND e.type = ? ORDER BY e.eid`, [nid, type])
+      : this.queryEdges(`${EDGE_SELECT} WHERE e.from_nid = ? ORDER BY e.eid`, [nid]);
   }
 
   getEdgesTo(nodeId: string, type?: EdgeType): GraphEdge[] {
     this.refreshFromDiskIfChanged();
-    const sql  = type ? 'SELECT * FROM edges WHERE to_id=? AND type=?' : 'SELECT * FROM edges WHERE to_id=?';
+    const nid = this.nidOf(nodeId);
+    if (nid === null) { return []; }
+    return type
+      ? this.queryEdges(`${EDGE_SELECT} WHERE e.to_nid = ? AND e.type = ? ORDER BY e.eid`, [nid, type])
+      : this.queryEdges(`${EDGE_SELECT} WHERE e.to_nid = ? ORDER BY e.eid`, [nid]);
+  }
+
+  private queryEdges(sql: string, params: unknown[]): GraphEdge[] {
     const stmt = this.db.prepare(sql);
-    stmt.bind(type ? [nodeId, type] : [nodeId]);
+    stmt.bind(params as any[]);
     const results: GraphEdge[] = [];
     while (stmt.step()) { results.push(this.rowToEdge(stmt.getAsObject())); }
-    stmt.free(); return results;
+    stmt.free();
+    return results;
   }
 
   // ── BFS traversal ─────────────────────────────────────────────────────────
@@ -841,7 +993,6 @@ export class GraphDB {
   }
 
   private computeStats(scope: 'workspace' | 'all'): Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> {
-
     if (scope === 'all') {
       const totalNodes = (this.db.exec('SELECT COUNT(*) FROM nodes')[0]?.values[0][0] ?? 0) as number;
       const totalEdges = (this.db.exec('SELECT COUNT(*) FROM edges')[0]?.values[0][0] ?? 0) as number;
@@ -854,36 +1005,30 @@ export class GraphDB {
       return { totalNodes, totalEdges, fileCount, byType: byType as Record<NodeType, number> };
     }
 
-    const wsFiles = this.getAllFiles('workspace');
-    const wsFilesSet = new Set(wsFiles);
-
-    // get() returns a row array; getAsObject() would allocate an object per row.
-    const stmt = this.db.prepare('SELECT id, type, file_path FROM nodes');
+    // Workspace scope: nodes in workspace files (not deps/configs), and edges
+    // whose endpoints are both such nodes.
+    const wsFileIds = new Set(this.indexedFiles('workspace').map(f => f.id));
     let totalNodes = 0;
     let fileCount = 0;
     const byType: Record<string, number> = {};
-    const wsNodeIds = new Set<string>();
-
+    const wsNids = new Set<number>();
+    const stmt = this.db.prepare('SELECT nid, type, file_id FROM nodes');
     while (stmt.step()) {
-      const [id, type, fp] = stmt.get() as [string, string, string];
-      if (wsFilesSet.has(fp)) {
-        wsNodeIds.add(id);
+      const [nid, type, fileId] = stmt.get() as [number, string, number];
+      if (wsFileIds.has(fileId)) {
+        wsNids.add(nid);
         totalNodes++;
-        if (type === 'file') {
-          fileCount++;
-        }
+        if (type === 'file') { fileCount++; }
         byType[type] = (byType[type] || 0) + 1;
       }
     }
     stmt.free();
 
-    const edgeStmt = this.db.prepare('SELECT from_id, to_id FROM edges');
     let totalEdges = 0;
+    const edgeStmt = this.db.prepare('SELECT from_nid, to_nid FROM edges');
     while (edgeStmt.step()) {
-      const [fromId, toId] = edgeStmt.get() as [string, string];
-      if (wsNodeIds.has(fromId) && wsNodeIds.has(toId)) {
-        totalEdges++;
-      }
+      const [fromNid, toNid] = edgeStmt.get() as [number, number];
+      if (wsNids.has(fromNid) && wsNids.has(toNid)) { totalEdges++; }
     }
     edgeStmt.free();
 
@@ -892,18 +1037,30 @@ export class GraphDB {
 
   // ─── Durable call references and workspace relationship resolution ───────
 
+  // Upserted by (caller, call site) so a ref keeps its rid — resolved call
+  // edges are keyed by it.
   upsertCallRefs(refs: CallReference[]): void {
     if (!refs.length) { return; }
     this.prepareWrite();
     this.writesSinceResolve = true;
     this.db.run('BEGIN');
     try {
-      for (const ref of refs) {
-        this.db.run(
-          `INSERT OR REPLACE INTO call_refs
-           (id,from_id,file_path,symbol_name,qualifier,line) VALUES (?,?,?,?,?,?)`,
-          [ref.id, ref.fromId, ref.filePath, ref.symbolName, ref.qualifier ?? null, ref.line]
-        );
+      const stmt = this.db.prepare(`
+        INSERT INTO call_refs (from_nid, file_id, ref_key, symbol_name, qualifier, line)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(from_nid, ref_key) DO UPDATE SET
+          file_id=excluded.file_id, symbol_name=excluded.symbol_name,
+          qualifier=excluded.qualifier, line=excluded.line
+      `);
+      try {
+        for (const ref of refs) {
+          const fromNid = this.nidOf(ref.fromId);
+          if (fromNid === null) { continue; }
+          const refKey = ref.id.startsWith(ref.fromId + '::') ? ref.id.slice(ref.fromId.length + 2) : RAW_ID_MARKER + ref.id;
+          stmt.run([fromNid, this.fileIdFor(ref.filePath, true)!, refKey, ref.symbolName, ref.qualifier ?? null, ref.line]);
+        }
+      } finally {
+        stmt.free();
       }
       this.db.run('COMMIT');
     } catch (e) {
@@ -945,12 +1102,11 @@ export class GraphDB {
 
     begin();
     try {
-      const insertEdge = prepare('INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)');
-      const deleteEdgeRange = prepare('DELETE FROM edges WHERE id >= ? AND id < ?');
-      // A call reference has at most one resolved edge. Search by primary-key
-      // range; '+type' keeps SQLite from choosing the far less selective type
-      // index instead (2.7ms vs 0.05ms per delete on a 1k-file workspace).
-      const deleteCallEdges = prepare(`DELETE FROM edges WHERE id >= ? AND id < ? AND +type = 'calls'`);
+      const insertEdge = prepare(
+        'INSERT OR REPLACE INTO edges (from_nid,to_nid,type,ref_id,origin,metadata) VALUES (?,?,?,?,?,?)'
+      );
+      const deleteImporterEdges = prepare('DELETE FROM edges WHERE from_nid = ? AND origin = 2');
+      const deleteCallEdges = prepare(`DELETE FROM edges WHERE ref_id = ? AND type = 'calls'`);
 
       if (fullResolve) {
         this.db.run(`DELETE FROM edges WHERE type = 'calls'`);
@@ -960,28 +1116,20 @@ export class GraphDB {
       const filesByPath = new Map(fileNodes.map(node => [path.normalize(node.filePath), node]));
       const importsByFile = this.getWorkspaceImportsByFile();
 
-      await this.resolveImportEdges(filesByPath, importsByFile, changedFiles, cache, insertEdge, deleteEdgeRange, maybeYield);
+      await this.resolveImportEdges(filesByPath, importsByFile, changedFiles, cache, insertEdge, deleteImporterEdges, maybeYield);
 
       for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols)) {
         await maybeYield();
-        if (!fullResolve) {
-          const edgePrefix = `${ref.id}::resolved::`;
-          deleteCallEdges.run([edgePrefix, edgePrefix + MAX_CODE_POINT]);
-        }
+        if (!fullResolve) { deleteCallEdges.run([ref.rid]); }
         const target = this.resolveCallTarget(ref, importsByFile, cache);
-        if (!target || target.id === ref.fromId) { continue; }
+        const targetNid = target ? this.nids.get(target) : undefined;
+        if (!target || targetNid === undefined || targetNid === ref.fromNid) { continue; }
 
-        const edge: GraphEdge = {
-          id: `${ref.id}::resolved::${target.id}`,
-          fromId: ref.fromId,
-          toId: target.id,
-          type: 'calls',
-          metadata: {
-            symbolName: ref.symbolName,
-            resolution: target.filePath === ref.filePath ? 'same-file' : 'workspace',
-          },
+        const metadata = {
+          symbolName: ref.symbolName,
+          resolution: target.filePath === ref.filePath ? 'same-file' : 'workspace',
         };
-        insertEdge.run([edge.id, edge.fromId, edge.toId, edge.type, JSON.stringify(edge.metadata)]);
+        insertEdge.run([ref.fromNid, targetNid, 'calls', ref.rid, 1, JSON.stringify(metadata)]);
       }
       commit();
     } catch (e) {
@@ -1000,50 +1148,44 @@ export class GraphDB {
 
   // Import nodes of workspace files (not deps/configs), keyed by file path.
   private getWorkspaceImportsByFile(): Map<string, GraphNode[]> {
-    const workspaceFiles = new Set(this.getAllFiles());
     const importsByFile = new Map<string, GraphNode[]>();
-    for (const filePath of workspaceFiles) { importsByFile.set(filePath, []); }
-    const stmt = this.db.prepare(`SELECT * FROM nodes WHERE type = 'import' ORDER BY file_path, line, rowid`);
-    while (stmt.step()) {
-      const node = this.rowToNode(stmt.getAsObject());
+    for (const filePath of this.getAllFiles()) { importsByFile.set(filePath, []); }
+    for (const node of this.queryNodes(`${NODE_SELECT} WHERE n.type = 'import' ORDER BY f.path, n.line, n.nid`)) {
       importsByFile.get(node.filePath)?.push(node);
     }
-    stmt.free();
     return importsByFile;
   }
 
-  private getAffectedCallRefs(changedFiles: string[] | null, changedSymbols: string[]): CallReference[] {
-    let sql = 'SELECT * FROM call_refs';
-    let params: string[] = [];
+  private getAffectedCallRefs(changedFiles: string[] | null, changedSymbols: string[]): CallRefRow[] {
+    let sql = `SELECT r.rid, r.from_nid, r.symbol_name, r.qualifier, f.id, f.path
+               FROM call_refs r JOIN files f ON f.id = r.file_id`;
+    let params: unknown[] = [];
     if (changedFiles !== null) {
-      const fileParams = [...new Set(changedFiles)];
+      const fileParams = [...new Set(changedFiles.map(f => this.toStoredPath(f)))];
       const symbolParams = [...new Set(changedSymbols)];
       if (!fileParams.length && !symbolParams.length) { return []; }
       // SQLite caps bound parameters; very large batches fall back to a filtered scan.
       if (fileParams.length + symbolParams.length <= 900) {
         const conditions: string[] = [];
-        if (fileParams.length) { conditions.push(`file_path IN (${fileParams.map(() => '?').join(',')})`); }
-        if (symbolParams.length) { conditions.push(`symbol_name IN (${symbolParams.map(() => '?').join(',')})`); }
+        if (fileParams.length) { conditions.push(`f.path IN (${fileParams.map(() => '?').join(',')})`); }
+        if (symbolParams.length) { conditions.push(`r.symbol_name IN (${symbolParams.map(() => '?').join(',')})`); }
         sql += ' WHERE ' + conditions.join(' OR ');
         params = [...fileParams, ...symbolParams];
       }
     }
-    sql += ' ORDER BY file_path, line';
+    sql += ' ORDER BY f.path, r.line, r.rid';
 
     const fileSet = changedFiles ? new Set(changedFiles) : null;
     const symbolSet = new Set(changedSymbols);
-    const refs: CallReference[] = [];
+    const refs: CallRefRow[] = [];
     const stmt = this.db.prepare(sql);
-    if (params.length) { stmt.bind(params); }
+    if (params.length) { stmt.bind(params as any[]); }
     while (stmt.step()) {
-      const row = stmt.getAsObject();
-      const ref: CallReference = {
-        id: row['id'] as string,
-        fromId: row['from_id'] as string,
-        filePath: row['file_path'] as string,
-        symbolName: row['symbol_name'] as string,
-        qualifier: row['qualifier'] as string | undefined,
-        line: row['line'] as number,
+      const [rid, fromNid, symbolName, qualifier, fileId, stored] = stmt.get() as [number, number, string, string | null, number, string];
+      const ref: CallRefRow = {
+        rid, fromNid, symbolName,
+        qualifier: qualifier ?? undefined,
+        filePath: this.absPathOf(fileId, stored),
       };
       if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)) { continue; }
       refs.push(ref);
@@ -1053,7 +1195,7 @@ export class GraphDB {
   }
 
   private resolveCallTarget(
-    ref: CallReference,
+    ref: CallRefRow,
     importsByFile: Map<string, GraphNode[]>,
     cache: ResolveCache
   ): GraphNode | null {
@@ -1120,12 +1262,12 @@ export class GraphDB {
     changedFiles: string[] | null,
     cache: ResolveCache,
     insertEdge: Statement,
-    deleteEdgeRange: Statement,
+    deleteImporterEdges: Statement,
     maybeYield: () => Promise<void>
   ): Promise<void> {
     let importers: Iterable<[string, GraphNode[]]>;
     if (changedFiles === null) {
-      this.db.run(`DELETE FROM edges WHERE id LIKE 'resolved-import::%'`);
+      this.db.run('DELETE FROM edges WHERE origin = 2');
       importers = importsByFile;
     } else {
       // Re-resolve importers that changed, plus importers whose import source
@@ -1143,10 +1285,8 @@ export class GraphDB {
         });
         if (!affected) { continue; }
         const importer = filesByPath.get(path.normalize(importerPath));
-        if (importer) {
-          const prefix = `resolved-import::${importer.id}::`;
-          deleteEdgeRange.run([prefix, prefix + MAX_CODE_POINT]);
-        }
+        const importerNid = importer ? this.nids.get(importer) : undefined;
+        if (importerNid !== undefined) { deleteImporterEdges.run([importerNid]); }
         selected.push([importerPath, importNodes]);
       }
       importers = selected;
@@ -1155,13 +1295,15 @@ export class GraphDB {
     for (const [importerPath, importNodes] of importers) {
       await maybeYield();
       const importer = filesByPath.get(path.normalize(importerPath));
-      if (!importer) { continue; }
+      const importerNid = importer ? this.nids.get(importer) : undefined;
+      if (importerNid === undefined) { continue; }
 
       for (const importNode of importNodes) {
         const targetPath = this.resolveImportPath(importerPath, importNode.name, cache);
         if (!targetPath) { continue; }
         const target = filesByPath.get(path.normalize(targetPath));
-        if (!target) { continue; }
+        const targetNid = target ? this.nids.get(target) : undefined;
+        if (targetNid === undefined) { continue; }
 
         const importerIsNm = isNodeModulePath(importerPath);
         const targetIsNm = isNodeModulePath(targetPath);
@@ -1173,10 +1315,7 @@ export class GraphDB {
         }
 
         insertEdge.run([
-          `resolved-import::${importer.id}::${target.id}`,
-          importer.id,
-          target.id,
-          edgeType,
+          importerNid, targetNid, edgeType, 0, 2,
           JSON.stringify({ source: importNode.name, resolution: 'workspace' }),
         ]);
       }
@@ -1208,11 +1347,7 @@ export class GraphDB {
   private getNodesByExactNameCached(name: string, cache: ResolveCache): GraphNode[] {
     let nodes = cache.nodesByName.get(name);
     if (!nodes) {
-      const stmt = this.db.prepare('SELECT * FROM nodes WHERE name = ? ORDER BY file_path, line');
-      stmt.bind([name]);
-      nodes = [];
-      while (stmt.step()) { nodes.push(this.rowToNode(stmt.getAsObject())); }
-      stmt.free();
+      nodes = this.queryNodes(`${NODE_SELECT} WHERE n.name = ? ORDER BY f.path, n.line, n.nid`, [name]);
       cache.nodesByName.set(name, nodes);
     }
     return nodes;
@@ -1245,11 +1380,14 @@ export class GraphDB {
   // ── Row mappers ───────────────────────────────────────────────────────────
 
   private rowToNode(row: Record<string, unknown>): GraphNode {
-    return {
-      id:             row['id']           as string,
+    const fileId = row['file_id'] as number;
+    const filePath = this.absPathOf(fileId, row['fpath'] as string);
+    const key = row['key'] as string;
+    const node: GraphNode = {
+      id:             key.startsWith(RAW_ID_MARKER) ? key.slice(1) : `${filePath}::${key}`,
       type:           row['type']         as NodeType,
       name:           row['name']         as string,
-      filePath:       row['file_path']    as string,
+      filePath,
       line:           row['line']         as number,
       endLine:        row['end_line']     as number,
       language:       row['language']     as string,
@@ -1266,13 +1404,18 @@ export class GraphDB {
       hash:           row['hash']         as string | undefined,
       updatedAt:      row['updated_at']   as number,
     };
+    this.nids.set(node, row['nid'] as number);
+    return node;
   }
 
   private rowToEdge(row: Record<string, unknown>): GraphEdge {
+    const fromNid = row['from_nid'] as number;
+    const toNid = row['to_nid'] as number;
     return {
-      id:       row['id']       as string,
-      fromId:   row['from_id']  as string,
-      toId:     row['to_id']    as string,
+      // Stable for a given edge; callers only use it as a key.
+      id:       `${fromNid}>${toNid}:${row['type']}:${row['ref_id']}`,
+      fromId:   this.idFrom(row['akey'] as string, row['afile'] as number, row['apath'] as string),
+      toId:     this.idFrom(row['bkey'] as string, row['bfile'] as number, row['bpath'] as string),
       type:     row['type']     as EdgeType,
       metadata: row['metadata'] ? JSON.parse(row['metadata'] as string) : undefined,
     };
@@ -1285,20 +1428,7 @@ export class GraphDB {
     this.prepareWrite();
     this.db.run('BEGIN');
     try {
-      const filePath = lines[0].filePath;
-
-      // 1. Get or insert file_id
-      this.db.run('INSERT OR IGNORE INTO files (path) VALUES (?)', [filePath]);
-      const fileStmt = this.db.prepare('SELECT id FROM files WHERE path = ?');
-      fileStmt.bind([filePath]);
-      if (!fileStmt.step()) {
-        fileStmt.free();
-        throw new Error(`Failed to resolve file_id for path: ${filePath}`);
-      }
-      const fileId = fileStmt.getAsObject().id as number;
-      fileStmt.free();
-
-      // 2. Insert lines
+      const fileId = this.fileIdFor(lines[0].filePath, true)!;
       const lineStmt = this.db.prepare(`
         INSERT OR IGNORE INTO file_lines (file_id, line, raw_text, token_type)
         VALUES (?, ?, ?, ?)
@@ -1307,7 +1437,6 @@ export class GraphDB {
         lineStmt.run([fileId, line.line, line.rawText, line.tokenType]);
       }
       lineStmt.free();
-
       this.db.run('COMMIT');
     } catch (e) {
       this.db.run('ROLLBACK');
@@ -1335,8 +1464,10 @@ export class GraphDB {
 
   deleteFileLinesByFile(filePath: string): void {
     this.prepareWrite();
-    this.db.run('DELETE FROM file_lines WHERE file_id IN (SELECT id FROM files WHERE path = ?)', [filePath]);
-    this.db.run('DELETE FROM files WHERE path = ?', [filePath]);
+    const fileId = this.fileIdFor(filePath, false);
+    if (fileId === null) { return; }
+    this.db.run('DELETE FROM file_lines WHERE file_id = ?', [fileId]);
+    this.dropFileIfUnused(fileId);
   }
 
   deleteTextEntriesByFile(filePath: string): void {
@@ -1345,23 +1476,20 @@ export class GraphDB {
 
   getTextEntriesByWord(word: string, _exact: boolean): any[] {
     this.refreshFromDiskIfChanged();
-    const query = `SELECT f.path AS file_path, l.line, l.raw_text, l.token_type
-                   FROM file_lines l
-                   JOIN files f ON l.file_id = f.id
-                   WHERE lower(l.raw_text) LIKE ?`;
-    const param = `%${word.toLowerCase()}%`;
-    const stmt = this.db.prepare(query);
-    stmt.bind([param]);
+    const stmt = this.db.prepare(`SELECT f.id, f.path, l.line, l.raw_text, l.token_type
+                                  FROM file_lines l JOIN files f ON l.file_id = f.id
+                                  WHERE lower(l.raw_text) LIKE ?`);
+    stmt.bind([`%${word.toLowerCase()}%`]);
     const results: any[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject();
+      const [fileId, stored, line, rawText, tokenType] = stmt.get() as [number, string, number, string, string];
       results.push({
-        word: word,
-        filePath: row.file_path,
-        line: row.line as number,
-        text: (row.raw_text as string).toLowerCase(),
-        rawText: row.raw_text,
-        tokenType: row.token_type,
+        word,
+        filePath: this.absPathOf(fileId, stored),
+        line,
+        text: rawText.toLowerCase(),
+        rawText,
+        tokenType,
       });
     }
     stmt.free();
@@ -1393,7 +1521,7 @@ export class GraphDB {
     let scanned = 0;
 
     let sql = `
-      SELECT f.path AS file_path, l.line, l.raw_text, l.token_type
+      SELECT f.id, f.path, l.line, l.raw_text, l.token_type
       FROM file_lines l
       JOIN files f ON l.file_id = f.id
       WHERE f.path NOT LIKE '%node_modules%'
@@ -1412,24 +1540,18 @@ export class GraphDB {
     const results = [];
     while (stmt.step()) {
       if (++scanned % 500 === 0 && Date.now() > deadline) { break; }
-      const row = stmt.getAsObject();
-      const rawText = row.raw_text as string;
-      const filePath = row.file_path as string;
+      const [fileId, stored, line, rawText, tokenType] = stmt.get() as [number, string, number, string, string];
+      const filePath = this.absPathOf(fileId, stored);
 
-      if (inComments && row.token_type !== 'comment') continue;
-      if (inStrings && row.token_type !== 'string_literal') continue;
+      if (inComments && tokenType !== 'comment') continue;
+      if (inStrings && tokenType !== 'string_literal') continue;
       if (regex && !matchesQuery(rawText)) continue;
 
       if (fileFilter && !matchPathFilter(filePath, fileFilter, workspaceRoot)) {
         continue;
       }
 
-      results.push({
-        filePath,
-        line: row.line as number,
-        rawText,
-        type: row.token_type as string,
-      });
+      results.push({ filePath, line, rawText, type: tokenType });
 
       if (results.length >= limit) {
         break;

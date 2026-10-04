@@ -286,7 +286,7 @@ export class MCPServer {
           }
 
           (async () => {
-            if (!scope.folders.length) {
+            if (!scope.folders.length && !db.wasRebuiltForUpgrade()) {
               const count = (await scanner.listFiles(scope, scanOptions)).length;
               if (count > threshold) {
                 this.scanNeedsSelection.set(resolvedPath, count);

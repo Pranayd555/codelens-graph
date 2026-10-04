@@ -143,7 +143,7 @@ src/
 │   ├── dependencyManifest.ts # Direct dependencies from package.json (no node_modules walk)
 │   └── fileWatcher.ts        # Standalone file watcher (outside VS Code)
 ├── graph/
-│   ├── graphDB.ts            # SQLite: nodes, edges, snapshots, migrations
+│   ├── graphDB.ts            # SQLite graph store (integer-keyed), relationship resolution
 │   └── differ.ts             # Pre/post agent run diff engine
 ├── context/
 │   ├── contextBuilder.ts     # Task → BFS subgraph → compressed context
@@ -169,6 +169,7 @@ The graph database is stored at `.codelens/codelens-graph.db` inside your projec
 - The VS Code extension and MCP server share the same database
 - No external directory permission prompts for the agent
 - The DB is gitignored automatically (via `.codelens/.gitignore` — your root `.gitignore` is not modified)
+- Storage is compact: integer keys and workspace-relative paths (roughly 12 KB per indexed source file). Indexes written by older versions are rebuilt automatically once
 
 ---
 
