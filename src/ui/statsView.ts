@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { GraphDB } from '../graph/graphDB';
 
 export class StatsViewProvider implements vscode.WebviewViewProvider {
@@ -63,7 +64,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     await this.db.ensureInit();
     if (!this.view?.visible) {
       const stats  = this.db.getStats();
-      const issues = this.db.getNodesWithUndefinedRefs().length;
+      const issues = this.db.countNodesWithUndefinedRefs();
       this.lastStats  = stats;
       this.lastIssues = issues;
       return;
@@ -84,17 +85,20 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
     }
     await this.db.ensureInit();
     const stats  = this.db.getStats();
-    const issues = this.db.getNodesWithUndefinedRefs().length;
+    const issues = this.db.countNodesWithUndefinedRefs();
     this.lastStats  = stats;
     this.lastIssues = issues;
     this.view.webview.postMessage({ command: 'update', stats, issues, status: this.status });
   }
 
   private getHtml(): string {
+    const nonce = crypto.randomBytes(16).toString('hex');
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline';">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -177,7 +181,7 @@ body {
   <div class="empty-icon">⬡</div>
   <div class="empty-title">Graph not built yet</div>
   <div class="empty-desc">CodeLens indexes your codebase automatically on first open.</div>
-  <button class="btn btn-primary" onclick="send('buildGraph')">⟳ Build Graph Now</button>
+  <button class="btn btn-primary" data-cmd="buildGraph">⟳ Build Graph Now</button>
 </div>
 
 <div id="main" style="display:none">
@@ -214,7 +218,7 @@ body {
       <div class="sav-bar-wrap"><div class="sav-bar" id="sav-bar"></div></div>
       <div class="sav-hint">vs. reading files directly</div>
     </div>
-    <button class="btn btn-secondary" onclick="send('showMcpUsage')">📊 Full Usage Report</button>
+    <button class="btn btn-secondary" data-cmd="showMcpUsage">📊 Full Usage Report</button>
   </div>
 
   <div class="section">
@@ -228,24 +232,33 @@ body {
       codelens_relations · codelens_impact · codelens_text_search<br>
       codelens_node · codelens_files · codelens_status
     </div>
-    <button class="btn btn-secondary" onclick="send('copyMcpConfig')">⎘ Copy MCP Config</button>
+    <button class="btn btn-secondary" data-cmd="copyMcpConfig">⎘ Copy MCP Config</button>
   </div>
 
   <div class="section">
     <div class="section-title">Actions</div>
-    <button class="btn btn-primary"   onclick="send('buildGraph')">⟳ Build / Rebuild Graph</button>
-    <button class="btn btn-secondary" onclick="send('showGraph')">⬡ Open Graph Explorer</button>
-    <button class="btn btn-secondary" onclick="send('searchSymbol')">⌕ Search Symbol</button>
-    <button class="btn btn-secondary" onclick="send('showContext')">⊙ Preview Agent Context</button>
-    <button class="btn btn-secondary" onclick="send('addConfig')">⚙ Add Configuration to IDE</button>
-    <button class="btn btn-secondary" onclick="send('clearConfig')">🗑 Clear Configuration Files</button>
+    <button class="btn btn-primary"   data-cmd="buildGraph">⟳ Build / Rebuild Graph</button>
+    <button class="btn btn-secondary" data-cmd="showGraph">⬡ Open Graph Explorer</button>
+    <button class="btn btn-secondary" data-cmd="searchSymbol">⌕ Search Symbol</button>
+    <button class="btn btn-secondary" data-cmd="showContext">⊙ Preview Agent Context</button>
+    <button class="btn btn-secondary" data-cmd="addConfig">⚙ Add Configuration to IDE</button>
+    <button class="btn btn-secondary" data-cmd="clearConfig">🗑 Clear Configuration Files</button>
   </div>
 
 </div>
 
-<script>
+<script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 function send(cmd) { vscode.postMessage({ command: cmd }); }
+
+document.addEventListener('click', ev => {
+  const btn = ev.target.closest('[data-cmd]');
+  if (btn) { send(btn.dataset.cmd); }
+});
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
 
 const TC = {
   function:'#4ec9b0', method:'#569cd6', class:'#c586c0',
@@ -302,10 +315,11 @@ window.addEventListener('message', ev => {
 
   document.getElementById('type-list').innerHTML = sorted.map(([type, count]) => {
     const pct = Math.round(Number(count)/maxV*100);
-    const col  = TC[type] || '#888';
+    // Type names come from the graph DB, which a repo could ship pre-built — never trust them as HTML.
+    const col  = Object.prototype.hasOwnProperty.call(TC, type) ? TC[type] : '#888';
     return '<div class="type-row">'
       + '<div class="type-dot" style="background:'+col+'"></div>'
-      + '<span class="type-name">'+type+'</span>'
+      + '<span class="type-name">'+esc(type)+'</span>'
       + '<div class="type-bar-wrap"><div class="type-bar" style="width:'+pct+'%;background:'+col+'"></div></div>'
       + '<span class="type-count">'+fmt(Number(count))+'</span>'
       + '</div>';

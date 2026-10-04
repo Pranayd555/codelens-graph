@@ -1,3 +1,4 @@
+import * as fs   from 'fs';
 import * as path from 'path';
 
 export const CONFIG_WHITELIST = new Set([
@@ -80,10 +81,21 @@ export function matchPathFilter(filePath: string, filter: string, workspaceRoot?
     }
   }
 
-  const p = filter.replace(/\\/g, '/').replace(/^\/|\/$/g, '');
+  const p = filter.replace(/\\/g, '/').replace(/^\/|\/$/g, '').replace(/(\*\*\/)+/g, '**/');
 
   if (/^\.[a-zA-Z0-9]+$/.test(p)) {
     return relPath.endsWith(p) || normPath.endsWith(p);
+  }
+
+  const literalMatch = () => {
+    const seg = p.replace(/\*/g, '').replace(/\//g, '').replace(/{|}|,/g, '');
+    return !!seg && (relPath.includes(seg) || name === seg);
+  };
+
+  // Filters can come from MCP agents; each wildcard adds a level of polynomial
+  // backtracking, so unusually long or wildcard-heavy filters match literally.
+  if (p.length > MAX_REGEX_PATTERN_CHARS || (p.match(/\*+/g)?.length ?? 0) > 4) {
+    return literalMatch();
   }
 
   let regexStr = p.replace(/[.+^$()|[\]\\]/g, '\\$&');
@@ -112,10 +124,109 @@ export function matchPathFilter(filePath: string, filter: string, workspaceRoot?
     const nameRegex = new RegExp('^' + regexStr + '$', 'i');
     if (nameRegex.test(name)) { return true; }
   } catch {
-    const seg = p.replace(/\*/g, '').replace(/\//g, '').replace(/{|}|,/g, '');
-    if (seg && (relPath.includes(seg) || name === seg)) { return true; }
+    return literalMatch();
   }
 
   return false;
+}
+
+// True when filePath resolves to a location inside rootPath. Symlinks are
+// resolved first, so a link inside the workspace cannot point reads elsewhere.
+export function isPathInside(filePath: string, rootPath: string): boolean {
+  const real = (p: string) => {
+    try { return fs.realpathSync.native(p); } catch { return path.resolve(p); }
+  };
+  const rel = path.relative(real(rootPath), real(filePath));
+  return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+}
+
+// ─── Agent-supplied regex search ──────────────────────────────────────────────
+// Search patterns from MCP agents run on the server's only thread, so a pattern
+// with catastrophic backtracking would hang every tool call. Risky patterns are
+// rejected (callers fall back to literal search) and tested input is capped.
+
+export const MAX_REGEX_PATTERN_CHARS = 200;
+export const MAX_REGEX_INPUT_CHARS   = 1000;
+
+export function compileSearchRegex(query: string): { regex: RegExp | null; rejected: boolean } {
+  if (!/[|*?+{}()[\]^$\\&]/.test(query)) { return { regex: null, rejected: false }; }
+  if (query.length > MAX_REGEX_PATTERN_CHARS || !isRegexBacktrackSafe(query)) {
+    return { regex: null, rejected: true };
+  }
+  try {
+    return { regex: new RegExp(query, 'i'), rejected: false };
+  } catch {
+    return { regex: null, rejected: false }; // invalid regex → literal search
+  }
+}
+
+export function regexTestCapped(regex: RegExp, text: string): boolean {
+  return regex.test(text.length > MAX_REGEX_INPUT_CHARS ? text.slice(0, MAX_REGEX_INPUT_CHARS) : text);
+}
+
+// Rejects backreferences, repeated groups that themselves contain repetition or
+// alternation (e.g. (a+)+, (a|aa)*), and more than two unbounded quantifiers.
+function isRegexBacktrackSafe(pattern: string): boolean {
+  const groupHasRepetition: boolean[] = [];
+  let prevAtomWasRiskyGroup = false;
+  let unboundedCount = 0;
+
+  const markEnclosingGroup = () => {
+    if (groupHasRepetition.length) { groupHasRepetition[groupHasRepetition.length - 1] = true; }
+  };
+
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+
+    if (c === '\\') {
+      if (/[1-9k]/.test(pattern[i + 1] ?? '')) { return false; }
+      i++;
+      prevAtomWasRiskyGroup = false;
+      continue;
+    }
+    if (c === '[') {
+      i++;
+      if (pattern[i] === '^') { i++; }
+      if (pattern[i] === ']') { i++; }
+      while (i < pattern.length && pattern[i] !== ']') {
+        if (pattern[i] === '\\') { i++; }
+        i++;
+      }
+      prevAtomWasRiskyGroup = false;
+      continue;
+    }
+    if (c === '(') {
+      groupHasRepetition.push(false);
+      prevAtomWasRiskyGroup = false;
+      continue;
+    }
+    if (c === ')') {
+      prevAtomWasRiskyGroup = groupHasRepetition.pop() ?? false;
+      if (prevAtomWasRiskyGroup) { markEnclosingGroup(); }
+      continue;
+    }
+    if (c === '|') {
+      markEnclosingGroup();
+      prevAtomWasRiskyGroup = false;
+      continue;
+    }
+
+    const brace = c === '{' ? /^\{(\d+)(,(\d*))?\}/.exec(pattern.slice(i)) : null;
+    if (c === '*' || c === '+' || c === '?' || brace) {
+      const unbounded = c === '*' || c === '+' || (brace !== null && brace[2] !== undefined);
+      if (unbounded) {
+        if (prevAtomWasRiskyGroup) { return false; }
+        if (++unboundedCount > 2) { return false; }
+      }
+      markEnclosingGroup();
+      if (brace) { i += brace[0].length - 1; }
+      if (pattern[i + 1] === '?') { i++; } // lazy modifier
+      prevAtomWasRiskyGroup = false;
+      continue;
+    }
+
+    prevAtomWasRiskyGroup = false;
+  }
+  return true;
 }
 

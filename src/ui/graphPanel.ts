@@ -22,15 +22,18 @@ export function toWebviewData(nodes: GraphNode[], edges: GraphEdge[]) {
 
 export function getGraphPanelHtml(
   graphData: ReturnType<typeof toWebviewData>,
-  nonce: string
+  nonce: string,
+  d3ScriptUri: string
 ): string {
-  const dataJson = JSON.stringify(graphData);
+  // Names and paths come from the scanned repo, and the JSON is inlined in a
+  // <script> block: escape '<' so a value like "</script>" can't end it early.
+  const dataJson = JSON.stringify(graphData).replace(/</g, '\\u003c');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy"
-  content="default-src 'none'; script-src 'nonce-${nonce}' https://cdnjs.cloudflare.com; style-src 'unsafe-inline';">
+  content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline';">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>CodeLens Graph</title>
 <style>
@@ -229,7 +232,7 @@ body {
   <div class="icon">⬡</div>
   <h2>Graph not built yet</h2>
   <p>CodeLens indexes your codebase automatically.<br>Click below if it hasn't started yet.</p>
-  <button onclick="send('buildGraph')">Build Graph Now</button>
+  <button id="empty-build-btn">Build Graph Now</button>
 </div>
 
 <div id="loading">
@@ -258,10 +261,11 @@ body {
   <div id="stats-bar">–</div>
 </div>
 
-<script nonce="${nonce}" src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script nonce="${nonce}" src="${d3ScriptUri}"></script>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 function send(cmd, payload) { vscode.postMessage({ command: cmd, ...payload }); }
+document.getElementById('empty-build-btn').addEventListener('click', () => send('buildGraph'));
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 let RAW = ${dataJson};

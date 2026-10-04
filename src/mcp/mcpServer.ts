@@ -8,7 +8,9 @@ import { ContextBuilder } from '../context/contextBuilder';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
-import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
+import {
+  isConfigPath, isNodeModulePath, matchPathFilter, isPathInside, compileSearchRegex, regexTestCapped
+} from '../utils';
 import { TextIndex, TextEntry } from '../indexing/textIndex';
 
 // ─── Task tier classifier ─────────────────────────────────────────────────────
@@ -115,9 +117,14 @@ export class MCPServer {
   private async resolveActiveWorkspace(overrideWorkspace?: string): Promise<string> {
     if (overrideWorkspace) {
       const resolved = path.resolve(overrideWorkspace);
-      if (fs.existsSync(resolved)) {
-        return resolved;
+      if (!this.isKnownWorkspace(resolved)) {
+        throw new Error(
+          'Workspace override rejected: "' + overrideWorkspace + '" is not a CodeLens workspace '
+          + '(no .codelens/codelens-graph.db and not open in VS Code). Omit the workspace argument '
+          + 'to use the active workspace, or pass the project root that contains .codelens/.'
+        );
       }
+      return resolved;
     }
 
     // Try reading active-workspaces.json global registry
@@ -146,6 +153,28 @@ export class MCPServer {
 
     // Fall back to process.cwd() or the folder containing `.codelens/codelens-graph.db` in cwd and ancestors
     return this.discoverWorkspaceFromCwd();
+  }
+
+  // The `workspace` tool argument is agent-controlled, so only folders CodeLens
+  // already manages are accepted. Otherwise a prompt-injected agent could create
+  // .codelens/ files in, or run codelens_clear_config against, any directory.
+  private isKnownWorkspace(dir: string): boolean {
+    const same = (a: string, b: string) =>
+      process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+
+    if (this.defaultWorkspaceRoot && same(dir, path.resolve(this.defaultWorkspaceRoot))) { return true; }
+    for (const loaded of this.workspaces.keys()) {
+      if (same(dir, loaded)) { return true; }
+    }
+    if (fs.existsSync(path.join(dir, '.codelens', 'codelens-graph.db'))) { return true; }
+
+    const registryPath = path.join(os.homedir(), '.codelens', 'active-workspaces.json');
+    try {
+      const windows = JSON.parse(fs.readFileSync(registryPath, 'utf-8')).windows ?? {};
+      return Object.values(windows).some((w: any) => typeof w?.path === 'string' && same(dir, path.resolve(w.path)));
+    } catch {
+      return false;
+    }
   }
 
   private discoverWorkspaceFromCwd(): string {
@@ -245,8 +274,7 @@ export class MCPServer {
     this.defaultWorkspaceRoot = workspaceRoot === '--auto' ? '' : workspaceRoot;
 
     // Resolve/initialize default workspace root
-    const activeWorkspace = await this.resolveActiveWorkspace();
-    await this.getWorkspaceContext(activeWorkspace);
+    await this.getWorkspaceContext();
 
     const pkgVersion = (() => {
       try {
@@ -547,7 +575,7 @@ export class MCPServer {
             lines.push('- Undefined refs: ' + node.undefinedRefs.join(', '));
           }
           if (with_snippet === true) {
-            const snippet = this.readSnippet(node);
+            const snippet = this.readSnippet(node, workspaceRoot);
             if (snippet) { lines.push('', '```' + node.language, snippet, '```'); }
           }
           lines.push('');
@@ -748,7 +776,7 @@ export class MCPServer {
         const { db } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
         const stats  = db.getStats();
-        const issues = db.getNodesWithUndefinedRefs().length;
+        const issues = db.countNodesWithUndefinedRefs();
         return txt([
           '## CodeLens Status',
           '- Files indexed: ' + stats.fileCount,
@@ -796,16 +824,8 @@ export class MCPServer {
           return txt('Empty search query.');
         }
 
-        // 2. Determine regex status
-        const isRegex = /[|*?+{}()[\]^$\\&]/.test(normalizedQuery);
-        let regex: RegExp | null = null;
-        if (isRegex) {
-          try {
-            regex = new RegExp(normalizedQuery, 'i');
-          } catch (e) {
-            // fallback to substring search if invalid regex
-          }
-        }
+        // 2. Determine regex status (invalid or backtracking-prone patterns fall back to substring search)
+        const { regex, rejected: regexRejected } = compileSearchRegex(normalizedQuery);
 
         const resultsMap = new Map<string, { filePath: string; line: number; rawText: string; source: 'graph' | 'filesystem'; type: string }>();
 
@@ -825,7 +845,7 @@ export class MCPServer {
           if (inStrings && !isLineString(lineText)) return false;
           
           if (regex) {
-            return regex.test(lineText);
+            return regexTestCapped(regex, lineText);
           }
           return lineText.toLowerCase().includes(normalizedQuery.toLowerCase());
         };
@@ -843,7 +863,7 @@ export class MCPServer {
 
             // Read the exact line for verification
             try {
-              if (fs.existsSync(node.filePath)) {
+              if (isPathInside(node.filePath, workspaceRoot) && fs.existsSync(node.filePath)) {
                 const content = fs.readFileSync(node.filePath, 'utf-8');
                 const linesList = content.split('\n');
                 const lineIndex = node.line - 1;
@@ -898,6 +918,10 @@ export class MCPServer {
         const results = Array.from(resultsMap.values());
 
         if (results.length === 0) {
+          if (regexRejected) {
+            return txt('No matches found for "' + normalizedQuery + '". The pattern was searched as literal text because it '
+              + 'could backtrack excessively (nested repetition, backreferences, or >2 unbounded quantifiers). Simplify the regex and retry.');
+          }
           return txt('No matches found for "' + normalizedQuery + '".\n\nGraph may be stale. Run codelens_status to check index freshness.');
         }
 
@@ -917,6 +941,9 @@ export class MCPServer {
 
         // Diagnostics block
         lines.push('---');
+        if (regexRejected) {
+          lines.push('*Regex not used (too long, nested repetition, backreferences, or >2 unbounded quantifiers); searched as literal text.*');
+        }
         if (databaseScanTriggered) {
           lines.push('*Matched via hybrid search: graph nodes pre-filter + database scan fallback.*');
         } else {
@@ -1001,7 +1028,10 @@ export class MCPServer {
       : 'import { ' + node.name + ' } from \'' + rel + '\';';
   }
 
-  private readSnippet(node: GraphNode): string | null {
+  // Node paths come from the DB, which a cloned repo could ship pre-built —
+  // never read outside the workspace.
+  private readSnippet(node: GraphNode, workspaceRoot: string): string | null {
+    if (!isPathInside(node.filePath, workspaceRoot)) { return null; }
     try {
       const lines   = fs.readFileSync(node.filePath, 'utf-8').split('\n');
       const start   = Math.max(0, node.line - 1);

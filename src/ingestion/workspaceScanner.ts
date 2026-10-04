@@ -147,6 +147,11 @@ const ALWAYS_EXCLUDE_FILES = new Set([
 
 // ─── WorkspaceScanner ─────────────────────────────────────────────────────────
 
+// The extension host is one thread shared by every extension, so long scans
+// hand control back this often to keep other extensions responsive.
+const YIELD_INTERVAL_MS = 25;
+const yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
+
 export class WorkspaceScanner {
   private textIndex: TextIndex;
   constructor(private parser: ASTParser, private db: GraphDB) {
@@ -163,7 +168,7 @@ export class WorkspaceScanner {
 
     await this.parser.ensureInit();
 
-    const allFiles    = this.collectFiles(rootPaths, options);
+    const allFiles    = await this.collectFiles(rootPaths, options);
     const total       = allFiles.length;
     const indexedSet  = new Set(allFiles.map(f => path.normalize(f)));
 
@@ -199,8 +204,13 @@ export class WorkspaceScanner {
 
     let lastPersistTime = Date.now();
     let unsavedChanges = false;
+    let lastYield = Date.now();
 
     for (let i = 0; i < allFiles.length; i++) {
+      if (Date.now() - lastYield > YIELD_INTERVAL_MS) {
+        await yieldToEventLoop();
+        lastYield = Date.now();
+      }
       const filePath = allFiles[i];
       options.onProgress?.(i + 1, total, filePath);
 
@@ -224,7 +234,7 @@ export class WorkspaceScanner {
         const parsed = await this.parser.parseFileAsync(filePath);
         if (parsed.parseErrors.length) { result.errors.push(...parsed.parseErrors); }
 
-        this.db.deleteNodesByFile(filePath);
+        const hadNodes = this.db.deleteNodesByFile(filePath);
 
         if (parsed.nodes.length > 0) {
           this.db.upsertNodes(parsed.nodes);
@@ -238,9 +248,10 @@ export class WorkspaceScanner {
           result.filesScanned++;
           unsavedChanges = true;
         } else {
-          this.db.deleteTextEntriesByFile(filePath);
+          // Empty or unparseable file: re-checked every scan, but only a real
+          // removal (it used to have symbols) counts as a change.
           result.filesScanned++;
-          unsavedChanges = true;
+          if (hadNodes) { unsavedChanges = true; }
         }
       } catch (err) {
         result.errors.push(`${filePath}: ${err}`);
@@ -258,11 +269,15 @@ export class WorkspaceScanner {
       }
     }
 
-    try {
-      this.db.resolveWorkspaceRelationships();
-      this.db.persist();
-    } catch (err) {
-      result.errors.push(`Final persist failed: ${err}`);
+    // Resolving relationships and rewriting the whole DB are the most expensive
+    // steps, so skip both when the scan changed nothing (the common startup case).
+    if (this.db.needsRelationshipResolve() || unsavedChanges) {
+      try {
+        await this.db.resolveWorkspaceRelationships();
+        this.db.persist();
+      } catch (err) {
+        result.errors.push(`Final persist failed: ${err}`);
+      }
     }
     result.edgesAdded = this.db.getStats().totalEdges;
     result.durationMs = Date.now() - start;
@@ -288,7 +303,7 @@ export class WorkspaceScanner {
       const currentSymbols = parsed.nodes
         .filter(n => n.type !== 'file' && n.type !== 'import')
         .map(n => n.name);
-      this.db.resolveWorkspaceRelationships(
+      await this.db.resolveWorkspaceRelationships(
         filePath,
         [...new Set([...previousSymbols, ...currentSymbols])]
       );
@@ -342,18 +357,18 @@ export class WorkspaceScanner {
 
   // ── File collection ────────────────────────────────────────────────────────
 
-  private collectFiles(rootPaths: string[], options: ScanOptions): string[] {
+  private async collectFiles(rootPaths: string[], options: ScanOptions): Promise<string[]> {
     const files  = new Array<string>();
     const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
     const userPatterns = options.excludePatterns;
 
     for (const root of rootPaths) {
-      this.walkDir(root, root, extSet, userPatterns, files, options);
+      await this.walkDir(root, root, extSet, userPatterns, files, options);
     }
     return files;
   }
 
-  private walkDir(
+  private async walkDir(
     dir: string,
     root: string,
     exts: Set<string>,
@@ -362,9 +377,9 @@ export class WorkspaceScanner {
     options: ScanOptions,
     inNodeModules = false,
     nodeModulesDepth = 0
-  ): void {
+  ): Promise<void> {
     let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
     catch { return; }
 
     const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
@@ -388,7 +403,7 @@ export class WorkspaceScanner {
         }
 
         if (this.shouldExcludeDir(entry.name, relPath, userPatterns)) { continue; }
-        this.walkDir(fullPath, root, exts, userPatterns, results, options, nextInNodeModules, nextDepth);
+        await this.walkDir(fullPath, root, exts, userPatterns, results, options, nextInNodeModules, nextDepth);
       } else if (entry.isFile()) {
         if (options.depsOnly && !inNodeModules) {
           continue;

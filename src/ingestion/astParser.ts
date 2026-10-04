@@ -288,6 +288,7 @@ export class TreeSitterParser {
 
     const parser = new (this.Parser as any)();
     parser.setLanguage(lang);
+    this.declarationCache.clear(); // node ids are only unique within one tree
 
     let tree: any;
     try {
@@ -842,12 +843,26 @@ export class TreeSitterParser {
     return params;
   }
 
+  // Each `.parent` is a call into tree-sitter's WASM that allocates a new node,
+  // and analyseScope asks about the same identifiers repeatedly (two passes per
+  // body, again for every enclosing function), so read it once per level and
+  // memoize the answer per node for the current tree.
+  private declarationCache = new Map<number, boolean>();
+
   private isDeclarationIdentifier(n: any): boolean {
+    const cached = this.declarationCache.get(n.id);
+    if (cached !== undefined) { return cached; }
+    const result = this.computeIsDeclarationIdentifier(n);
+    this.declarationCache.set(n.id, result);
+    return result;
+  }
+
+  private computeIsDeclarationIdentifier(n: any): boolean {
     let curr = n;
     while (curr) {
-      const pType = curr.parent?.type;
-      if (!pType) { break; }
       const parent = curr.parent;
+      const pType = parent?.type;
+      if (!pType) { break; }
       if (pType === 'function_declaration' && parent.childForFieldName('name')?.id === curr.id) { return true; }
       if (pType === 'class_declaration' && parent.childForFieldName('name')?.id === curr.id) { return true; }
       if (pType === 'method_definition' && parent.childForFieldName('name')?.id === curr.id) { return true; }
@@ -858,7 +873,7 @@ export class TreeSitterParser {
       if (pType === 'import_specifier' || pType === 'import_clause' || pType === 'namespace_import') { return true; }
       if (pType === 'pair' && parent.childForFieldName('key')?.id === curr.id) { return true; }
       if (pType === 'for_in_statement' && parent.childForFieldName('left')?.id === curr.id) { return true; }
-      curr = curr.parent;
+      curr = parent;
     }
     return false;
   }

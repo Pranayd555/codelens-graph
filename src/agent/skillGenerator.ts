@@ -3,26 +3,56 @@ import * as path from 'path';
 import { GraphDB }    from '../graph/graphDB';
 import { GraphStats } from '../types';
 
+const MANAGED_START = '<!-- CODELENS_MANAGED_START -->';
+
+// Agent rule files CodeLens manages. 'whole' files are owned by CodeLens;
+// 'merge' files belong to the user and only carry a managed section.
+const AGENT_RULE_FILES: Array<{ rel: string; ide?: string; mode: 'whole' | 'merge'; header?: string }> = [
+  { rel: '.vscode/codelens.instructions.md', ide: 'vscode', mode: 'whole', header: '---\napplyTo: "**"\n---\n\n' },
+  { rel: '.cursor/rules/codelens.mdc', ide: 'cursor', mode: 'whole',
+    header: '---\ndescription: CodeLens Graph — mandatory codebase search protocol\nalwaysApply: true\n---\n\n' },
+  { rel: '.agents/AGENTS.md', ide: 'antigravity', mode: 'merge' },
+  { rel: 'CLAUDE.md',         ide: 'Claude',      mode: 'merge' },
+  { rel: '.windsurfrules',    ide: 'Winsurf',     mode: 'merge' },
+  // Written by older versions — only ever cleaned up now.
+  { rel: '.cursorrules',                    mode: 'merge' },
+  { rel: '.github/copilot-instructions.md', mode: 'merge' },
+  { rel: '.clinerules',                     mode: 'merge' },
+  { rel: 'CONVENTIONS.md',                  mode: 'merge' },
+];
+
+// Rewrites a file only when its content differs (line endings ignored), so
+// regenerating configs on startup or after saves doesn't touch mtimes, git
+// status, or other tools' file watchers.
+function writeIfChanged(filePath: string, content: string): boolean {
+  try {
+    const existing = fs.readFileSync(filePath, 'utf-8');
+    if (existing.replace(/\r\n/g, '\n') === content.replace(/\r\n/g, '\n')) { return false; }
+  } catch { /* missing — write it */ }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf-8');
+  return true;
+}
+
 export class SkillGenerator {
   constructor(private db: GraphDB) {}
 
-  generateAll(workspaceRoot: string, _stats: GraphStats, selectedIdes: string[] = []): string[] {
-    // First, clean up existing configurations/rules so we don't leave stale ones
-    this.removeAll(workspaceRoot);
-
-    const written: string[] = [];
+  // CodeLens's own files under .codelens/. Safe to write before the user has
+  // chosen any agent integrations — nothing outside .codelens/ is touched.
+  writeInternalFiles(workspaceRoot: string, stats: GraphStats): string[] {
     const codelensDir = path.join(workspaceRoot, '.codelens');
-    fs.mkdirSync(codelensDir, { recursive: true });
+    writeIfChanged(path.join(codelensDir, '.gitignore'), '*\n');
+    writeIfChanged(path.join(codelensDir, 'README.md'), this.buildReadme(workspaceRoot));
+    writeIfChanged(path.join(codelensDir, 'mcp.json'), this.buildMcpConfig(workspaceRoot));
+    writeIfChanged(path.join(codelensDir, 'instructions.md'), this.buildInstructionsMd(stats));
+    return ['.codelens/README.md', '.codelens/mcp.json', '.codelens/instructions.md'];
+  }
 
-    fs.writeFileSync(path.join(codelensDir, 'README.md'), this.buildReadme(workspaceRoot), 'utf-8');
-    written.push('.codelens/README.md');
-
-    fs.writeFileSync(path.join(codelensDir, 'mcp.json'), this.buildMcpConfig(workspaceRoot), 'utf-8');
-    written.push('.codelens/mcp.json');
-
-    // Write manual reference instructions
-    fs.writeFileSync(path.join(codelensDir, 'instructions.md'), this.buildInstructionsMd(_stats), 'utf-8');
-    written.push('.codelens/instructions.md');
+  // Brings .codelens/ files, .vscode/mcp.json and every agent rule file in line
+  // with the selection. Files are only rewritten when their content changes.
+  // The index is kept out of git by .codelens/.gitignore, not the root .gitignore.
+  generateAll(workspaceRoot: string, stats: GraphStats, selectedIdes: string[] = []): string[] {
+    const written = this.writeInternalFiles(workspaceRoot, stats);
 
     if (selectedIdes.includes('vscode')) {
       if (this.writeVsCodeMcpConfig(workspaceRoot)) { written.push('.vscode/mcp.json'); }
@@ -30,10 +60,7 @@ export class SkillGenerator {
       this.removeVsCodeMcpConfig(workspaceRoot);
     }
 
-    // Write agent instruction rules for selected IDEs
-    this.writeAgentInstructions(workspaceRoot, written, selectedIdes, _stats);
-
-    this.ensureGitignore(workspaceRoot);
+    this.syncAgentInstructions(workspaceRoot, written, selectedIdes);
     return written;
   }
 
@@ -85,94 +112,61 @@ export class SkillGenerator {
   }
 
   removeAll(workspaceRoot: string): void {
-    const legacy = [
-      '.cursor/rules/codelens.mdc',
-      '.cursorrules',
-      '.github/copilot-instructions.md',
-      '.clinerules',
-      '.vscode/codelens.instructions.md',
-      'CONVENTIONS.md',
-      'CLAUDE.md',
-      '.windsurfrules',
-      '.agents/AGENTS.md'
-    ];
-    for (const rel of legacy) {
-      const fp = path.join(workspaceRoot, rel);
-      if (!fs.existsSync(fp)) { continue; }
-      try {
-        const c = fs.readFileSync(fp, 'utf-8');
-        if (c.includes('CODELENS_MANAGED_START')) {
-          const cleaned = this.removeManagedSection(c);
-          const trimmed = cleaned.trim();
-          
-          // If only frontmatter or nothing remains, delete the file completely
-          const withoutFrontmatter = trimmed.replace(/^---[\s\S]*?---/, '').trim();
-          if (trimmed && withoutFrontmatter !== '') {
-            fs.writeFileSync(fp, cleaned, 'utf-8');
-          } else {
-            fs.unlinkSync(fp);
-          }
-        }
-      } catch { /* ignore */ }
+    for (const target of AGENT_RULE_FILES) {
+      this.removeManagedSectionFrom(path.join(workspaceRoot, target.rel));
     }
+  }
+
+  // Strips the managed section; deletes the file if nothing meaningful remains.
+  private removeManagedSectionFrom(filePath: string): void {
+    if (!fs.existsSync(filePath)) { return; }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      if (!content.includes(MANAGED_START)) { return; }
+      const remaining = this.contentWithoutManagedSection(content);
+      if (remaining) {
+        writeIfChanged(filePath, remaining);
+      } else {
+        fs.unlinkSync(filePath);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // What is left after removing the managed section, or '' when only
+  // whitespace / frontmatter would remain.
+  private contentWithoutManagedSection(content: string): string {
+    const cleaned = this.removeManagedSection(content);
+    const trimmed = cleaned.trim();
+    const withoutFrontmatter = trimmed.replace(/^---[\s\S]*?---/, '').trim();
+    return trimmed && withoutFrontmatter !== '' ? cleaned : '';
   }
 
   // ── Agent instruction files ───────────────────────────────────────────────
 
-  private writeAgentInstructions(workspaceRoot: string, written: string[], selectedIdes: string[], stats: GraphStats): void {
-    const instruction = this.buildAgentInstruction(stats);
-
-    if (selectedIdes.includes('vscode')) {
-      const vscodeDir = path.join(workspaceRoot, '.vscode');
-      fs.mkdirSync(vscodeDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(vscodeDir, 'codelens.instructions.md'),
-        '---\napplyTo: "**"\n---\n\n' + instruction,
-        'utf-8'
-      );
-      written.push('.vscode/codelens.instructions.md');
-    }
-
-    if (selectedIdes.includes('cursor')) {
-      const cursorRulesDir = path.join(workspaceRoot, '.cursor', 'rules');
-      fs.mkdirSync(cursorRulesDir, { recursive: true });
-      const cursorPath = path.join(cursorRulesDir, 'codelens.mdc');
-      fs.writeFileSync(cursorPath,
-        '---\ndescription: CodeLens Graph — mandatory codebase search protocol\nalwaysApply: true\n---\n\n'
-        + instruction, 'utf-8');
-      written.push('.cursor/rules/codelens.mdc');
-    }
-
-    if (selectedIdes.includes('antigravity')) {
-      const agentsDir = path.join(workspaceRoot, '.agents');
-      fs.mkdirSync(agentsDir, { recursive: true });
-      const agentsPath = path.join(agentsDir, 'AGENTS.md');
-      this.mergeInstructions(agentsPath, instruction);
-      written.push('.agents/AGENTS.md');
-    }
-
-    if (selectedIdes.includes('Claude')) {
-      const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
-      this.mergeInstructions(claudePath, instruction);
-      written.push('CLAUDE.md');
-    }
-
-    if (selectedIdes.includes('Winsurf')) {
-      const windsurfPath = path.join(workspaceRoot, '.windsurfrules');
-      this.mergeInstructions(windsurfPath, instruction);
-      written.push('.windsurfrules');
+  private syncAgentInstructions(workspaceRoot: string, written: string[], selectedIdes: string[]): void {
+    const instruction = this.buildAgentInstruction();
+    for (const target of AGENT_RULE_FILES) {
+      const filePath = path.join(workspaceRoot, target.rel);
+      if (!target.ide || !selectedIdes.includes(target.ide)) {
+        this.removeManagedSectionFrom(filePath);
+        continue;
+      }
+      const desired = target.mode === 'whole'
+        ? (target.header ?? '') + instruction
+        : this.mergedInstructions(filePath, instruction);
+      writeIfChanged(filePath, desired);
+      written.push(target.rel);
     }
   }
 
-  private buildAgentInstruction(stats: Omit<GraphStats, "lastBuilt" | "buildDurationMs"> & Partial<Pick<GraphStats, "lastBuilt" | "buildDurationMs">>): string {
-    const nodeCount = (stats as any).totalNodes ?? 0;
-    const fileCount = (stats as any).fileCount   ?? 0;
-
+  // Kept free of live numbers (symbol/file counts) so the files that embed it
+  // don't change — and show up in git — after every save.
+  private buildAgentInstruction(): string {
     return `<!-- CODELENS_MANAGED_START -->
 ## CodeLens Graph — Mandatory Search Protocol
 
-This workspace has a live codebase knowledge graph via **CodeLens Graph** MCP.
-The graph contains **${nodeCount} symbols** across **${fileCount} files**, updated on every save.
+This workspace has a live codebase knowledge graph via **CodeLens Graph** MCP, updated on every save.
+Run \`codelens_status\` for current symbol and file counts.
 
 ### RULE 1 — Triage first to establish the baseline
 Before starting a task, call \`codelens_triage\` to classify it.
@@ -231,8 +225,7 @@ Use \`codelens_search\` or \`codelens_files\` with \`scope: "deps"\`, or use \`c
       },
     };
     try {
-      fs.mkdirSync(path.join(workspaceRoot, '.vscode'), { recursive: true });
-      fs.writeFileSync(configPath, JSON.stringify(updated, null, 2) + '\n', 'utf-8');
+      writeIfChanged(configPath, JSON.stringify(updated, null, 2) + '\n');
       return true;
     } catch { return false; }
   }
@@ -282,10 +275,11 @@ Use \`codelens_search\` or \`codelens_files\` with \`scope: "deps"\`, or use \`c
   // ── .codelens/instructions.md ─────────────────────────────────────────────
 
   private buildInstructionsMd(stats: GraphStats): string {
-    const instruction = this.buildAgentInstruction(stats);
+    const instruction = this.buildAgentInstruction();
     return `# CodeLens Graph — AI Agent Instructions
 
 This file contains the mandatory search protocol and rules for AI agents using the CodeLens Graph MCP server.
+The graph currently contains **${stats.totalNodes} symbols** across **${stats.fileCount} files**.
 You can copy the contents of the rules section below and add them to your IDE's custom instructions or rules file.
 
 ## Manual Rule Setup Guide
@@ -331,26 +325,14 @@ ${instruction}
 
   private toFwd(p: string): string { return p.replace(/\\/g, '/'); }
 
-  private mergeInstructions(filePath: string, newContent: string): void {
+  // The user's file with the managed section replaced by newContent at the end.
+  private mergedInstructions(filePath: string, newContent: string): string {
     let existing = '';
-    if (fs.existsSync(filePath)) {
-      try { existing = fs.readFileSync(filePath, 'utf-8'); } catch { /* overwrite */ }
+    try { existing = fs.readFileSync(filePath, 'utf-8'); } catch { /* new file */ }
+    if (existing.includes(MANAGED_START)) {
+      existing = this.contentWithoutManagedSection(existing);
     }
-    if (existing.includes('CODELENS_MANAGED_START')) {
-      existing = this.removeManagedSection(existing);
-    }
-    const merged = (existing.trimEnd() ? existing.trimEnd() + '\n\n' : '') + newContent + '\n';
-    fs.writeFileSync(filePath, merged, 'utf-8');
-  }
-
-  private ensureGitignore(workspaceRoot: string): void {
-    const gp = path.join(workspaceRoot, '.gitignore');
-    try {
-      const ex = fs.existsSync(gp) ? fs.readFileSync(gp,'utf-8') : '';
-      if (!ex.includes('.codelens/')) {
-        fs.appendFileSync(gp, '\n# CodeLens Graph local index\n.codelens/\n','utf-8');
-      }
-    } catch { /* ignore */ }
+    return (existing.trimEnd() ? existing.trimEnd() + '\n\n' : '') + newContent + '\n';
   }
 
   private removeGitignore(workspaceRoot: string): void {

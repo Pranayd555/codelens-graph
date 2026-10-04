@@ -23,7 +23,7 @@ CodeLens Graph fixes this by providing exact, targeted symbol subgraphs:
 
 ## How it works
 
-On activation, CodeLens Graph silently indexes your entire codebase into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and package dependencies (entry points, signatures, and version details from `node_modules`). It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
+Once VS Code has finished starting up (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and package dependencies (entry points, signatures, and version details from `node_modules`). It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
 
 The key insight: instead of the agent reading 5–10 files to orient itself, it calls one MCP tool and gets back only the relevant symbols, snippets, and relationships for the current task.
 
@@ -77,7 +77,7 @@ Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
 CodeLens Graph features an automatic configuration engine that sets up MCP settings and inserts mandatory search rules for your favorite AI assistants:
 
 1. **Automatic Setup (Recommended):**
-   Upon initial scan or by running the `CodeLens: Regenerate AI Agent Skill Files` command, the extension will prompt you to select your target IDEs/assistants:
+   When the first index finishes, CodeLens offers a one-time setup (**Choose Agents… / Not Now / Don't Ask Again**). Nothing outside `.codelens/` is written until you choose. You can also run the `CodeLens: Regenerate AI Agent Skill Files` command at any time to select your target IDEs/assistants:
    - **VS Code (Copilot / Trae)**: Writes MCP server configuration to `.vscode/mcp.json` and instruction rules to `.vscode/codelens.instructions.md`.
    - **Cursor**: Writes instruction rules to `.cursor/rules/codelens.mdc`.
    - **Antigravity**: Integrates instruction rules into `.agents/AGENTS.md`.
@@ -162,7 +162,7 @@ src/
 The graph database is stored at `.codelens/codelens-graph.db` inside your project workspace. This ensures:
 - The VS Code extension and MCP server share the same database
 - No external directory permission prompts for the agent
-- The DB is gitignored automatically
+- The DB is gitignored automatically (via `.codelens/.gitignore` — your root `.gitignore` is not modified)
 
 ---
 

@@ -37,6 +37,12 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "CodeLens Graph only indexes the workspace and writes agent configuration files once the workspace is trusted."
+    }
+  },
   "main": "./dist/extension.js",
   "scripts": {
     "compile": "node esbuild.js",
@@ -208,6 +214,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "d3": "^7.9.0",
     "sql.js": "^1.11.0",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6",

@@ -5,7 +5,11 @@ import * as fs from 'fs';
 import {
   GraphNode, GraphEdge, GraphSnapshot, GraphStats, NodeType, EdgeType, CallReference
 } from '../types';
-import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
+import {
+  isConfigPath, isNodeModulePath, matchPathFilter, compileSearchRegex, regexTestCapped
+} from '../utils';
+
+const SEARCH_TIME_BUDGET_MS = 3000;
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -82,6 +86,12 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_call_refs_from   ON call_refs(from_id);
   CREATE INDEX IF NOT EXISTS idx_call_refs_symbol ON call_refs(symbol_name);
   CREATE INDEX IF NOT EXISTS idx_file_lines_file  ON file_lines(file_id);
+  CREATE INDEX IF NOT EXISTS idx_call_refs_file   ON call_refs(file_path);
+
+  CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+  );
 `;
 
 export interface FileLine {
@@ -89,6 +99,56 @@ export interface FileLine {
   line: number;
   rawText: string;
   tokenType: string;
+}
+
+// ─── Relationship resolution helpers ─────────────────────────────────────────
+
+const IMPORT_EXTENSIONS = ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt'];
+
+// Upper bound for primary-key prefix range scans (largest code point sorts last in UTF-8).
+const MAX_CODE_POINT = String.fromCodePoint(0x10ffff);
+
+// A full resolve can take seconds on large workspaces; it commits and hands
+// the shared extension-host thread back this often.
+const RESOLVE_YIELD_INTERVAL_MS = 25;
+const yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
+
+type Statement = import('sql.js').Statement;
+
+// Per-resolve-pass memoization; the graph does not change while a pass runs.
+interface ResolveCache {
+  importPaths:  Map<string, string | null>;
+  nodesByName:  Map<string, GraphNode[]>;
+  nodesByFile:  Map<string, GraphNode[]>;
+  wordPatterns: Map<string, RegExp>;
+}
+
+// The path an import source points at, before trying extensions / index files.
+function importBase(importerPath: string, source: string): string | null {
+  if (!source) { return null; }
+  const importerDir = path.dirname(importerPath);
+  if (source.startsWith('.')) { return path.resolve(importerDir, source); }
+  if (source.includes('.') && !source.includes('/') && !source.includes('\\')) {
+    return path.resolve(importerDir, source.replace(/\./g, path.sep));
+  }
+  return null;
+}
+
+// Every import base that could resolve to filePath (inverse of resolveImportPath).
+function importBasesFor(filePath: string): string[] {
+  const bases = [filePath];
+  const ext = path.extname(filePath);
+  if (IMPORT_EXTENSIONS.includes(ext)) {
+    bases.push(filePath.slice(0, -ext.length));
+    if (path.basename(filePath, ext) === 'index') { bases.push(path.dirname(filePath)); }
+  }
+  if (path.basename(filePath) === '__init__.py') { bases.push(path.dirname(filePath)); }
+  return bases;
+}
+
+function pathKey(p: string): string {
+  const normalized = path.normalize(p);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
 // ─── GraphDB ──────────────────────────────────────────────────────────────────
@@ -99,6 +159,22 @@ export class GraphDB {
   private SQL!: any;
   private fileVersion = '';
   private dirty = false;
+  // Relationship (call/import edge) freshness. Graph writes set writesSinceResolve;
+  // an incremental resolve clears it for the files it covered. fullResolvePending is
+  // persisted in `meta` so a scan interrupted after an intermediate persist is fully
+  // resolved on the next startup, even though its files then look unchanged.
+  private writesSinceResolve = false;
+  private fullResolvePending = false;
+  private resolveTransactionOpen = false;
+  // Stats queries scan every node and edge; they are cached until the next
+  // write (writeCount) or reload from disk (version).
+  private writeCount = 0;
+  private undefinedRefCount: { key: string; count: number } | null = null;
+  private statsCache: { key: string; stats: Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> } | null = null;
+
+  private cacheKey(scope: string): string {
+    return `${scope}:${this.version}:${this.writeCount}`;
+  }
   private initPromise: Promise<void> | null = null;
   private version = 0;
 
@@ -112,6 +188,13 @@ export class GraphDB {
 
   getVersion(): number {
     return this.version;
+  }
+
+  // The DB lives at <workspace>/.codelens/, so the workspace is two levels up.
+  // Returns null for a DB stored elsewhere (e.g. global storage, no folder open).
+  getWorkspaceRoot(): string | null {
+    const storageDir = path.dirname(this.dbPath);
+    return path.basename(storageDir) === '.codelens' ? path.dirname(storageDir) : null;
   }
 
   async init(): Promise<void> {
@@ -131,8 +214,12 @@ export class GraphDB {
       });
       if (fs.existsSync(this.dbPath)) {
         try {
+          // Record which on-disk version was loaded (stat before read), so the
+          // first refreshFromDiskIfChanged() doesn't reload the whole file again.
+          const loadedVersion = this.getFileVersion();
           const data = fs.readFileSync(this.dbPath);
           this.db = new this.SQL.Database(data);
+          this.fileVersion = loadedVersion;
 
           // Schema validation: if file_lines does not exist OR text_index exists, trigger a rebuild for optimization
           // Schema validation: trigger a rebuild if file_lines or files does not exist,
@@ -172,6 +259,7 @@ export class GraphDB {
       }
       this.db.run(SCHEMA);
       this.runMigrations();
+      this.loadMeta();
       this.version++;
       // DO NOT call this.persist() on init — avoid redundant slow write when no changes were made.
     })();
@@ -198,9 +286,35 @@ export class GraphDB {
     }
   }
 
+  private loadMeta(): void {
+    const value = this.db.exec(`SELECT value FROM meta WHERE key = 'relationships_stale'`)[0]?.values[0]?.[0];
+    if (value === undefined) {
+      // DB written by a version without this flag: resolve once if it has data.
+      const count = this.db.exec('SELECT COUNT(*) FROM nodes')[0]?.values[0]?.[0] ?? 0;
+      this.fullResolvePending = Number(count) > 0;
+    } else {
+      this.fullResolvePending = value === '1';
+    }
+    this.writesSinceResolve = false;
+  }
+
+  needsRelationshipResolve(): boolean {
+    return this.fullResolvePending || this.writesSinceResolve;
+  }
+
   persist(): void {
+    this.db.run(
+      `INSERT OR REPLACE INTO meta (key, value) VALUES ('relationships_stale', ?)`,
+      [this.needsRelationshipResolve() ? '1' : '0']
+    );
     const data = this.db.export();
-    fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
+    const storageDir = path.dirname(this.dbPath);
+    fs.mkdirSync(storageDir, { recursive: true });
+    // Keep the index out of git without editing the user's root .gitignore.
+    const nestedIgnore = path.join(storageDir, '.gitignore');
+    if (path.basename(storageDir) === '.codelens' && !fs.existsSync(nestedIgnore)) {
+      try { fs.writeFileSync(nestedIgnore, '*\n', 'utf-8'); } catch { /* best effort */ }
+    }
     fs.writeFileSync(this.dbPath, data);
     this.dirty = false;
     this.fileVersion = this.getFileVersion();
@@ -209,6 +323,12 @@ export class GraphDB {
 
   close(): void {
     if (this.db) {
+      if (this.resolveTransactionOpen) {
+        // Closing during a yielded resolve: drop the open chunk. The relationship
+        // flags stay set, so the next startup resolves again.
+        try { this.db.run('ROLLBACK'); } catch { /* ignore */ }
+        this.resolveTransactionOpen = false;
+      }
       if (this.dirty) {
         try { this.persist(); } catch {}
       }
@@ -236,6 +356,7 @@ export class GraphDB {
       this.db.close();
       this.db = replacement;
       this.db.run(SCHEMA);
+      this.loadMeta();
       this.fileVersion = currentVersion;
       this.version++;
       return true;
@@ -260,12 +381,14 @@ export class GraphDB {
     }
     this.refreshFromDiskIfChanged();
     this.dirty = true;
+    this.writeCount++;
   }
 
   // ── Node operations ───────────────────────────────────────────────────────
 
   upsertNode(node: GraphNode): void {
     this.prepareWrite();
+    this.writesSinceResolve = true;
     this.db.run(`
       INSERT INTO nodes
         (id,type,name,file_path,line,end_line,language,signature,return_type,
@@ -330,6 +453,39 @@ export class GraphDB {
   }
 
   // Nodes that have undefined references — pre-diagnosed issues
+  // Same count as getNodesWithUndefinedRefs('workspace').length, but reads only
+  // the two columns it needs and is cached until the graph next changes on disk.
+  // The stats panel asks for it after every update.
+  countNodesWithUndefinedRefs(): number {
+    this.refreshFromDiskIfChanged();
+    const key = this.cacheKey('undefined-refs');
+    if (this.undefinedRefCount?.key === key) { return this.undefinedRefCount.count; }
+
+    const definedNames = new Set<string>();
+    const defined = this.db.prepare(`SELECT DISTINCT name FROM nodes WHERE type NOT IN ('file', 'import')`);
+    while (defined.step()) {
+      const name = defined.get()[0];
+      if (name) { definedNames.add(String(name).trim()); }
+    }
+    defined.free();
+
+    let count = 0;
+    const stmt = this.db.prepare(
+      `SELECT file_path, undefined_refs FROM nodes WHERE undefined_refs IS NOT NULL AND undefined_refs != '[]'`
+    );
+    while (stmt.step()) {
+      const [filePath, refsJson] = stmt.get() as [string, string];
+      if (isNodeModulePath(filePath) || isConfigPath(filePath)) { continue; }
+      let refs: unknown;
+      try { refs = JSON.parse(refsJson); } catch { continue; }
+      if (Array.isArray(refs) && refs.some(ref => !definedNames.has(ref))) { count++; }
+    }
+    stmt.free();
+
+    this.undefinedRefCount = { key, count };
+    return count;
+  }
+
   getNodesWithUndefinedRefs(scope: 'workspace' | 'all' = 'workspace'): GraphNode[] {
     this.refreshFromDiskIfChanged();
 
@@ -438,16 +594,20 @@ export class GraphDB {
     return results;
   }
 
-  deleteNodesByFile(filePath: string): void {
+  // Returns whether the file had any nodes. Only then are relationships marked
+  // stale — re-parsing an empty file must not force a full resolve.
+  deleteNodesByFile(filePath: string): boolean {
     this.prepareWrite();
     // Delete edges referencing nodes in this file first (no FK cascade in sql.js)
     const nodes = this.getNodesByFile(filePath);
+    if (nodes.length) { this.writesSinceResolve = true; }
     for (const n of nodes) {
       this.db.run('DELETE FROM edges WHERE from_id = ? OR to_id = ?', [n.id, n.id]);
       this.db.run('DELETE FROM call_refs WHERE from_id = ?', [n.id]);
     }
     this.db.run('DELETE FROM nodes WHERE file_path = ?', [filePath]);
     this.deleteTextEntriesByFile(filePath);
+    return nodes.length > 0;
   }
 
   getAllFiles(scope: 'workspace' | 'deps' | 'all' = 'workspace'): string[] {
@@ -476,6 +636,7 @@ export class GraphDB {
 
   upsertEdge(edge: GraphEdge): void {
     this.prepareWrite();
+    this.writesSinceResolve = true;
     this.db.run(`INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)`, [
       edge.id, edge.fromId, edge.toId, edge.type,
       edge.metadata ? JSON.stringify(edge.metadata) : null,
@@ -587,7 +748,18 @@ export class GraphDB {
 
   getStats(scope: 'workspace' | 'all' = 'workspace'): Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> {
     this.refreshFromDiskIfChanged();
-    
+    const key = this.cacheKey('stats:' + scope);
+    if (this.statsCache?.key === key) {
+      const cached = this.statsCache.stats;
+      return { ...cached, byType: { ...cached.byType } };
+    }
+    const stats = this.computeStats(scope);
+    this.statsCache = { key, stats: { ...stats, byType: { ...stats.byType } } };
+    return stats;
+  }
+
+  private computeStats(scope: 'workspace' | 'all'): Omit<GraphStats, 'lastBuilt' | 'buildDurationMs'> {
+
     if (scope === 'all') {
       const totalNodes = (this.db.exec('SELECT COUNT(*) FROM nodes')[0]?.values[0][0] ?? 0) as number;
       const totalEdges = (this.db.exec('SELECT COUNT(*) FROM edges')[0]?.values[0][0] ?? 0) as number;
@@ -603,6 +775,7 @@ export class GraphDB {
     const wsFiles = this.getAllFiles('workspace');
     const wsFilesSet = new Set(wsFiles);
 
+    // get() returns a row array; getAsObject() would allocate an object per row.
     const stmt = this.db.prepare('SELECT id, type, file_path FROM nodes');
     let totalNodes = 0;
     let fileCount = 0;
@@ -610,11 +783,7 @@ export class GraphDB {
     const wsNodeIds = new Set<string>();
 
     while (stmt.step()) {
-      const row = stmt.getAsObject();
-      const fp = row['file_path'] as string;
-      const id = row['id'] as string;
-      const type = row['type'] as string;
-
+      const [id, type, fp] = stmt.get() as [string, string, string];
       if (wsFilesSet.has(fp)) {
         wsNodeIds.add(id);
         totalNodes++;
@@ -629,9 +798,7 @@ export class GraphDB {
     const edgeStmt = this.db.prepare('SELECT from_id, to_id FROM edges');
     let totalEdges = 0;
     while (edgeStmt.step()) {
-      const row = edgeStmt.getAsObject();
-      const fromId = row['from_id'] as string;
-      const toId = row['to_id'] as string;
+      const [fromId, toId] = edgeStmt.get() as [string, string];
       if (wsNodeIds.has(fromId) && wsNodeIds.has(toId)) {
         totalEdges++;
       }
@@ -646,6 +813,7 @@ export class GraphDB {
   upsertCallRefs(refs: CallReference[]): void {
     if (!refs.length) { return; }
     this.prepareWrite();
+    this.writesSinceResolve = true;
     this.db.run('BEGIN');
     try {
       for (const ref of refs) {
@@ -662,27 +830,129 @@ export class GraphDB {
     }
   }
 
-  resolveWorkspaceRelationships(changedFilePath?: string, changedSymbols: string[] = []): void {
+  // Re-resolves call and import edges. With no argument everything is rebuilt.
+  // With changed files (one or a batch) only edges that could have changed are
+  // touched: call refs in those files or naming the given symbols, and imports
+  // in those files or whose source path points at one of them.
+  async resolveWorkspaceRelationships(changedFilePaths?: string | string[], changedSymbols: string[] = []): Promise<void> {
     this.prepareWrite();
-    const fullResolve = !changedFilePath;
-    if (fullResolve) {
-      this.db.run(`DELETE FROM edges WHERE type = 'calls'`);
-    }
-    this.db.run(`DELETE FROM edges WHERE id LIKE 'resolved-import::%'`);
+    const changedFiles = changedFilePaths === undefined
+      ? null
+      : (Array.isArray(changedFilePaths) ? changedFilePaths : [changedFilePaths]);
+    const fullResolve = changedFiles === null;
+    const cache: ResolveCache = {
+      importPaths: new Map(), nodesByName: new Map(), nodesByFile: new Map(), wordPatterns: new Map(),
+    };
 
-    const fileNodes = this.getNodesByType('file');
-    const filesByPath = new Map(fileNodes.map(node => [path.normalize(node.filePath), node]));
+    // Work is committed in chunks so the event loop can run in between.
+    // Each chunk also invalidates cached stats (edge inserts skip prepareWrite).
+    const begin = () => { this.db.run('BEGIN'); this.resolveTransactionOpen = true; this.writeCount++; };
+    const commit = () => { this.db.run('COMMIT'); this.resolveTransactionOpen = false; this.writeCount++; };
+    let lastYield = Date.now();
+    const maybeYield = async () => {
+      if (Date.now() - lastYield < RESOLVE_YIELD_INTERVAL_MS) { return; }
+      commit();
+      await yieldToEventLoop();
+      if (!this.db) { throw new Error('Database closed during relationship resolve'); }
+      begin();
+      lastYield = Date.now();
+    };
+
+    const statements: Statement[] = [];
+    const prepare = (sql: string) => { const stmt = this.db.prepare(sql); statements.push(stmt); return stmt; };
+
+    begin();
+    try {
+      const insertEdge = prepare('INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)');
+      const deleteEdgeRange = prepare('DELETE FROM edges WHERE id >= ? AND id < ?');
+      // A call reference has at most one resolved edge. Search by primary-key
+      // range; '+type' keeps SQLite from choosing the far less selective type
+      // index instead (2.7ms vs 0.05ms per delete on a 1k-file workspace).
+      const deleteCallEdges = prepare(`DELETE FROM edges WHERE id >= ? AND id < ? AND +type = 'calls'`);
+
+      if (fullResolve) {
+        this.db.run(`DELETE FROM edges WHERE type = 'calls'`);
+      }
+
+      const fileNodes = this.getNodesByType('file');
+      const filesByPath = new Map(fileNodes.map(node => [path.normalize(node.filePath), node]));
+      const importsByFile = this.getWorkspaceImportsByFile();
+
+      await this.resolveImportEdges(filesByPath, importsByFile, changedFiles, cache, insertEdge, deleteEdgeRange, maybeYield);
+
+      for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols)) {
+        await maybeYield();
+        if (!fullResolve) {
+          const edgePrefix = `${ref.id}::resolved::`;
+          deleteCallEdges.run([edgePrefix, edgePrefix + MAX_CODE_POINT]);
+        }
+        const target = this.resolveCallTarget(ref, importsByFile, cache);
+        if (!target || target.id === ref.fromId) { continue; }
+
+        const edge: GraphEdge = {
+          id: `${ref.id}::resolved::${target.id}`,
+          fromId: ref.fromId,
+          toId: target.id,
+          type: 'calls',
+          metadata: {
+            symbolName: ref.symbolName,
+            resolution: target.filePath === ref.filePath ? 'same-file' : 'workspace',
+          },
+        };
+        insertEdge.run([edge.id, edge.fromId, edge.toId, edge.type, JSON.stringify(edge.metadata)]);
+      }
+      commit();
+    } catch (e) {
+      if (this.resolveTransactionOpen) {
+        try { this.db.run('ROLLBACK'); } catch { /* connection may be gone */ }
+        this.resolveTransactionOpen = false;
+      }
+      throw e;
+    } finally {
+      for (const stmt of statements) { try { stmt.free(); } catch { /* already freed by close */ } }
+    }
+
+    this.writesSinceResolve = false;
+    if (fullResolve) { this.fullResolvePending = false; }
+  }
+
+  // Import nodes of workspace files (not deps/configs), keyed by file path.
+  private getWorkspaceImportsByFile(): Map<string, GraphNode[]> {
+    const workspaceFiles = new Set(this.getAllFiles());
     const importsByFile = new Map<string, GraphNode[]>();
-    for (const filePath of this.getAllFiles()) {
-      importsByFile.set(
-        filePath,
-        this.getNodesByFile(filePath).filter(node => node.type === 'import')
-      );
+    for (const filePath of workspaceFiles) { importsByFile.set(filePath, []); }
+    const stmt = this.db.prepare(`SELECT * FROM nodes WHERE type = 'import' ORDER BY file_path, line, rowid`);
+    while (stmt.step()) {
+      const node = this.rowToNode(stmt.getAsObject());
+      importsByFile.get(node.filePath)?.push(node);
     }
+    stmt.free();
+    return importsByFile;
+  }
 
-    this.resolveImportEdges(filesByPath, importsByFile);
+  private getAffectedCallRefs(changedFiles: string[] | null, changedSymbols: string[]): CallReference[] {
+    let sql = 'SELECT * FROM call_refs';
+    let params: string[] = [];
+    if (changedFiles !== null) {
+      const fileParams = [...new Set(changedFiles)];
+      const symbolParams = [...new Set(changedSymbols)];
+      if (!fileParams.length && !symbolParams.length) { return []; }
+      // SQLite caps bound parameters; very large batches fall back to a filtered scan.
+      if (fileParams.length + symbolParams.length <= 900) {
+        const conditions: string[] = [];
+        if (fileParams.length) { conditions.push(`file_path IN (${fileParams.map(() => '?').join(',')})`); }
+        if (symbolParams.length) { conditions.push(`symbol_name IN (${symbolParams.map(() => '?').join(',')})`); }
+        sql += ' WHERE ' + conditions.join(' OR ');
+        params = [...fileParams, ...symbolParams];
+      }
+    }
+    sql += ' ORDER BY file_path, line';
 
-    const stmt = this.db.prepare('SELECT * FROM call_refs ORDER BY file_path, line');
+    const fileSet = changedFiles ? new Set(changedFiles) : null;
+    const symbolSet = new Set(changedSymbols);
+    const refs: CallReference[] = [];
+    const stmt = this.db.prepare(sql);
+    if (params.length) { stmt.bind(params); }
     while (stmt.step()) {
       const row = stmt.getAsObject();
       const ref: CallReference = {
@@ -693,65 +963,37 @@ export class GraphDB {
         qualifier: row['qualifier'] as string | undefined,
         line: row['line'] as number,
       };
-      const isAffected = fullResolve
-        || ref.filePath === changedFilePath
-        || changedSymbols.includes(ref.symbolName);
-      if (!isAffected) { continue; }
-
-      // A call reference has at most one resolved edge. Remove its previous
-      // resolution before selecting the best current target.
-      const edgePrefix = `${ref.id}::resolved::`;
-      this.db.run(
-        `DELETE FROM edges WHERE type = 'calls' AND substr(id, 1, length(?)) = ?`,
-        [edgePrefix, edgePrefix]
-      );
-      const target = this.resolveCallTarget(ref, importsByFile);
-      if (!target || target.id === ref.fromId) { continue; }
-
-      const edge: GraphEdge = {
-        id: `${ref.id}::resolved::${target.id}`,
-        fromId: ref.fromId,
-        toId: target.id,
-        type: 'calls',
-        metadata: {
-          symbolName: ref.symbolName,
-          resolution: target.filePath === ref.filePath ? 'same-file' : 'workspace',
-        },
-      };
-      this.db.run(
-        'INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)',
-        [edge.id, edge.fromId, edge.toId, edge.type, JSON.stringify(edge.metadata)]
-      );
+      if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)) { continue; }
+      refs.push(ref);
     }
     stmt.free();
+    return refs;
   }
 
   private resolveCallTarget(
     ref: CallReference,
-    importsByFile: Map<string, GraphNode[]>
+    importsByFile: Map<string, GraphNode[]>,
+    cache: ResolveCache
   ): GraphNode | null {
     const importNodes = importsByFile.get(ref.filePath) ?? [];
     const importedFiles = new Set<string>();
     const candidateNames = new Set<string>([ref.symbolName]);
     for (const importNode of importNodes) {
       const signature = importNode.signature ?? '';
-      const mentionsTarget = this.containsWord(signature, ref.symbolName)
-        || (!!ref.qualifier && this.containsWord(signature, ref.qualifier));
+      const mentionsTarget = this.wordPattern(ref.symbolName, cache).test(signature)
+        || (!!ref.qualifier && this.wordPattern(ref.qualifier, cache).test(signature));
       if (!mentionsTarget) { continue; }
 
-      const aliasPattern = new RegExp(
-        `\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${this.escapeRegExp(ref.symbolName)}\\b`
-      );
-      const aliasMatch = aliasPattern.exec(signature);
+      const aliasMatch = this.aliasPattern(ref.symbolName, cache).exec(signature);
       if (aliasMatch) { candidateNames.add(aliasMatch[1]); }
 
-      const resolved = this.resolveImportPath(ref.filePath, importNode.name);
+      const resolved = this.resolveImportPath(ref.filePath, importNode.name, cache);
       if (resolved) { importedFiles.add(path.normalize(resolved)); }
     }
 
     const candidatesById = new Map<string, GraphNode>();
     for (const name of candidateNames) {
-      for (const node of this.getNodesByExactName(name)) {
+      for (const node of this.getNodesByExactNameCached(name, cache)) {
         if (node.type !== 'file' && node.type !== 'import') {
           candidatesById.set(node.id, node);
         }
@@ -761,7 +1003,12 @@ export class GraphDB {
     // A default import may intentionally use a different local name.
     if (!candidatesById.size && importedFiles.size) {
       for (const importedFile of importedFiles) {
-        for (const node of this.getNodesByFile(importedFile)) {
+        let fileNodes = cache.nodesByFile.get(importedFile);
+        if (!fileNodes) {
+          fileNodes = this.getNodesByFile(importedFile);
+          cache.nodesByFile.set(importedFile, fileNodes);
+        }
+        for (const node of fileNodes) {
           if (node.modifiers?.includes('default')) {
             candidatesById.set(node.id, node);
           }
@@ -785,16 +1032,51 @@ export class GraphDB {
     return null;
   }
 
-  private resolveImportEdges(
+  private async resolveImportEdges(
     filesByPath: Map<string, GraphNode>,
-    importsByFile: Map<string, GraphNode[]>
-  ): void {
-    for (const [importerPath, importNodes] of importsByFile) {
+    importsByFile: Map<string, GraphNode[]>,
+    changedFiles: string[] | null,
+    cache: ResolveCache,
+    insertEdge: Statement,
+    deleteEdgeRange: Statement,
+    maybeYield: () => Promise<void>
+  ): Promise<void> {
+    let importers: Iterable<[string, GraphNode[]]>;
+    if (changedFiles === null) {
+      this.db.run(`DELETE FROM edges WHERE id LIKE 'resolved-import::%'`);
+      importers = importsByFile;
+    } else {
+      // Re-resolve importers that changed, plus importers whose import source
+      // points at a changed path (a created/deleted file can change their target).
+      const changedBases = new Set<string>();
+      for (const filePath of changedFiles) {
+        for (const base of importBasesFor(filePath)) { changedBases.add(pathKey(base)); }
+      }
+      const changedSet = new Set(changedFiles.map(pathKey));
+      const selected: Array<[string, GraphNode[]]> = [];
+      for (const [importerPath, importNodes] of importsByFile) {
+        const affected = changedSet.has(pathKey(importerPath)) || importNodes.some(node => {
+          const base = importBase(importerPath, node.name);
+          return base !== null && changedBases.has(pathKey(base));
+        });
+        if (!affected) { continue; }
+        const importer = filesByPath.get(path.normalize(importerPath));
+        if (importer) {
+          const prefix = `resolved-import::${importer.id}::`;
+          deleteEdgeRange.run([prefix, prefix + MAX_CODE_POINT]);
+        }
+        selected.push([importerPath, importNodes]);
+      }
+      importers = selected;
+    }
+
+    for (const [importerPath, importNodes] of importers) {
+      await maybeYield();
       const importer = filesByPath.get(path.normalize(importerPath));
       if (!importer) { continue; }
 
       for (const importNode of importNodes) {
-        const targetPath = this.resolveImportPath(importerPath, importNode.name);
+        const targetPath = this.resolveImportPath(importerPath, importNode.name, cache);
         if (!targetPath) { continue; }
         const target = filesByPath.get(path.normalize(targetPath));
         if (!target) { continue; }
@@ -808,55 +1090,70 @@ export class GraphDB {
           edgeType = 'peer-dependency';
         }
 
-        this.db.run(
-          'INSERT OR REPLACE INTO edges (id,from_id,to_id,type,metadata) VALUES (?,?,?,?,?)',
-          [
-            `resolved-import::${importer.id}::${target.id}`,
-            importer.id,
-            target.id,
-            edgeType,
-            JSON.stringify({ source: importNode.name, resolution: 'workspace' }),
-          ]
-        );
+        insertEdge.run([
+          `resolved-import::${importer.id}::${target.id}`,
+          importer.id,
+          target.id,
+          edgeType,
+          JSON.stringify({ source: importNode.name, resolution: 'workspace' }),
+        ]);
       }
     }
   }
 
-  private resolveImportPath(importerPath: string, source: string): string | null {
-    if (!source) { return null; }
-    const importerDir = path.dirname(importerPath);
-    let base: string;
+  // Each lookup probes up to ~34 candidate paths on disk, so results are
+  // cached per resolve pass (keyed by importer directory + source).
+  private resolveImportPath(importerPath: string, source: string, cache: ResolveCache): string | null {
+    const key = path.dirname(importerPath) + '\0' + source;
+    const cached = cache.importPaths.get(key);
+    if (cached !== undefined) { return cached; }
 
-    if (source.startsWith('.')) {
-      base = path.resolve(importerDir, source);
-    } else if (source.includes('.') && !source.includes('/') && !source.includes('\\')) {
-      base = path.resolve(importerDir, source.replace(/\./g, path.sep));
-    } else {
-      return null;
+    const base = importBase(importerPath, source);
+    let resolved: string | null = null;
+    if (base !== null) {
+      const candidates = [
+        base,
+        ...IMPORT_EXTENSIONS.map(ext => base + ext),
+        ...IMPORT_EXTENSIONS.map(ext => path.join(base, `index${ext}`)),
+        path.join(base, '__init__.py'),
+      ];
+      resolved = candidates.find(candidate => fs.existsSync(candidate)) ?? null;
     }
-
-    const extensions = ['.ts','.tsx','.js','.jsx','.mjs','.py','.go','.rs','.java','.cs','.cpp','.c','.rb','.php','.swift','.kt'];
-    const candidates = [
-      base,
-      ...extensions.map(ext => base + ext),
-      ...extensions.map(ext => path.join(base, `index${ext}`)),
-      path.join(base, '__init__.py'),
-    ];
-    return candidates.find(candidate => fs.existsSync(candidate)) ?? null;
+    cache.importPaths.set(key, resolved);
+    return resolved;
   }
 
-  private getNodesByExactName(name: string): GraphNode[] {
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE name = ? ORDER BY file_path, line');
-    stmt.bind([name]);
-    const results: GraphNode[] = [];
-    while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free();
-    return results;
+  private getNodesByExactNameCached(name: string, cache: ResolveCache): GraphNode[] {
+    let nodes = cache.nodesByName.get(name);
+    if (!nodes) {
+      const stmt = this.db.prepare('SELECT * FROM nodes WHERE name = ? ORDER BY file_path, line');
+      stmt.bind([name]);
+      nodes = [];
+      while (stmt.step()) { nodes.push(this.rowToNode(stmt.getAsObject())); }
+      stmt.free();
+      cache.nodesByName.set(name, nodes);
+    }
+    return nodes;
   }
 
-  private containsWord(text: string, word: string): boolean {
-    const escaped = this.escapeRegExp(word);
-    return new RegExp(`\\b${escaped}\\b`).test(text);
+  private wordPattern(word: string, cache: ResolveCache): RegExp {
+    const key = 'w:' + word;
+    let pattern = cache.wordPatterns.get(key);
+    if (!pattern) {
+      pattern = new RegExp(`\\b${this.escapeRegExp(word)}\\b`);
+      cache.wordPatterns.set(key, pattern);
+    }
+    return pattern;
+  }
+
+  private aliasPattern(symbolName: string, cache: ResolveCache): RegExp {
+    const key = 'a:' + symbolName;
+    let pattern = cache.wordPatterns.get(key);
+    if (!pattern) {
+      pattern = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${this.escapeRegExp(symbolName)}\\b`);
+      cache.wordPatterns.set(key, pattern);
+    }
+    return pattern;
   }
 
   private escapeRegExp(value: string): string {
@@ -999,20 +1296,19 @@ export class GraphDB {
   ): Array<{ filePath: string; line: number; rawText: string; type: string }> {
     this.refreshFromDiskIfChanged();
 
-    const isRegex = /[|*?+{}()[\]^$\\&]/.test(normalizedQuery);
-    let regex: RegExp | null = null;
-    if (isRegex) {
-      try {
-        regex = new RegExp(normalizedQuery, 'i');
-      } catch {}
-    }
+    const { regex } = compileSearchRegex(normalizedQuery);
 
     const matchesQuery = (lineText: string) => {
       if (regex) {
-        return regex.test(lineText);
+        return regexTestCapped(regex, lineText);
       }
       return lineText.toLowerCase().includes(normalizedQuery.toLowerCase());
     };
+
+    // Regex scans can't use the LIKE pre-filter, so bound total scan time and
+    // return what was found rather than stalling the MCP server.
+    const deadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+    let scanned = 0;
 
     let sql = `
       SELECT f.path AS file_path, l.line, l.raw_text, l.token_type
@@ -1033,6 +1329,7 @@ export class GraphDB {
 
     const results = [];
     while (stmt.step()) {
+      if (++scanned % 500 === 0 && Date.now() > deadline) { break; }
       const row = stmt.getAsObject();
       const rawText = row.raw_text as string;
       const filePath = row.file_path as string;
