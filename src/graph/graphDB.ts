@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import {
   GraphNode, GraphEdge, GraphSnapshot, GraphStats, NodeType, EdgeType, CallReference
 } from '../types';
+import { PackageInfo } from '../ingestion/dependencyManifest';
 import {
   isConfigPath, isNodeModulePath, matchPathFilter, compileSearchRegex, regexTestCapped
 } from '../utils';
@@ -91,6 +92,21 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+  );
+
+  -- Direct dependencies declared by workspace package.json files (see
+  -- dependencyManifest.ts). Paths are workspace-relative.
+  CREATE TABLE IF NOT EXISTS packages (
+    name           TEXT PRIMARY KEY,
+    declared_range TEXT,
+    kind           TEXT,
+    declared_in    TEXT,
+    installed      INTEGER NOT NULL,
+    version        TEXT,
+    dir            TEXT,
+    types          TEXT,
+    main           TEXT,
+    readme         TEXT
   );
 `;
 
@@ -571,27 +587,93 @@ export class GraphDB {
     `;
     bindParams.push(tokens[0], `${tokens[0]}%`);
 
+    // The config-file filter below runs in JS, so the limit is applied after
+    // it — otherwise config files could use up the limit and hide symbols.
     const sql = `
       SELECT * FROM nodes
       WHERE (${conditions.join(' OR ')})
       ${scopeSql}
       ${orderSql}
-      LIMIT ?
     `;
-    bindParams.push(limit);
+    const keep = (n: GraphNode) =>
+      scope === 'workspace' ? !isConfigPath(n.filePath)
+      : scope === 'deps' ? (isNodeModulePath(n.filePath) || isConfigPath(n.filePath))
+      : true;
 
     const stmt = this.db.prepare(sql);
     stmt.bind(bindParams);
     const results: GraphNode[] = [];
-    while (stmt.step()) { results.push(this.rowToNode(stmt.getAsObject())); }
-    stmt.free();
-
-    if (scope === 'workspace') {
-      return results.filter(n => !isConfigPath(n.filePath));
-    } else if (scope === 'deps') {
-      return results.filter(n => isNodeModulePath(n.filePath) || isConfigPath(n.filePath));
+    while (results.length < limit && stmt.step()) {
+      const node = this.rowToNode(stmt.getAsObject());
+      if (keep(node)) { results.push(node); }
     }
+    stmt.free();
     return results;
+  }
+
+  // ── Dependency manifest ───────────────────────────────────────────────────
+
+  // Replaces the stored manifest. Returns false (and writes nothing) when it is
+  // unchanged, so refreshing it after every scan doesn't force a DB write.
+  replacePackages(packages: PackageInfo[]): boolean {
+    const root = this.getWorkspaceRoot();
+    const rel = (p: string | null) => (p && root ? path.relative(root, p).split(path.sep).join('/') : p);
+    const rows = packages.map(p => [
+      p.name, p.declaredRange, p.kind, JSON.stringify(p.declaredIn.map(rel)), p.installed ? 1 : 0,
+      p.version, rel(p.dir), rel(p.types), rel(p.main), rel(p.readme),
+    ]);
+    const current = this.db.exec('SELECT name, declared_range, kind, declared_in, installed, version, dir, types, main, readme FROM packages ORDER BY name')[0]?.values ?? [];
+    if (JSON.stringify(current) === JSON.stringify([...rows].sort((a, b) => String(a[0]).localeCompare(String(b[0]))))) {
+      return false;
+    }
+
+    this.prepareWrite();
+    this.db.run('BEGIN');
+    try {
+      this.db.run('DELETE FROM packages');
+      const insert = this.db.prepare('INSERT INTO packages VALUES (?,?,?,?,?,?,?,?,?,?)');
+      for (const row of rows) { insert.run(row as any[]); }
+      insert.free();
+      this.db.run('COMMIT');
+    } catch (e) {
+      this.db.run('ROLLBACK');
+      throw e;
+    }
+    return true;
+  }
+
+  getPackages(): PackageInfo[] {
+    this.refreshFromDiskIfChanged();
+    const root = this.getWorkspaceRoot();
+    const abs = (p: unknown) => (typeof p === 'string' && p ? (root ? path.join(root, p) : p) : null);
+    const res = this.db.exec('SELECT name, declared_range, kind, declared_in, installed, version, dir, types, main, readme FROM packages ORDER BY name');
+    return (res[0]?.values ?? []).map(r => ({
+      name: String(r[0]),
+      declaredRange: String(r[1] ?? ''),
+      kind: String(r[2]) as PackageInfo['kind'],
+      declaredIn: (JSON.parse(String(r[3] ?? '[]')) as string[]).map(p => abs(p) ?? p),
+      installed: r[4] === 1,
+      version: r[5] === null ? null : String(r[5]),
+      dir: abs(r[6]),
+      types: abs(r[7]),
+      main: abs(r[8]),
+      readme: abs(r[9]),
+    }));
+  }
+
+  // Workspace files with an import of the package (or one of its subpaths).
+  getFilesImporting(packageName: string): string[] {
+    this.refreshFromDiskIfChanged();
+    const stmt = this.db.prepare(
+      `SELECT DISTINCT file_path FROM nodes
+       WHERE type = 'import' AND (name = ? OR substr(name, 1, ?) = ?)
+       ORDER BY file_path`
+    );
+    stmt.bind([packageName, packageName.length + 1, packageName + '/']);
+    const files: string[] = [];
+    while (stmt.step()) { files.push(String(stmt.get()[0])); }
+    stmt.free();
+    return files;
   }
 
   // Returns whether the file had any nodes. Only then are relationships marked

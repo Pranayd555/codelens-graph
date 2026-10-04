@@ -46,29 +46,6 @@ export function isConfigPath(filePath: string): boolean {
   return false;
 }
 
-export function shouldIndexNodeModuleFile(filePath: string, indexDependencySymbols?: boolean): boolean {
-  const name = path.basename(filePath).toLowerCase();
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/node_modules/');
-  const afterNodeModules = parts[1] || '';
-  if (!afterNodeModules) return false;
-
-  // Always: package.json, readme.md
-  if (name === 'package.json' || name === 'readme.md') return true;
-
-  // .d.ts: only index.d.ts or types field entry points if indexDependencySymbols is enabled
-  if (name.endsWith('.d.ts') && indexDependencySymbols === true) {
-    const segs = afterNodeModules.split('/');
-    const isScoped = segs[0]?.startsWith('@');
-    const maxParts = isScoped ? 3 : 2; // e.g. @types/react/index.d.ts (3) vs lodash/index.d.ts (2)
-    if (segs.length <= maxParts) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 export function matchPathFilter(filePath: string, filter: string, workspaceRoot?: string): boolean {
   const normPath = filePath.replace(/\\/g, '/');
   const name = normPath.split('/').pop() || '';
@@ -98,36 +75,69 @@ export function matchPathFilter(filePath: string, filter: string, workspaceRoot?
     return literalMatch();
   }
 
-  let regexStr = p.replace(/[.+^$()|[\]\\]/g, '\\$&');
-
-  regexStr = regexStr.replace(/{([^}]+)}/g, (_, group) => {
-    return '(' + group.split(',').map((s: string) => s.trim()).join('|') + ')';
-  });
-
-  regexStr = regexStr
-    .replace(/\*\*\//g, '(?:.+/)?')
-    .replace(/\/\*\*/g, '(?:/.+)?')
-    .replace(/\*/g, '[^/]*')
-    .replace(/\?/g, '[^/]');
+  let regexStr = globToRegexSource(p);
 
   if (!p.startsWith('**')) {
     regexStr = '(?:^|/)' + regexStr;
   }
 
-  try {
-    const regex = new RegExp('^' + regexStr + '$', 'i');
-    if (regex.test(relPath)) { return true; }
-    
-    const relaxedRegex = new RegExp(regexStr + '$', 'i');
-    if (relaxedRegex.test(relPath) || relaxedRegex.test(normPath)) { return true; }
-    
-    const nameRegex = new RegExp('^' + regexStr + '$', 'i');
-    if (nameRegex.test(name)) { return true; }
-  } catch {
-    return literalMatch();
-  }
+  const compiled = compileGlob(regexStr);
+  if (!compiled) { return literalMatch(); }
+  return compiled.exact.test(relPath)
+    || compiled.suffix.test(relPath) || compiled.suffix.test(normPath)
+    || compiled.exact.test(name);
+}
 
-  return false;
+// Exclude checks run for every file event and every path segment, so compiled
+// patterns are cached. Bounded because MCP agents can also supply filters.
+const MAX_CACHED_GLOBS = 500;
+const globCache = new Map<string, { exact: RegExp; suffix: RegExp } | null>();
+
+function compileGlob(regexStr: string): { exact: RegExp; suffix: RegExp } | null {
+  let compiled = globCache.get(regexStr);
+  if (compiled === undefined) {
+    try {
+      compiled = { exact: new RegExp('^' + regexStr + '$', 'i'), suffix: new RegExp(regexStr + '$', 'i') };
+    } catch {
+      compiled = null;
+    }
+    if (globCache.size >= MAX_CACHED_GLOBS) { globCache.clear(); }
+    globCache.set(regexStr, compiled);
+  }
+  return compiled;
+}
+
+// Converts a glob to a regex source in a single pass, so wildcards and the
+// groups they expand to can't be rewritten by later steps.
+//   **/  any number of leading/intermediate directories (including none)
+//   **   anything, including '/'
+//   *    anything except '/'
+//   ?    one character except '/'
+//   {a,b} alternatives (may contain wildcards)
+function globToRegexSource(glob: string): string {
+  let out = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        if (glob[i + 2] === '/') { out += '(?:[^/]*/)*'; i += 2; }
+        else { out += '.*'; i += 1; }
+      } else {
+        out += '[^/]*';
+      }
+    } else if (c === '?') {
+      out += '[^/]';
+    } else if (c === '{') {
+      const end = glob.indexOf('}', i);
+      if (end === -1) { out += '\\{'; continue; }
+      const alternatives = glob.slice(i + 1, end).split(',').map(s => globToRegexSource(s.trim()));
+      out += '(?:' + alternatives.join('|') + ')';
+      i = end;
+    } else {
+      out += c.replace(/[.+^$()|[\]\\]/g, '\\$&');
+    }
+  }
+  return out;
 }
 
 // True when filePath resolves to a location inside rootPath. Symlinks are

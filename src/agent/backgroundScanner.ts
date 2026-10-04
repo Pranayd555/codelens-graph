@@ -2,8 +2,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { GraphDB }          from '../graph/graphDB';
 import { WorkspaceScanner, ScanOptions } from '../ingestion/workspaceScanner';
+import { IndexScope }       from '../ingestion/indexScope';
+import { readDependencyManifest } from '../ingestion/dependencyManifest';
 import { SkillGenerator }  from '../agent/skillGenerator';
 import { GraphStats }       from '../types';
+import { isNodeModulePath } from '../utils';
 
 // File-change events arrive in bursts (git checkout, format-on-save, codegen).
 // Events inside this window are applied as one batch: one relationship
@@ -13,10 +16,6 @@ const FILE_BATCH_DEBOUNCE_MS = 400;
 // How long to wait before regenerating skills after a file change.
 // Prevents thrashing on rapid saves.
 const SKILL_REGEN_DEBOUNCE_MS = 5_000;
-
-// Dependency (node_modules) indexing is lower priority than the workspace
-// itself, so it starts a little after the workspace pass finishes.
-const DEPS_SCAN_DELAY_MS = 2_000;
 
 // Long loops hand control back to the shared extension-host thread this often.
 const YIELD_INTERVAL_MS = 25;
@@ -28,19 +27,16 @@ type FileChange = 'change' | 'delete';
 
 // ─── BackgroundScanner ────────────────────────────────────────────────────────
 // Orchestrates indexing without blocking VS Code:
-//   1. Full scans (startup / manual), then a delayed dependency pass
+//   1. Full scans (startup / manual / scope change) that reconcile the graph
+//      with the selected folders, then a refresh of the dependency manifest
 //   2. Batched incremental updates from file-change events
 //   3. Skill file regeneration after changes settle
-// Scans and batches run one at a time through a single queue, so a batch
-// never interleaves with a scan writing the same DB.
+// Scans, batches and manifest refreshes run one at a time through a single
+// queue, so nothing interleaves writes to the same DB.
 
 export class BackgroundScanner {
   private work: Promise<unknown> = Promise.resolve();
   private queuedFullScan: Promise<GraphStats | null> | null = null;
-
-  private depsScan: Promise<void> = Promise.resolve();
-  private depsTimer: ReturnType<typeof setTimeout> | null = null;
-  private resolveDepsScan: (() => void) | null = null;
 
   private acceptingChanges = false;
   private pendingChanges = new Map<string, FileChange>();
@@ -74,7 +70,7 @@ export class BackgroundScanner {
     return run;
   }
 
-  // Resolves once no scan, batch, or dependency pass is running or pending.
+  // Resolves once no scan or batch is running or pending.
   async whenIdle(): Promise<void> {
     for (;;) {
       if (this.batchTimer || this.pendingChanges.size) {
@@ -82,21 +78,25 @@ export class BackgroundScanner {
         continue;
       }
       const work = this.work;
-      const deps = this.depsScan;
-      await Promise.all([work, deps]);
-      if (work === this.work && deps === this.depsScan && !this.batchTimer && !this.pendingChanges.size) {
-        return;
-      }
+      await work;
+      if (work === this.work && !this.batchTimer && !this.pendingChanges.size) { return; }
     }
   }
 
-  // ── Full scan + skill generation ───────────────────────────────────────────
-  // Scans the workspace (skipping unchanged files), then schedules the
-  // dependency pass. Concurrent non-forced requests share one queued scan.
+  // Number of files a full scan of this scope would index (walks the folders,
+  // parses nothing). Used to ask before indexing very large workspaces.
+  async countIndexableFiles(scope: IndexScope, options: ScanOptions): Promise<number> {
+    return (await this.scanner.listFiles(scope, options)).length;
+  }
 
-  runFullScan(workspaceRoot: string, options: ScanOptions): Promise<GraphStats | null> {
+  // ── Full scan + skill generation ───────────────────────────────────────────
+  // Reconciles the graph with the scope (unchanged files are skipped), then
+  // refreshes the dependency manifest. Concurrent non-forced requests share
+  // one queued scan.
+
+  runFullScan(scope: IndexScope, options: ScanOptions): Promise<GraphStats | null> {
     if (this.queuedFullScan && !options.force) { return this.queuedFullScan; }
-    const scan = this.enqueue(() => this.scanWorkspacePhase(workspaceRoot, options));
+    const scan = this.enqueue(() => this.scanPhase(scope, options));
     this.queuedFullScan = scan;
     void scan.finally(() => {
       if (this.queuedFullScan === scan) { this.queuedFullScan = null; }
@@ -104,13 +104,16 @@ export class BackgroundScanner {
     return scan;
   }
 
-  private async scanWorkspacePhase(workspaceRoot: string, options: ScanOptions): Promise<GraphStats | null> {
+  private async scanPhase(scope: IndexScope, options: ScanOptions): Promise<GraphStats | null> {
     if (this.disposed) { return null; }
     this.onStatusChange?.('scanning');
     try {
       await this.db.ensureInit();
-      console.log('[CodeLens] Workspace scan starting (excluding dependencies)…');
-      const result = await this.scanner.scanWorkspace([workspaceRoot], { ...options, excludeDeps: true });
+      const folders = scope.folders.length ? scope.folders.join(', ') : 'entire workspace';
+      console.log(`[CodeLens] Workspace scan starting (${folders})…`);
+      const result = await this.scanner.scanWorkspace(scope, options);
+      if (await this.refreshManifest(scope.workspaceRoot)) { this.db.persist(); }
+
       const stats: GraphStats = {
         ...this.db.getStats(),
         lastBuilt:       Date.now(),
@@ -122,10 +125,9 @@ export class BackgroundScanner {
         `${result.filesSkipped} unchanged, ${result.durationMs}ms.`
       );
 
-      await this.generateSkills(workspaceRoot, stats);
+      await this.generateSkills(scope.workspaceRoot, stats);
       this.onScanComplete?.(stats);
       this.onStatusChange?.('ready');
-      this.scheduleDependencyScan(workspaceRoot, options, stats.buildDurationMs);
       return stats;
     } catch (err) {
       console.error('[CodeLens] Background scan failed:', err);
@@ -134,47 +136,27 @@ export class BackgroundScanner {
     }
   }
 
-  private scheduleDependencyScan(workspaceRoot: string, options: ScanOptions, workspaceScanMs: number): void {
-    this.cancelDependencyScan();
-    this.depsScan = new Promise<void>(resolve => {
-      this.resolveDepsScan = resolve;
-      this.depsTimer = setTimeout(() => {
-        this.depsTimer = null;
-        this.enqueue(async () => {
-          if (this.disposed) { return; }
-          console.log('[CodeLens] Dependency scan starting…');
-          const depResult = await this.scanner.scanWorkspace([workspaceRoot], {
-            ...options,
-            depsOnly:   true,
-            onProgress: undefined,
-          });
-          console.log(`[CodeLens] Dependency scan complete: ${depResult.filesScanned} dependency files parsed.`);
-          if (depResult.filesScanned > 0) {
-            const stats: GraphStats = {
-              ...this.db.getStats(),
-              lastBuilt:       Date.now(),
-              buildDurationMs: workspaceScanMs + depResult.durationMs,
-            };
-            this.lastScanStats = stats;
-            await this.generateSkills(workspaceRoot, stats);
-            this.onScanComplete?.(stats);
-          }
-        })
-          .catch(err => console.error('[CodeLens] Background dependency scan failed:', err))
-          .finally(() => this.finishDependencyScan());
-      }, DEPS_SCAN_DELAY_MS);
-    });
+  // ── Dependency manifest ────────────────────────────────────────────────────
+  // Direct dependencies of the workspace's package.json files (one package.json
+  // read per dependency; node_modules is never walked or parsed).
+
+  refreshDependencies(workspaceRoot: string): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.disposed) { return; }
+      await this.db.ensureInit();
+      if (await this.refreshManifest(workspaceRoot)) {
+        this.db.persist();
+        console.log('[CodeLens] Dependency manifest updated.');
+      }
+    }).catch(err => console.error('[CodeLens] Dependency manifest refresh failed:', err));
   }
 
-  private finishDependencyScan(): void {
-    const resolve = this.resolveDepsScan;
-    this.resolveDepsScan = null;
-    resolve?.();
-  }
-
-  private cancelDependencyScan(): void {
-    if (this.depsTimer) { clearTimeout(this.depsTimer); this.depsTimer = null; }
-    this.finishDependencyScan();
+  // Returns whether the stored manifest changed.
+  private async refreshManifest(workspaceRoot: string): Promise<boolean> {
+    const manifests = this.db.getAllFiles('all')
+      .filter(f => path.basename(f).toLowerCase() === 'package.json' && !isNodeModulePath(f));
+    const packages = await readDependencyManifest(workspaceRoot, manifests);
+    return this.db.replacePackages(packages);
   }
 
   // ── Incremental updates from file-change events ────────────────────────────
@@ -189,6 +171,7 @@ export class BackgroundScanner {
     }
   }
 
+  // Callers filter out-of-scope paths before queueing.
   queueFileChange(filePath: string, change: FileChange, workspaceRoot: string): void {
     if (!this.acceptingChanges || this.disposed) { return; }
     this.pendingChanges.set(filePath, change); // latest event per path wins
@@ -214,7 +197,13 @@ export class BackgroundScanner {
   private async applyBatch(batch: Map<string, FileChange>, workspaceRoot: string): Promise<void> {
     if (this.disposed) { return; }
     await this.db.ensureInit();
-    this.onStatusChange?.('updating');
+
+    // Only show "updating" once the batch actually touches an indexed file
+    // (deleting build output, for example, changes nothing).
+    let announced = false;
+    const announce = () => {
+      if (!announced) { announced = true; this.onStatusChange?.('updating'); }
+    };
 
     const changedFiles: string[] = [];
     const affectedSymbols = new Set<string>();
@@ -237,11 +226,13 @@ export class BackgroundScanner {
             // A deleted folder arrives as one event for the folder itself.
             indexedFiles ??= this.db.getAllFiles('all');
             for (const indexed of this.indexedFilesAt(filePath, indexedFiles)) {
+              announce();
               collectSymbols(indexed);
               this.db.deleteNodesByFile(indexed); // also drops its text-index rows
               changedFiles.push(indexed);
             }
           } else {
+            announce();
             collectSymbols(filePath);
             const parsed = await this.scanner.updateFile(filePath, false);
             for (const node of parsed.nodes) {
@@ -261,10 +252,12 @@ export class BackgroundScanner {
         this.scheduleSkillRegen(workspaceRoot);
       }
     } finally {
-      // The UI refresh this triggers runs as its own task, not stacked onto
-      // the DB write above.
-      await yieldToEventLoop();
-      this.onStatusChange?.('ready');
+      if (announced) {
+        // The UI refresh this triggers runs as its own task, not stacked onto
+        // the DB write above.
+        await yieldToEventLoop();
+        this.onStatusChange?.('ready');
+      }
     }
   }
 
@@ -280,20 +273,20 @@ export class BackgroundScanner {
 
   async handleAgentRunComplete(
     changedFiles: string[],
-    workspaceRoot: string,
+    scope: IndexScope,
     options: ScanOptions
   ): Promise<void> {
     const allowedFiles = changedFiles
-      .map(fp => path.isAbsolute(fp) ? fp : path.resolve(workspaceRoot, fp))
-      .filter(fp => this.scanner.isFileAllowed(fp, workspaceRoot, options));
+      .map(fp => path.isAbsolute(fp) ? fp : path.resolve(scope.workspaceRoot, fp))
+      .filter(fp => this.scanner.isFileAllowed(fp, scope, options));
     console.log(`[CodeLens] Agent run complete. Re-scanning ${allowedFiles.length} / ${changedFiles.length} allowed files…`);
 
     const batch = new Map<string, FileChange>(allowedFiles.map(fp => [fp, 'change']));
-    await this.enqueue(() => this.applyBatch(batch, workspaceRoot));
+    await this.enqueue(() => this.applyBatch(batch, scope.workspaceRoot));
 
     const stats: GraphStats = { ...this.db.getStats(), lastBuilt: Date.now(), buildDurationMs: 0 };
     this.lastScanStats = stats;
-    await this.generateSkills(workspaceRoot, stats);
+    await this.generateSkills(scope.workspaceRoot, stats);
     this.onScanComplete?.(stats);
   }
 
@@ -327,7 +320,6 @@ export class BackgroundScanner {
   dispose(): void {
     this.disposed = true;
     this.setAcceptingChanges(false);
-    this.cancelDependencyScan();
     if (this.skillRegenTimer) { clearTimeout(this.skillRegenTimer); this.skillRegenTimer = null; }
   }
 }

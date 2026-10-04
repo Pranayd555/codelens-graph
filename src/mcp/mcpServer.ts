@@ -12,6 +12,26 @@ import {
   isConfigPath, isNodeModulePath, matchPathFilter, isPathInside, compileSearchRegex, regexTestCapped
 } from '../utils';
 import { TextIndex, TextEntry } from '../indexing/textIndex';
+import { IndexScope, normalizeFolders } from '../ingestion/indexScope';
+import { readDependencyManifest, readDeclaredExports } from '../ingestion/dependencyManifest';
+
+const DEFAULT_LARGE_WORKSPACE_THRESHOLD = 5000;
+
+// Reads CodeLens settings from the workspace's .vscode/settings.json (which
+// allows comments and trailing commas), so a standalone MCP server indexes the
+// same folders the user selected in VS Code.
+function readWorkspaceSettings(workspaceRoot: string): Record<string, unknown> {
+  try {
+    const raw = fs.readFileSync(path.join(workspaceRoot, '.vscode', 'settings.json'), 'utf-8');
+    const json = raw
+      .replace(/"(?:[^"\\]|\\.)*"|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, m => (m.startsWith('"') ? m : ''))
+      .replace(/,(\s*[}\]])/g, '$1');
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 // ─── Task tier classifier ─────────────────────────────────────────────────────
 
@@ -72,6 +92,9 @@ export class MCPServer {
   }>();
   private defaultWorkspaceRoot = '';
   private runningScans = new Set<string>();
+  // Workspaces whose auto-index was skipped because they are too large to index
+  // without a folder selection (value: indexable file count).
+  private scanNeedsSelection = new Map<string, number>();
 
   constructor() {
     this.setupRegistryWatcher();
@@ -167,7 +190,13 @@ export class MCPServer {
       if (same(dir, loaded)) { return true; }
     }
     if (fs.existsSync(path.join(dir, '.codelens', 'codelens-graph.db'))) { return true; }
+    return this.isOpenInVsCode(dir);
+  }
 
+  // Whether a VS Code window with the CodeLens extension has this workspace open.
+  private isOpenInVsCode(dir: string): boolean {
+    const same = (a: string, b: string) =>
+      process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
     const registryPath = path.join(os.homedir(), '.codelens', 'active-workspaces.json');
     try {
       const windows = JSON.parse(fs.readFileSync(registryPath, 'utf-8')).windows ?? {};
@@ -212,16 +241,25 @@ export class MCPServer {
       const db = new GraphDB(dbDir);
       await db.init();
 
-      // Check if graph is empty, scan in background if not already running
+      // Graph empty: index in the background — unless VS Code has this
+      // workspace open (the extension owns indexing there, and two writers
+      // would overwrite each other's DB), or it is too large to index without
+      // a folder selection.
       const stats = db.getStats();
-      if (stats.totalNodes === 0) {
+      if (stats.totalNodes === 0 && this.isOpenInVsCode(resolvedPath)) {
+        console.error(`[CodeLens MCP] Graph empty — ${resolvedPath} is open in VS Code; the CodeLens extension builds the graph.`);
+      } else if (stats.totalNodes === 0) {
         if (!this.runningScans.has(resolvedPath)) {
           this.runningScans.add(resolvedPath);
-          console.error(`[CodeLens MCP] Graph empty — starting background index for ${resolvedPath}…`);
           const parser  = new ASTParser();
           const scanner = new WorkspaceScanner(parser, db);
+          const settings = readWorkspaceSettings(resolvedPath);
+          const scope: IndexScope = { workspaceRoot: resolvedPath, folders: normalizeFolders(settings['codeLensGraph.includeFolders']) };
+          const threshold = typeof settings['codeLensGraph.largeWorkspaceThreshold'] === 'number'
+            ? settings['codeLensGraph.largeWorkspaceThreshold'] as number
+            : DEFAULT_LARGE_WORKSPACE_THRESHOLD;
 
-          scanner.scanWorkspace([resolvedPath], {
+          const scanOptions = {
             excludePatterns: [
               '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**', '**/output/**',
               '**/bundle/**', '**/.next/**', '**/.nuxt/**', '**/.svelte-kit/**', '**/.vite/**',
@@ -239,10 +277,30 @@ export class MCPServer {
               '.py','.go','.rs','.java','.cs',
               '.cpp','.c','.rb','.php','.swift','.kt',
             ],
-          }).then((result) => {
+          };
+          if (Array.isArray(settings['codeLensGraph.excludePatterns'])) {
+            scanOptions.excludePatterns = settings['codeLensGraph.excludePatterns'] as string[];
+          }
+          if (Array.isArray(settings['codeLensGraph.supportedExtensions'])) {
+            scanOptions.supportedExtensions = settings['codeLensGraph.supportedExtensions'] as string[];
+          }
+
+          (async () => {
+            if (!scope.folders.length) {
+              const count = (await scanner.listFiles(scope, scanOptions)).length;
+              if (count > threshold) {
+                this.scanNeedsSelection.set(resolvedPath, count);
+                console.error(`[CodeLens MCP] ${count} indexable files exceeds the large-workspace threshold (${threshold}); not indexing until folders are selected.`);
+                return;
+              }
+            }
+            console.error(`[CodeLens MCP] Graph empty — starting background index for ${resolvedPath}…`);
+            const result = await scanner.scanWorkspace(scope, scanOptions);
+            const manifests = db.getAllFiles('all').filter(f => path.basename(f).toLowerCase() === 'package.json' && !isNodeModulePath(f));
+            if (db.replacePackages(await readDependencyManifest(resolvedPath, manifests))) { db.persist(); }
             const newStats = db.getStats();
             console.error(`[CodeLens MCP] Background index finished. Indexed ${newStats.fileCount} files, ${newStats.totalNodes} symbols. Errors: ${result.errors.length}`);
-          }).catch((err) => {
+          })().catch((err) => {
             console.error(`[CodeLens MCP] Background index failed:`, err);
           }).finally(() => {
             this.runningScans.delete(resolvedPath);
@@ -370,13 +428,13 @@ export class MCPServer {
         const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
         const results = db.searchNodes(query, limit ?? 10, scope ?? 'workspace');
-        if (!results.length) {
+        const packages = scope === 'deps' || scope === 'all'
+          ? db.getPackages().filter(p => p.name.toLowerCase().includes(query.toLowerCase())).slice(0, limit ?? 10)
+          : [];
+        if (!results.length && !packages.length) {
           let msg = 'No symbols found matching "' + query + '" within scope ' + (scope ?? 'workspace') + '.';
           if (scope === 'deps' || scope === 'all') {
-            const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
-            if (!hasIndexedDts) {
-              msg += '\n\nTip: Dependency symbol indexing is disabled by default to prevent IDE lagging. You can enable it by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.';
-            }
+            msg += '\n\nDependency symbols are not indexed; use codelens_dependencies with queryType "exports" to list a package\'s exports.';
           }
           return txt(msg + ' Safe to create.');
         }
@@ -384,9 +442,12 @@ export class MCPServer {
           'Found ' + results.length + ' symbol(s) matching "' + query + '" inside scope ' + (scope ?? 'workspace') + ':',
           '',
           ...results.map(n => this.fmtNode(n, workspaceRoot)),
-          '',
-          '→ Read only the specific line(s) above.',
         ];
+        if (packages.length) {
+          lines.push('', 'Matching dependencies:');
+          lines.push(...packages.map(p => '  - ' + p.name + '@' + (p.version ?? p.declaredRange + ' (not installed)')));
+        }
+        lines.push('', '→ Read only the specific line(s) above.');
         return txt(lines.join('\n'));
       }
     );
@@ -603,6 +664,14 @@ export class MCPServer {
         const allFiles   = db.getAllFiles(scope ?? 'workspace');
         const groups     = classifier.groupFiles(allFiles);
         const lines      = ['## Workspace (' + allFiles.length + ' files, scope: ' + (scope ?? 'workspace') + ')', ''];
+        if (scope === 'deps' || scope === 'all') {
+          const packages = db.getPackages();
+          if (packages.length) {
+            lines.push('### Dependencies (' + packages.length + ') — see codelens_dependencies');
+            lines.push(...packages.map(p => '  - ' + p.name + '@' + (p.version ?? p.declaredRange)));
+            lines.push('');
+          }
+        }
         for (const [label, files] of groups) {
           if (filter
             && !label.toLowerCase().includes(filter.toLowerCase())
@@ -626,9 +695,10 @@ export class MCPServer {
 
     tool(
       'codelens_dependencies',
-      'Query installed packages and their metadata. Use when the task involves dependencies, versions, types, or package configuration.',
+      'Query the workspace\'s direct dependencies (declared in its package.json files): installed version, entry points, '
+      + 'exports from type definitions, and which files import a package. Use when the task involves dependencies, versions, types, or package configuration.',
       {
-        packageName: z.string().optional().describe('Specific package to look up, e.g. "lodash" or "@types/react". Omit to list all top-level packages.'),
+        packageName: z.string().optional().describe('Specific package to look up, e.g. "lodash" or "@types/react". Omit to list all direct dependencies.'),
         queryType: z.enum(['info', 'exports', 'types', 'dependents']).optional().default('info').describe('What to retrieve: package info, exported symbols, type definitions, or files that import this package.'),
         workspace: z.string().optional().describe('Optional workspace override path')
       },
@@ -636,129 +706,63 @@ export class MCPServer {
         const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
         
+        const packages = db.getPackages();
         if (packageName) {
-          const matches = db.getNodesByType('file').filter(n => 
-            isNodeModulePath(n.filePath) && 
-            n.filePath.replace(/\\/g, '/').toLowerCase().includes('/' + packageName.toLowerCase() + '/')
-          );
-
-          if (!matches.length) {
-            return txt('Package "' + packageName + '" is not indexed or found in node_modules.');
+          const pkg = packages.find(p => p.name === packageName)
+            ?? packages.find(p => p.name.toLowerCase() === packageName.toLowerCase());
+          if (!pkg) {
+            const known = packages.filter(p => p.name.toLowerCase().includes(packageName.toLowerCase())).map(p => p.name);
+            return txt('Package "' + packageName + '" is not a direct dependency of this workspace.'
+              + (known.length ? ' Similar: ' + known.slice(0, 10).join(', ') : ''));
           }
-
-          const lines: string[] = ['## Package: ' + packageName, ''];
+          const rel = (p: string) => this.rel(p, workspaceRoot);
+          const lines: string[] = ['## Package: ' + pkg.name, ''];
 
           if (queryType === 'info') {
-            const pkgJsonNode = matches.find(n => n.name === 'package.json');
-            if (pkgJsonNode) {
-              lines.push('- Version: ' + (pkgJsonNode.signature || 'unknown'));
-              lines.push('- Path: ' + this.rel(pkgJsonNode.filePath, workspaceRoot));
-            }
-            const readmeNode = matches.find(n => n.name.toLowerCase() === 'readme.md');
-            if (readmeNode) {
-              lines.push('- Readme: ' + this.rel(readmeNode.filePath, workspaceRoot));
-            }
-            const typeDefs = matches.filter(n => n.name.endsWith('.d.ts'));
-            if (typeDefs.length) {
-              lines.push('- Type definitions: ' + typeDefs.map(t => this.rel(t.filePath, workspaceRoot)).join(', '));
-            }
-          } else if (queryType === 'exports') {
-            const symbols = matches.flatMap(m => 
-              db.getNodesByFile(m.filePath).filter(n => n.type !== 'file' && n.type !== 'import')
-            );
-            if (!symbols.length) {
-              lines.push('No exported symbols found in the type definitions for this package.');
-              const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
-              if (!hasIndexedDts) {
-                lines.push('');
-                lines.push('Tip: Exported symbols and type definitions from node_modules are not indexed by default to optimize performance. You can enable them by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.');
-              }
+            lines.push('- Installed version: ' + (pkg.version ?? 'not installed'));
+            lines.push('- Declared: ' + pkg.declaredRange + ' (' + pkg.kind + ') in ' + pkg.declaredIn.map(rel).join(', '));
+            if (pkg.dir)    { lines.push('- Path: ' + rel(pkg.dir)); }
+            if (pkg.types)  { lines.push('- Type definitions: ' + rel(pkg.types)); }
+            if (pkg.main)   { lines.push('- Main entry: ' + rel(pkg.main)); }
+            if (pkg.readme) { lines.push('- Readme: ' + rel(pkg.readme)); }
+          } else if (queryType === 'exports' || queryType === 'types') {
+            if (!pkg.types) {
+              lines.push('No type definitions found for this package' + (pkg.installed ? '.' : ' (it is not installed).'));
             } else {
-              lines.push('Exported symbols:');
-              lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ ' + this.rel(s.filePath, workspaceRoot) + ':' + s.line));
-            }
-          } else if (queryType === 'types') {
-            const typeDefs = matches.filter(n => n.name.endsWith('.d.ts'));
-            if (!typeDefs.length) {
-              lines.push('No type definition files found for this package.');
-              const hasIndexedDts = db.getNodesByType('file').some(n => n.filePath.endsWith('.d.ts') && isNodeModulePath(n.filePath));
-              if (!hasIndexedDts) {
-                lines.push('');
-                lines.push('Tip: Exported symbols and type definitions from node_modules are not indexed by default to optimize performance. You can enable them by setting `codeLensGraph.indexDependencySymbols` to `true` in your VS Code settings.');
-              }
-            } else {
-              lines.push('Type definition files:');
-              const maxTypeDefsToShow = 10;
-              const shownTypeDefs = typeDefs.slice(0, maxTypeDefsToShow);
-              for (const td of shownTypeDefs) {
-                lines.push('### ' + this.rel(td.filePath, workspaceRoot));
-                const symbols = db.getNodesByFile(td.filePath).filter(n => n.type !== 'file' && n.type !== 'import');
-                lines.push(...symbols.map(s => '  - [' + s.type + '] ' + s.name + ' @ line ' + s.line + ' ' + (s.signature ? '`' + s.signature.slice(0, 100) + '`' : '')));
-                lines.push('');
-              }
-              if (typeDefs.length > maxTypeDefsToShow) {
-                lines.push(`### ... and ${typeDefs.length - maxTypeDefsToShow} more type definition files.`);
-                lines.push('');
+              const exported = readDeclaredExports(pkg.types);
+              lines.push('Type definitions: ' + rel(pkg.types), '');
+              if (!exported.length) {
+                lines.push('No top-level exports found in the type definitions entry.');
+              } else {
+                lines.push('Exports declared in the entry file (read on demand):');
+                lines.push(...exported.map(e => '  - [' + e.kind + '] ' + e.name + ' @ line ' + e.line));
               }
             }
           } else if (queryType === 'dependents') {
-            const dependents = new Set<string>();
-            for (const fileNode of matches) {
-              const edges = db.getEdgesTo(fileNode.id, 'depends-on' as any);
-              for (const edge of edges) {
-                const node = db.getNode(edge.fromId);
-                if (node) {
-                  dependents.add(this.rel(node.filePath, workspaceRoot));
-                }
-              }
-            }
-            if (!dependents.size) {
-              lines.push('No indexed workspace files import or depend on "' + packageName + '".');
+            const files = db.getFilesImporting(pkg.name);
+            if (!files.length) {
+              lines.push('No indexed workspace files import "' + pkg.name + '".');
             } else {
-              lines.push('Workspace files importing/depending on this package:');
-              lines.push(...Array.from(dependents).map(d => '  - ' + d));
+              lines.push('Workspace files importing this package (' + files.length + '):');
+              lines.push(...files.map(f => '  - ' + rel(f)));
             }
           }
-
           return txt(lines.join('\n'));
         } else {
-          // List all top-level packages and configs
-          const allDeps = db.getAllFiles('deps');
-          const lines = ['## Index Dependencies & Configuration Files', ''];
-          const packages = new Set<string>();
-          const configs: string[] = [];
-
-          for (const fp of allDeps) {
-            if (isNodeModulePath(fp)) {
-              const match = /\/node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(fp.replace(/\\/g, '/'));
-              if (match && match[1]) {
-                packages.add(match[1]);
-              }
-            } else {
-              configs.push(this.rel(fp, workspaceRoot));
-            }
-          }
-
-          if (packages.size > 0) {
-            lines.push('### Packages:');
-            for (const pkg of Array.from(packages).sort()) {
-              // Try to find package version
-              const pkgJsonNode = db.getNodesByType('file').find(n => 
-                isNodeModulePath(n.filePath) && 
-                n.filePath.toLowerCase().endsWith('/node_modules/' + pkg.toLowerCase() + '/package.json')
-              );
-              const version = pkgJsonNode?.signature ? ` (${pkgJsonNode.signature})` : '';
-              lines.push('  - ' + pkg + version);
+          const lines = ['## Dependencies & Configuration Files', ''];
+          if (packages.length) {
+            lines.push('### Direct dependencies (' + packages.length + '):');
+            for (const p of packages) {
+              lines.push('  - ' + p.name + '@' + (p.version ?? p.declaredRange + ' (not installed)') + (p.kind === 'dependencies' ? '' : ' [' + p.kind + ']'));
             }
             lines.push('');
           }
-
-          if (configs.length > 0) {
+          const configs = db.getAllFiles('deps').filter(f => !isNodeModulePath(f)).map(f => this.rel(f, workspaceRoot));
+          if (configs.length) {
             lines.push('### Configurations:');
             lines.push(...configs.sort().map(c => '  - ' + c));
             lines.push('');
           }
-
           return txt(lines.join('\n'));
         }
       }
@@ -773,10 +777,19 @@ export class MCPServer {
         workspace: z.string().optional().describe('Optional workspace override path')
       },
       async ({ workspace }: { workspace?: string }) => {
-        const { db } = await this.getWorkspaceContext(workspace);
+        const { db, workspaceRoot } = await this.getWorkspaceContext(workspace);
         db.refreshFromDiskIfChanged();
         const stats  = db.getStats();
         const issues = db.countNodesWithUndefinedRefs();
+        const pendingFiles = stats.totalNodes === 0 ? this.scanNeedsSelection.get(workspaceRoot) : undefined;
+        if (pendingFiles !== undefined) {
+          return txt([
+            '## CodeLens Status',
+            '- Not indexed yet: this workspace has ' + pendingFiles + ' indexable files, above the large-workspace threshold.',
+            '- Ask the user to choose folders to index: "CodeLens: Select Indexed Folders" in VS Code, '
+              + 'or set "codeLensGraph.includeFolders" in .vscode/settings.json.',
+          ].join('\n'));
+        }
         return txt([
           '## CodeLens Status',
           '- Files indexed: ' + stats.fileCount,

@@ -23,7 +23,7 @@ CodeLens Graph fixes this by providing exact, targeted symbol subgraphs:
 
 ## How it works
 
-Once VS Code has finished starting up (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and package dependencies (entry points, signatures, and version details from `node_modules`). It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
+Once VS Code has finished starting up (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and the direct dependencies declared in your `package.json` files (installed version, entry points, type definitions — read without walking or parsing `node_modules`). You choose which folders are indexed from the **Indexed Folders** view; very large workspaces are not indexed until you pick. It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
 
 The key insight: instead of the agent reading 5–10 files to orient itself, it calls one MCP tool and gets back only the relevant symbols, snippets, and relationships for the current task.
 
@@ -110,6 +110,8 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `CodeLens: Regenerate AI Agent Skill Files` | Regenerate rules/MCP configs and prompt for IDE preferences |
 | `CodeLens: Show MCP Usage Report` | Show total agent tool calls and token savings |
 | `CodeLens: Clear Configuration Files and Reset State` | Clean up all CodeLens-generated rule files/configs and reset extension state |
+| `CodeLens: Select Indexed Folders…` | Pick which folders are indexed (with file counts); also available as checkboxes in the **Indexed Folders** view |
+| `CodeLens: Index Entire Workspace` | Clear the folder selection and index everything |
 
 ---
 
@@ -120,8 +122,9 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `codeLensGraph.autoRebuildOnSave` | `true` | Update graph on file save |
 | `codeLensGraph.maxGraphDepth` | `2` | BFS hops from entry points |
 | `codeLensGraph.maxTokenBudget` | `2000` | Token cap for agent context |
-| `codeLensGraph.excludePatterns` | `node_modules, dist…` | Folders to skip |
-| `codeLensGraph.indexDependencySymbols` | `false` | Deeply index internal symbols inside `node_modules` |
+| `codeLensGraph.includeFolders` | `[]` (whole workspace) | Folders to index, workspace-relative. Root-level files are always indexed. Stored in `.vscode/settings.json`, so the team and a standalone MCP server share it |
+| `codeLensGraph.largeWorkspaceThreshold` | `5000` | Above this many indexable files, a never-indexed workspace waits for a folder selection |
+| `codeLensGraph.excludePatterns` | `node_modules, dist…` | Globs to skip (`**` supported) |
 | `codeLensGraph.supportedExtensions` | `.ts .js .py .go .rs…` | Languages to parse |
 
 ---
@@ -132,11 +135,13 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 src/
 ├── extension.ts              # VS Code entry point, command registration
 ├── types.ts                  # GraphNode, GraphEdge, AgentContext, Diagnosis
-├── utils.ts                  # Path helpers, configuration whitelist, and node_modules filters
+├── utils.ts                  # Path helpers, configuration whitelist, glob matching
 ├── ingestion/
 │   ├── astParser.ts          # tree-sitter WASM parser (regex fallback)
-│   ├── workspaceScanner.ts   # Walks workspace, async file parsing
-│   └── fileWatcher.ts        # Incremental graph updates on save
+│   ├── workspaceScanner.ts   # Walks the selected folders, reconciles the graph with them
+│   ├── indexScope.ts         # Folder selection (codeLensGraph.includeFolders) rules
+│   ├── dependencyManifest.ts # Direct dependencies from package.json (no node_modules walk)
+│   └── fileWatcher.ts        # Standalone file watcher (outside VS Code)
 ├── graph/
 │   ├── graphDB.ts            # SQLite: nodes, edges, snapshots, migrations
 │   └── differ.ts             # Pre/post agent run diff engine
@@ -146,13 +151,14 @@ src/
 │   └── fileClassifier.ts     # Groups files by semantic category
 ├── agent/
 │   ├── skillGenerator.ts     # Writes .codelens/mcp.json + README
-│   └── backgroundScanner.ts  # Silent background scan on activation
+│   └── backgroundScanner.ts  # Queued background scans and batched file-change updates
 ├── mcp/
 │   ├── mcpServer.ts          # 10 MCP tools (triage, search, context, dependencies…)
 │   └── mcpEntry.ts           # Standalone MCP binary entry point
 └── ui/
     ├── graphPanel.ts         # D3 force-directed graph webview
-    └── statsView.ts          # Sidebar stats panel (WebviewViewProvider)
+    ├── statsView.ts          # Sidebar stats panel (WebviewViewProvider)
+    └── indexedFoldersView.ts # Sidebar folder tree with checkboxes
 ```
 
 ---
