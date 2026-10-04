@@ -241,9 +241,17 @@ export class GraphDB {
     return `${scope}:${this.version}:${this.writeCount}`;
   }
 
-  constructor(storagePath: string) {
+  // followExternalWrites: reload when another process rewrites the file. The
+  // MCP server (a reader) needs this; the extension owns and writes the file,
+  // so it must not adopt a file written elsewhere (e.g. by an MCP server from a
+  // different CodeLens version) — its in-memory graph stays authoritative and
+  // is written back on the next save.
+  private followExternalWrites: boolean;
+
+  constructor(storagePath: string, options: { followExternalWrites?: boolean } = {}) {
     this.dbPath = path.join(storagePath, 'codelens-graph.db');
     this.root = this.getWorkspaceRoot();
+    this.followExternalWrites = options.followExternalWrites ?? true;
   }
 
   isInitialized(): boolean {
@@ -291,7 +299,7 @@ export class GraphDB {
           this.db = new this.SQL.Database(data);
           this.fileVersion = loadedVersion;
 
-          if (!this.hasCurrentSchema()) {
+          if (!this.hasCurrentSchema(this.db)) {
             console.log('[CodeLens] Graph storage format changed — rebuilding the index once.');
             this.db.close();
             try { fs.unlinkSync(this.dbPath); } catch { /* ignore */ }
@@ -319,11 +327,11 @@ export class GraphDB {
 
   // An existing DB is current if its nodes table is integer-keyed (or it has
   // no graph tables yet).
-  private hasCurrentSchema(): boolean {
+  private hasCurrentSchema(db: Database): boolean {
     try {
-      const tables = this.db.exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'nodes'`);
+      const tables = db.exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'nodes'`);
       if (!tables.length || !tables[0].values.length) { return true; }
-      const columns = (this.db.exec('PRAGMA table_info(nodes)')[0]?.values ?? []).map(v => v[1]);
+      const columns = (db.exec('PRAGMA table_info(nodes)')[0]?.values ?? []).map(v => v[1]);
       return columns.includes('nid') && columns.includes('file_id');
     } catch {
       return false;
@@ -398,13 +406,20 @@ export class GraphDB {
     if (!this.db) {
       throw new Error('Database not initialized. Ensure init() has completed successfully.');
     }
-    if (this.dirty || !fs.existsSync(this.dbPath)) { return false; }
+    if (!this.followExternalWrites || this.dirty || !fs.existsSync(this.dbPath)) { return false; }
     const currentVersion = this.getFileVersion();
     if (!currentVersion || currentVersion === this.fileVersion) { return false; }
 
     try {
       const data = fs.readFileSync(this.dbPath);
       const replacement = new this.SQL.Database(data);
+      if (!this.hasCurrentSchema(replacement)) {
+        // Written by a different CodeLens version: don't load a format we can't read.
+        replacement.close();
+        this.fileVersion = currentVersion;
+        console.warn('[CodeLens] Ignoring graph DB written in an older format by another process.');
+        return false;
+      }
       this.db.close();
       this.db = replacement;
       this.db.run(SCHEMA);

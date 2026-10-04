@@ -261,11 +261,16 @@ export class BackgroundScanner {
     }
   }
 
-  // The indexed file at this path, or every indexed file under it if it was a folder.
+  // The indexed file at this path, or every indexed file under it if it was a
+  // folder. Case-insensitive on Windows, where event paths may differ in case.
   private indexedFilesAt(deletedPath: string, indexedFiles: string[]): string[] {
-    if (indexedFiles.includes(deletedPath)) { return [deletedPath]; }
-    const prefix = deletedPath.endsWith(path.sep) ? deletedPath : deletedPath + path.sep;
-    return indexedFiles.filter(f => f.startsWith(prefix));
+    const fold = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const target = fold(path.normalize(deletedPath));
+    const prefix = target.endsWith(path.sep) ? target : target + path.sep;
+    return indexedFiles.filter(f => {
+      const candidate = fold(path.normalize(f));
+      return candidate === target || candidate.startsWith(prefix);
+    });
   }
 
   // ── Trigger after agent finishes (called by the command handler) ───────────

@@ -62,7 +62,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ? path.join(activeWorkspaceRoot, '.codelens')
     : context.globalStorageUri.fsPath;
 
-  db             = new GraphDB(graphStoragePath);
+  // The extension is the DB's writer; it never reloads a file changed by another process.
+  db             = new GraphDB(graphStoragePath, { followExternalWrites: false });
   parser         = new ASTParser();
   scanner        = new WorkspaceScanner(parser, db);
   contextBuilder = new ContextBuilder(db);
@@ -336,7 +337,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     fsWatcher.onDidCreate(uri => queueChange(uri, 'change'));
     fsWatcher.onDidDelete(uri => queueChange(uri, 'delete'));
 
-    context.subscriptions.push(fsWatcher);
+    // Folder-level events. Deleting, moving or renaming a folder is reported as
+    // ONE event for the folder path, which never matches the extension glob
+    // above — without this, a deleted folder's files stay in the graph and a
+    // moved folder is indexed again under its new path (duplicate nodes).
+    const structureWatcher = vscode.workspace.createFileSystemWatcher('**/*', false, true, false);
+    structureWatcher.onDidDelete(uri => {
+      if (scanner.isTrackedLocation(uri.fsPath, currentScope(), scanOptions())) {
+        backgroundScanner.queueFileChange(uri.fsPath, 'delete', workspaceRoot);
+      }
+    });
+    structureWatcher.onDidCreate(async uri => {
+      let isDirectory = false;
+      try { isDirectory = (await fs.promises.stat(uri.fsPath)).isDirectory(); } catch { return; }
+      if (!isDirectory) { return; } // files are handled by fsWatcher
+      for (const file of await scanner.listFilesUnder(uri.fsPath, currentScope(), scanOptions())) {
+        backgroundScanner.queueFileChange(file, 'change', workspaceRoot);
+      }
+    });
+
+    context.subscriptions.push(fsWatcher, structureWatcher);
   }
 
   // ── 6b. Dependency manifest: refresh when package.json or a lockfile changes

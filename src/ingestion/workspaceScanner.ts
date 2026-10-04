@@ -363,6 +363,33 @@ export class WorkspaceScanner {
 
   // ── File collection ────────────────────────────────────────────────────────
 
+  // Whether a path (file or folder) is somewhere CodeLens indexes: in scope, not
+  // in node_modules, and not inside an excluded folder. Used for watcher events
+  // that may be folders — a deleted or moved folder arrives as one event.
+  isTrackedLocation(absPath: string, scope: IndexScope, options: ScanOptions): boolean {
+    const relPath = relativeToWorkspace(absPath, scope.workspaceRoot);
+    if (relPath === null || !isInScope(absPath, scope) || isNodeModulePath(absPath)) { return false; }
+    const selectedRoot = scope.folders
+      .map(f => f.toLowerCase())
+      .find(f => relPath.toLowerCase() === f || relPath.toLowerCase().startsWith(f + '/')) ?? '';
+    let currentRelPath = '';
+    for (const segment of relPath.split('/')) {
+      currentRelPath = currentRelPath ? `${currentRelPath}/${segment}` : segment;
+      if (currentRelPath.length <= selectedRoot.length) { continue; }
+      if (this.shouldExcludeDir(segment, currentRelPath, options.excludePatterns)) { return false; }
+    }
+    return true;
+  }
+
+  // Indexable files under a folder (e.g. one that was just moved or copied in).
+  async listFilesUnder(absDir: string, scope: IndexScope, options: ScanOptions): Promise<string[]> {
+    if (!this.isTrackedLocation(absDir, scope, options)) { return []; }
+    const files: string[] = [];
+    const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
+    await this.walkDir(absDir, scope.workspaceRoot, extSet, options.excludePatterns, files, true);
+    return files.filter(f => isInScope(f, scope));
+  }
+
   // Every indexable file in scope: the selected folders (recursively) plus files
   // directly in the workspace root. Never descends into node_modules.
   async listFiles(scope: IndexScope, options: ScanOptions): Promise<string[]> {
