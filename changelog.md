@@ -4,6 +4,13 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [0.3.1] - 2026-10-06
+
+### Changed
+- Release notes: the packaged changelog now includes the full 0.3.0 notes (per-workspace opt-in details and release date). No code changes from 0.3.0.
+
+---
+
 ## [0.3.0] - 2026-10-06
 
 ### Added
