@@ -43,6 +43,8 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
         showMcpUsage:  'codelens-graph.showMcpUsage',
         addConfig:     'codelens-graph.regenerateSkills',
         clearConfig:   'codelens-graph.clearConfig',
+        enableWorkspace:  'codelens-graph.enableWorkspace',
+        disableWorkspace: 'codelens-graph.disableWorkspace',
       };
       if (map[cmd]) { vscode.commands.executeCommand(map[cmd]); }
     });
@@ -56,6 +58,10 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
   }
 
   async refresh(): Promise<void> {
+    if (this.status === 'disabled') {
+      await this.sendData();
+      return;
+    }
     if (this.status === 'idle' && !this.db.isInitialized()) {
       this.lastStats  = null;
       this.lastIssues = 0;
@@ -79,7 +85,7 @@ export class StatsViewProvider implements vscode.WebviewViewProvider {
 
   private async sendData(): Promise<void> {
     if (!this.view) { return; }
-    if (this.status === 'idle' && !this.db.isInitialized()) {
+    if (this.status === 'disabled' || (this.status === 'idle' && !this.db.isInitialized())) {
       this.view.webview.postMessage({ command: 'update', stats: null, issues: 0, status: this.status });
       return;
     }
@@ -177,6 +183,13 @@ body {
   </div>
 </div>
 
+<div id="off-state" class="empty-state" style="display:none">
+  <div class="empty-icon">⏻</div>
+  <div class="empty-title">CodeLens is off for this workspace</div>
+  <div class="empty-desc">Nothing is indexed and no files are created here. Turn it on to build a code graph your AI agents can use.</div>
+  <button class="btn btn-primary" data-cmd="enableWorkspace">⏻ Turn On for This Workspace</button>
+</div>
+
 <div id="empty-state" style="display:none">
   <div class="empty-icon">⬡</div>
   <div class="empty-title">Graph not built yet</div>
@@ -243,6 +256,7 @@ body {
     <button class="btn btn-secondary" data-cmd="showContext">⊙ Preview Agent Context</button>
     <button class="btn btn-secondary" data-cmd="addConfig">⚙ Add Configuration to IDE</button>
     <button class="btn btn-secondary" data-cmd="clearConfig">🗑 Clear Configuration Files</button>
+    <button class="btn btn-secondary" data-cmd="disableWorkspace">⏻ Turn Off for This Workspace</button>
   </div>
 
 </div>
@@ -282,6 +296,15 @@ window.addEventListener('message', ev => {
   }
 
   if (command !== 'update') { return; }
+
+  const off = status === 'disabled';
+  document.getElementById('off-state').style.display = off ? 'block' : 'none';
+  if (off) {
+    document.getElementById('skeleton').style.display    = 'none';
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('main').style.display        = 'none';
+    return;
+  }
 
   const empty = !stats || stats.totalNodes === 0;
   const isParsing = status === 'scanning' || status === 'updating';

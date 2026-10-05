@@ -111,16 +111,26 @@
         "command": "codelens-graph.refreshIndexedFolders",
         "title": "CodeLens: Refresh Indexed Folders",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "codelens-graph.enableWorkspace",
+        "title": "CodeLens: Turn On for This Workspace"
+      },
+      {
+        "command": "codelens-graph.disableWorkspace",
+        "title": "CodeLens: Turn Off for This Workspace"
       }
     ],
     "menus": {
       "view/title": [
-        { "command": "codelens-graph.selectIndexedFolders", "when": "view == codelens-graph.indexedFolders", "group": "navigation@1" },
-        { "command": "codelens-graph.indexEntireWorkspace", "when": "view == codelens-graph.indexedFolders", "group": "navigation@2" },
-        { "command": "codelens-graph.refreshIndexedFolders", "when": "view == codelens-graph.indexedFolders", "group": "navigation@3" }
+        { "command": "codelens-graph.selectIndexedFolders", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@1" },
+        { "command": "codelens-graph.indexEntireWorkspace", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@2" },
+        { "command": "codelens-graph.refreshIndexedFolders", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@3" }
       ],
       "commandPalette": [
-        { "command": "codelens-graph.refreshIndexedFolders", "when": "false" }
+        { "command": "codelens-graph.refreshIndexedFolders", "when": "false" },
+        { "command": "codelens-graph.enableWorkspace", "when": "workspaceFolderCount > 0 && !codelens.workspaceEnabled" },
+        { "command": "codelens-graph.disableWorkspace", "when": "codelens.workspaceEnabled" }
       ]
     },
     "viewsContainers": {
@@ -132,6 +142,13 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "codelens-graph.indexedFolders",
+        "contents": "CodeLens Graph is off for this workspace. Nothing is indexed and no files are created.\n[Turn On for This Workspace](command:codelens-graph.enableWorkspace)\nOnly this workspace is affected; other windows keep their own setting.",
+        "when": "workspaceFolderCount > 0 && !codelens.workspaceEnabled"
+      }
+    ],
     "views": {
       "codelens-graph-sidebar": [
         {

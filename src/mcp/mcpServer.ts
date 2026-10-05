@@ -14,6 +14,16 @@ import {
 import { TextIndex, TextEntry } from '../indexing/textIndex';
 import { IndexScope, normalizeFolders } from '../ingestion/indexScope';
 import { readDependencyManifest, readDeclaredExports } from '../ingestion/dependencyManifest';
+import { findDisabledWorkspace } from '../workspaceOptOut';
+
+// Thrown for a workspace where the user turned CodeLens off in VS Code.
+class WorkspaceOffError extends Error {
+  constructor(workspaceRoot: string) {
+    super('CodeLens Graph is turned off for ' + workspaceRoot + ', so it has no graph for this workspace. '
+      + 'To use it, turn it on in VS Code (CodeLens sidebar, or "CodeLens: Turn On for This Workspace"). '
+      + 'Until then, explore the code with your normal tools.');
+  }
+}
 
 const DEFAULT_LARGE_WORKSPACE_THRESHOLD = 5000;
 
@@ -150,6 +160,11 @@ export class MCPServer {
       return resolved;
     }
 
+    // Working inside a workspace that was turned off: answer "off" for it
+    // instead of indexing it or serving another window's graph.
+    const off = findDisabledWorkspace(this.defaultWorkspaceRoot || process.cwd());
+    if (off) { return path.resolve(off); }
+
     // Try reading active-workspaces.json global registry
     const registryPath = path.join(os.homedir(), '.codelens', 'active-workspaces.json');
     if (fs.existsSync(registryPath)) {
@@ -234,6 +249,7 @@ export class MCPServer {
     logger: MCPLogger;
   }> {
     const resolvedPath = await this.resolveActiveWorkspace(overrideWorkspace);
+    if (findDisabledWorkspace(resolvedPath)) { throw new WorkspaceOffError(resolvedPath); }
     let ctx = this.workspaces.get(resolvedPath);
     if (!ctx) {
       const dbDir = path.join(resolvedPath, '.codelens');
@@ -332,7 +348,12 @@ export class MCPServer {
     this.defaultWorkspaceRoot = workspaceRoot === '--auto' ? '' : workspaceRoot;
 
     // Resolve/initialize default workspace root
-    await this.getWorkspaceContext();
+    try {
+      await this.getWorkspaceContext();
+    } catch (err) {
+      if (!(err instanceof WorkspaceOffError)) { throw err; }
+      console.error('[CodeLens MCP] ' + err.message);
+    }
 
     const pkgVersion = (() => {
       try {
@@ -369,7 +390,13 @@ export class MCPServer {
     ) => {
       this.server.tool(name, description, schema, async (args: any) => {
         const t0     = Date.now();
-        const result = await handler(args);
+        let result: { content: Array<{ type: 'text'; text: string }> };
+        try {
+          result = await handler(args);
+        } catch (err) {
+          if (err instanceof WorkspaceOffError) { return txt(err.message); }
+          throw err;
+        }
         const text   = result.content.map((c: any) => c.text).join('');
         const { logger } = await this.getWorkspaceContext(args.workspace);
         logger.log(name, args, text, Date.now() - t0);

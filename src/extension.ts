@@ -21,6 +21,7 @@ import {
 } from './ingestion/indexScope';
 import { GraphStats }         from './types';
 import { isNodeModulePath }   from './utils';
+import { setWorkspaceDisabled } from './workspaceOptOut';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -39,6 +40,15 @@ let currentStatus: StatusState = 'idle';
 let deactivated = false;
 let agentSetupOffered = false;
 let awaitingFolderSelection = false;
+let extensionContext: vscode.ExtensionContext;
+let registeredInRegistry = false;
+let enabledStartupRunning = false;
+let startupRerunRequested = false;
+
+// Per-workspace opt-in, stored in this workspace's private VS Code state
+// (nothing is written to the project). undefined = not asked yet. Each window
+// reads its own workspace's value, so a choice never affects other windows.
+const WORKSPACE_ENABLED_KEY = 'codelens.enabled';
 let indexedFoldersProvider: IndexedFoldersProvider | undefined;
 let scopeChangeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -63,6 +73,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     : context.globalStorageUri.fsPath;
 
   // The extension is the DB's writer; it never reloads a file changed by another process.
+  extensionContext = context;
   db             = new GraphDB(graphStoragePath, { followExternalWrites: false });
   parser         = new ASTParser();
   scanner        = new WorkspaceScanner(parser, db);
@@ -80,7 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBarItem.command = 'codelens-graph.showGraph';
-  setStatus('idle');
+  setStatus(isWorkspaceEnabled() ? 'idle' : 'disabled');
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
@@ -93,13 +104,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // ── 3b. Indexed Folders view: checkboxes mirror codeLensGraph.includeFolders
   const viewRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
   if (viewRoot) {
-    indexedFoldersProvider = new IndexedFoldersProvider(viewRoot, () => getConfig().includeFolders);
+    indexedFoldersProvider = new IndexedFoldersProvider(viewRoot, () => getConfig().includeFolders,
+      () => isWorkspaceEnabled());
     const foldersView = vscode.window.createTreeView('codelens-graph.indexedFolders', {
       treeDataProvider: indexedFoldersProvider,
       manageCheckboxStateManually: true,
     });
     foldersView.onDidChangeCheckboxState(async event => {
       let folders = getConfig().includeFolders;
+      if (!isWorkspaceEnabled()) { return; }
       for (const [item, state] of event.items) {
         if (!(item instanceof FolderItem)) { continue; }
         const next = toggleFolder(folders, item.relPath, state === vscode.TreeItemCheckboxState.Checked,
@@ -117,13 +130,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('codelens-graph.selectIndexedFolders', () => selectIndexedFolders(context)),
+    vscode.commands.registerCommand('codelens-graph.selectIndexedFolders', async () => {
+      // Turning CodeLens on from here lets the user pick folders before anything is indexed.
+      const wasEnabled = isWorkspaceEnabled();
+      if (!await ensureEnabledFor(context, 'choose the indexed folders', false)) { return; }
+      await selectIndexedFolders(context);
+      if (!wasEnabled) { void runEnabledStartup(context, true); }
+    }),
     vscode.commands.registerCommand('codelens-graph.indexEntireWorkspace', async () => {
+      if (!await ensureEnabledFor(context, 'index the entire workspace')) { return; }
       await context.workspaceState.update('codelens.indexEntireWorkspace', true);
       await saveIncludeFolders([]);
       if (awaitingFolderSelection) { void indexWorkspace(context); }
     }),
     vscode.commands.registerCommand('codelens-graph.refreshIndexedFolders', () => refreshFolderCounts()),
+    vscode.commands.registerCommand('codelens-graph.enableWorkspace', () => setWorkspaceEnabled(context, true)),
+    vscode.commands.registerCommand('codelens-graph.disableWorkspace', () => setWorkspaceEnabled(context, false)),
 
     // Changing the scope (or what counts as indexable) reconciles the graph:
     // only added/removed folders cost anything; unchanged files are skipped.
@@ -135,7 +157,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (scopeChangeTimer) { clearTimeout(scopeChangeTimer); }
       scopeChangeTimer = setTimeout(() => {
         scopeChangeTimer = undefined;
-        if (deactivated || !vscode.workspace.isTrusted || context.workspaceState.get<boolean>('graphCleared')) { return; }
+        if (deactivated || !isWorkspaceEnabled() || !vscode.workspace.isTrusted
+            || context.workspaceState.get<boolean>('graphCleared')) { return; }
         console.log('[CodeLens] Index scope changed — reconciling the graph.');
         void indexWorkspace(context);
       }, SCOPE_CHANGE_DEBOUNCE_MS);
@@ -176,16 +199,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Graph viewer
     vscode.commands.registerCommand('codelens-graph.showGraph', async () => {
+      if (!await ensureEnabledFor(context, 'view the graph')) { return; }
       await showGraphPanel(context);
     }),
 
     // Agent context preview (still available for debugging)
     vscode.commands.registerCommand('codelens-graph.showContext', async () => {
+      if (!await ensureEnabledFor(context, 'preview agent context')) { return; }
       await showContextPreview();
     }),
 
     // Symbol search
     vscode.commands.registerCommand('codelens-graph.searchSymbol', async () => {
+      if (!await ensureEnabledFor(context, 'search symbols')) { return; }
       await searchSymbol();
     }),
 
@@ -194,6 +220,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Called by the AI agent BEFORE starting work on a task.
     // Returns a compressed context JSON — the agent reads it, not the user.
     vscode.commands.registerCommand('codelens-graph.getContextForTask', async (taskDescription?: string, mode?: 'short' | 'deep') => {
+      if (!isWorkspaceEnabled()) {
+        vscode.window.showInformationMessage('CodeLens Graph is off for this workspace. Turn it on from the CodeLens sidebar.');
+        return;
+      }
       await db.ensureInit();
       const task = taskDescription
         ?? await vscode.window.showInputBox({ prompt: 'Task description for context lookup' });
@@ -217,6 +247,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Called by the AI agent AFTER it finishes making changes.
     // Re-scans changed files and regenerates skill files.
     vscode.commands.registerCommand('codelens-graph.updateAfterAgentRun', async (changedFiles?: string[]) => {
+      if (!isWorkspaceEnabled()) { return; }
       await db.ensureInit();
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
       if (!workspaceRoot) { return; }
@@ -330,7 +361,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Events are batched (a git checkout can fire hundreds) and applied in the
     // background; the scanner refreshes the UI once per batch via onStatus.
     const queueChange = (uri: vscode.Uri, change: 'change' | 'delete') => {
-      if (isExcludedPath(uri.fsPath, change)) { return; }
+      if (!isWorkspaceEnabled() || isExcludedPath(uri.fsPath, change)) { return; }
       backgroundScanner.queueFileChange(uri.fsPath, change, workspaceRoot);
     };
     fsWatcher.onDidChange(uri => queueChange(uri, 'change'));
@@ -343,11 +374,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // moved folder is indexed again under its new path (duplicate nodes).
     const structureWatcher = vscode.workspace.createFileSystemWatcher('**/*', false, true, false);
     structureWatcher.onDidDelete(uri => {
-      if (scanner.isTrackedLocation(uri.fsPath, currentScope(), scanOptions())) {
+      if (isWorkspaceEnabled() && scanner.isTrackedLocation(uri.fsPath, currentScope(), scanOptions())) {
         backgroundScanner.queueFileChange(uri.fsPath, 'delete', workspaceRoot);
       }
     });
     structureWatcher.onDidCreate(async uri => {
+      if (!isWorkspaceEnabled()) { return; }
       let isDirectory = false;
       try { isDirectory = (await fs.promises.stat(uri.fsPath)).isDirectory(); } catch { return; }
       if (!isDirectory) { return; } // files are handled by fsWatcher
@@ -366,7 +398,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     let manifestTimer: ReturnType<typeof setTimeout> | undefined;
     const onManifestChange = (uri: vscode.Uri) => {
-      if (isNodeModulePath(uri.fsPath) || !isInScope(uri.fsPath, currentScope())) { return; }
+      if (!isWorkspaceEnabled() || isNodeModulePath(uri.fsPath) || !isInScope(uri.fsPath, currentScope())) { return; }
       if (manifestTimer) { clearTimeout(manifestTimer); }
       manifestTimer = setTimeout(() => {
         manifestTimer = undefined;
@@ -381,12 +413,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(manifestWatcher, { dispose: () => { if (manifestTimer) { clearTimeout(manifestTimer); } } });
   }
 
-  // ── 7. Active Workspace registry update ──────────────────────────────────
+  // ── 7. Active Workspace registry update (only while CodeLens is on here) ──
   if (activeWorkspaceRoot) {
-    updateActiveWorkspaceRegistry(activeWorkspaceRoot);
     context.subscriptions.push(
       vscode.window.onDidChangeWindowState(e => {
-        if (e.focused) {
+        if (e.focused && registeredInRegistry) {
           updateActiveWorkspaceRegistry(activeWorkspaceRoot);
         }
       })
@@ -406,7 +437,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   deactivated = true;
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-  if (workspaceRoot) {
+  if (workspaceRoot && registeredInRegistry) {
     updateActiveWorkspaceRegistry(workspaceRoot, true);
   }
   backgroundScanner?.dispose();
@@ -476,6 +507,7 @@ async function manualBuild(context: vscode.ExtensionContext, force = false): Pro
     vscode.window.showWarningMessage('CodeLens Graph only indexes trusted workspaces. Trust this workspace to build the graph.');
     return;
   }
+  if (!await ensureEnabledFor(context, 'build the graph', false)) { return; }
   await context.workspaceState.update('graphCleared', false);
   await db.ensureInit();
   awaitingFolderSelection = false;
@@ -622,7 +654,7 @@ function refreshSavings(): void {
 
 function refreshGraphPanel(): void {
   if (!graphPanel?.visible) { return; }
-  if (currentStatus === 'idle' && !db.isInitialized()) {
+  if (currentStatus === 'disabled' || (currentStatus === 'idle' && !db.isInitialized())) {
     graphPanel.webview.postMessage({ command: 'updateGraph', nodes: [], edges: [] });
     return;
   }
@@ -768,9 +800,11 @@ function getConfig() {
   };
 }
 
-type StatusState = 'idle' | 'scanning' | 'updating' | 'ready' | 'error' | 'needsFolders';
+type StatusState = 'idle' | 'scanning' | 'updating' | 'ready' | 'error' | 'needsFolders' | 'disabled';
 
 function setStatus(state: StatusState, nodes?: number, edges?: number): void {
+  // Work that finishes after CodeLens was turned off here must not flip the status back.
+  if (extensionContext && !isWorkspaceEnabled()) { state = 'disabled'; }
   currentStatus = state;
   statusBarItem.command = 'codelens-graph.showGraph';
   statsViewProvider?.setStatus(state);
@@ -790,6 +824,11 @@ function setStatus(state: StatusState, nodes?: number, edges?: number): void {
       statusBarItem.text    = `$(type-hierarchy) CodeLens: ${nodes ?? '?'} symbols`;
       statusBarItem.tooltip = `Graph ready · ${nodes} nodes · ${edges} edges\nClick to open graph viewer`;
       break;
+    case 'disabled':
+      statusBarItem.text    = '$(circle-slash) CodeLens: off';
+      statusBarItem.tooltip = 'CodeLens Graph is off for this workspace — click to turn it on';
+      statusBarItem.command = 'codelens-graph.enableWorkspace';
+      return;
     case 'needsFolders':
       statusBarItem.text    = '$(list-tree) CodeLens: choose folders';
       statusBarItem.tooltip = 'Large workspace — choose which folders to index';
@@ -815,7 +854,102 @@ function setStatus(state: StatusState, nodes?: number, edges?: number): void {
 async function startup(context: vscode.ExtensionContext): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
   if (!workspaceRoot) { return; }
+
+  let decision = context.workspaceState.get<boolean>(WORKSPACE_ENABLED_KEY);
+  if (decision === undefined && fs.existsSync(path.join(workspaceRoot, '.codelens', 'codelens-graph.db'))) {
+    // Already indexed by an earlier version: keep working without asking.
+    decision = true;
+    await context.workspaceState.update(WORKSPACE_ENABLED_KEY, true);
+  }
+  await vscode.commands.executeCommand('setContext', 'codelens.workspaceEnabled', decision === true);
+  // Keep the MCP server's copy of an explicit choice in sync.
+  if (decision !== undefined) { setWorkspaceDisabled(workspaceRoot, !decision); }
+  if (decision === true) {
+    await runEnabledStartup(context, false);
+    return;
+  }
+
+  // Off or not decided yet: nothing is read, parsed or written.
+  setStatus('disabled');
+  if (decision === false) { return; }
+  await new Promise(resolve => setTimeout(resolve, STARTUP_SETTLE_MS));
+  await whenWindowFocused(context);
+  if (deactivated || context.workspaceState.get<boolean>(WORKSPACE_ENABLED_KEY) !== undefined) { return; }
+  console.log('[CodeLens] Asking whether to use CodeLens in this workspace.');
+  const choice = await vscode.window.showInformationMessage(
+    'Use CodeLens Graph in this workspace? It builds a local code graph (in .codelens/) that your AI agents can query. '
+      + 'You can change this anytime from the CodeLens sidebar.',
+    'Yes', 'No'
+  );
+  // Dismissed without answering: do nothing now and ask again next session.
+  if (choice === undefined || context.workspaceState.get<boolean>(WORKSPACE_ENABLED_KEY) !== undefined) { return; }
+  await setWorkspaceEnabled(context, choice === 'Yes');
+}
+
+function isWorkspaceEnabled(): boolean {
+  return extensionContext?.workspaceState.get<boolean>(WORKSPACE_ENABLED_KEY) === true;
+}
+
+// Turns CodeLens on or off for this workspace (this window's workspace only).
+async function setWorkspaceEnabled(context: vscode.ExtensionContext, enabled: boolean): Promise<void> {
+  const wasEnabled = isWorkspaceEnabled();
+  await context.workspaceState.update(WORKSPACE_ENABLED_KEY, enabled);
+  const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (root) { setWorkspaceDisabled(root, !enabled); }
+  await vscode.commands.executeCommand('setContext', 'codelens.workspaceEnabled', enabled);
+  indexedFoldersProvider?.refresh();
+  if (enabled) {
+    console.log('[CodeLens] Turned on for this workspace.');
+    if (!wasEnabled || !db.isInitialized()) { await runEnabledStartup(context, true); }
+    return;
+  }
+  console.log('[CodeLens] Turned off for this workspace.');
+  awaitingFolderSelection = false;
+  backgroundScanner.setAcceptingChanges(false);
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (workspaceRoot && registeredInRegistry) {
+    updateActiveWorkspaceRegistry(workspaceRoot, true);
+    registeredInRegistry = false;
+  }
+  setStatus('disabled');
+}
+
+// For actions that need the graph while CodeLens may be off here. Turning it on
+// starts normal background indexing unless the caller builds the graph itself.
+async function ensureEnabledFor(context: vscode.ExtensionContext, action: string, startIndexing = true): Promise<boolean> {
+  if (isWorkspaceEnabled()) { return true; }
+  const choice = await vscode.window.showInformationMessage(
+    `CodeLens Graph is off for this workspace. Turn it on to ${action}?`, 'Turn On'
+  );
+  if (choice !== 'Turn On') { return false; }
+  await context.workspaceState.update(WORKSPACE_ENABLED_KEY, true);
+  const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (root) { setWorkspaceDisabled(root, false); }
+  await vscode.commands.executeCommand('setContext', 'codelens.workspaceEnabled', true);
+  indexedFoldersProvider?.refresh();
+  if (startIndexing) {
+    void runEnabledStartup(context, true);
+  } else {
+    registerWorkspace();
+  }
+  return true;
+}
+
+function registerWorkspace(): void {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+  if (!workspaceRoot) { return; }
+  registeredInRegistry = true;
+  updateActiveWorkspaceRegistry(workspaceRoot);
+}
+
+// The normal startup flow, once CodeLens is on for the workspace. settled =
+// VS Code has already finished starting up (the user just turned it on).
+async function runEnabledStartup(context: vscode.ExtensionContext, settled: boolean): Promise<void> {
+  // Turned off and on again while a run is in progress: run once more after it.
+  if (enabledStartupRunning) { startupRerunRequested = true; return; }
+  enabledStartupRunning = true;
   try {
+    registerWorkspace();
     await db.init();
     const stats = db.getStats();
     if (stats.totalNodes > 0) { setStatus('ready', stats.totalNodes, stats.totalEdges); }
@@ -827,8 +961,8 @@ async function startup(context: vscode.ExtensionContext): Promise<void> {
     }
 
     await whenWorkspaceTrusted(context);
-    await new Promise(resolve => setTimeout(resolve, STARTUP_SETTLE_MS));
-    if (deactivated) { return; }
+    if (!settled) { await new Promise(resolve => setTimeout(resolve, STARTUP_SETTLE_MS)); }
+    if (deactivated || !isWorkspaceEnabled()) { return; }
 
     // Never indexed, no folders selected, and very large: ask before indexing.
     // (A graph rebuilt for a storage upgrade was indexed before — no need to ask.)
@@ -838,7 +972,7 @@ async function startup(context: vscode.ExtensionContext): Promise<void> {
       const fileCount = await backgroundScanner.countIndexableFiles(scope, scanOptions());
       if (fileCount > getConfig().largeWorkspaceThreshold) {
         console.log(`[CodeLens] ${fileCount} indexable files — asking which folders to index.`);
-        await offerFolderSelection(context, fileCount);
+        void offerFolderSelection(context, fileCount);
         return;
       }
     }
@@ -848,18 +982,25 @@ async function startup(context: vscode.ExtensionContext): Promise<void> {
   } catch (err) {
     console.error('[CodeLens] Startup failed:', err);
     setStatus('error');
+  } finally {
+    enabledStartupRunning = false;
+    if (startupRerunRequested) {
+      startupRerunRequested = false;
+      if (isWorkspaceEnabled() && !deactivated) { void runEnabledStartup(context, true); }
+    }
   }
 }
 
 // Brings the graph in line with the folder selection (only added/removed or
 // changed files cost anything), then offers agent setup once.
 async function indexWorkspace(context: vscode.ExtensionContext): Promise<void> {
+  if (!isWorkspaceEnabled()) { return; }
   awaitingFolderSelection = false;
   backgroundScanner.setAcceptingChanges(true);
   await backgroundScanner.runFullScan(currentScope(), scanOptions());
   await backgroundScanner.whenIdle();
   if (deactivated) { return; }
-  await offerAgentSetup(context);
+  void offerAgentSetup(context);
 }
 
 // Shown once per session for a large workspace that has never been indexed.
@@ -1000,6 +1141,7 @@ async function offerAgentSetup(context: vscode.ExtensionContext): Promise<void> 
 async function configureAgents(context: vscode.ExtensionContext): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
   if (!workspaceRoot) { return; }
+  if (!await ensureEnabledFor(context, 'set up your AI agents')) { return; }
   await db.ensureInit();
   const ides = await promptForIdes(context);
   if (ides === undefined) { return; }

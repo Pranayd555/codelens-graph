@@ -23,7 +23,9 @@ CodeLens Graph fixes this by providing exact, targeted symbol subgraphs:
 
 ## How it works
 
-Once VS Code has finished starting up (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and the direct dependencies declared in your `package.json` files (installed version, entry points, type definitions — read without walking or parsing `node_modules`). You choose which folders are indexed from the **Indexed Folders** view; very large workspaces are not indexed until you pick. It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
+CodeLens Graph is opt-in per workspace. The first time you open a folder, it asks **"Use CodeLens Graph in this workspace?"** once VS Code has settled. Until you answer **Yes**, nothing is parsed and no files are created. **No** keeps it off for that workspace only — other folders and other open VS Code windows keep their own choice. Your answer is stored privately in VS Code (not in the project), and you can change it anytime from the CodeLens sidebar or with **CodeLens: Turn On / Turn Off for This Workspace**. Workspaces that already have a `.codelens/` index are treated as **Yes**.
+
+Once it is on (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and the direct dependencies declared in your `package.json` files (installed version, entry points, type definitions — read without walking or parsing `node_modules`). You choose which folders are indexed from the **Indexed Folders** view; very large workspaces are not indexed until you pick. It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
 
 The key insight: instead of the agent reading 5–10 files to orient itself, it calls one MCP tool and gets back only the relevant symbols, snippets, and relationships for the current task.
 
@@ -99,6 +101,8 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 
 | Command | Purpose |
 |---------|---------|
+| `CodeLens: Turn On for This Workspace` | Start using CodeLens in this workspace (only this one) |
+| `CodeLens: Turn Off for This Workspace` | Stop indexing and watching this workspace; existing files are kept. The standalone MCP server also answers "off" here |
 | `CodeLens: Build Knowledge Graph` | Full scan of workspace |
 | `CodeLens: Force Rebuild Graph` | Clear and rescan |
 | `CodeLens: Show Graph Explorer` | Interactive D3 force graph |

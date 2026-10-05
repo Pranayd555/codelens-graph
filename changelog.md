@@ -4,17 +4,19 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
-## [0.3.0] - 2026-10-04
+## [0.3.0] - 2026-10-06
 
 ### Added
+- **Per-workspace opt-in**: the first time a folder is opened, CodeLens asks "Use CodeLens Graph in this workspace?" (after startup settles). Nothing is parsed, indexed or written before **Yes**; **No** keeps it off for that workspace only, without affecting other folders or other open windows. The choice is stored privately in VS Code's workspace state and can be changed from the sidebar or with **CodeLens: Turn On / Turn Off for This Workspace**. Workspaces that already have an index are treated as on. The standalone MCP server answers "off" for a turned-off workspace instead of indexing it (explicit "off" choices are mirrored to the per-user `~/.codelens/disabled-workspaces.json`, never into the project).
 - **Choose which folders are indexed**: new **Indexed Folders** sidebar view (checkboxes, file counts) and **CodeLens: Select Indexed Folders…** picker, backed by the `codeLensGraph.includeFolders` setting in `.vscode/settings.json`. Files in the workspace root are always indexed; an explicitly selected folder is indexed even if its name is normally skipped. Changing the selection only parses added folders and drops removed ones.
 - **Large-workspace guard**: a never-indexed workspace above `codeLensGraph.largeWorkspaceThreshold` (default 5000 files) waits for a folder selection instead of indexing everything.
 - **Dependency manifest**: direct dependencies declared in workspace `package.json` files (version, entry points, type definitions, readme). `codelens_dependencies` lists exports on demand from type definitions, and `dependents` now returns the files that import a package.
 - **Single agent-setup prompt** shown after the first index finishes; nothing outside `.codelens/` is written until you choose.
-- **Commands**: `CodeLens: Select Indexed Folders…`, `CodeLens: Index Entire Workspace`.
+- **Commands**: `CodeLens: Select Indexed Folders…`, `CodeLens: Index Entire Workspace`, `CodeLens: Turn On for This Workspace`, `CodeLens: Turn Off for This Workspace`.
 
 ### Changed
-- **Non-blocking startup**: activation returns immediately; indexing starts after the workspace is trusted and VS Code has settled, and never waits on user input.
+- **Non-blocking startup**: activation returns immediately; indexing starts after the workspace is turned on and trusted and VS Code has settled, and never waits on user input.
+- The global active-workspace registry only lists windows where CodeLens is turned on.
 - **Responsiveness**: scans, file-change batches and relationship resolution yield to the extension host; file events are batched (one resolve and one save per batch); an unchanged startup rescan skips the resolve and the save. Worst extension-host freeze on a 1,180-file workspace: first index 61 s → under 1 s, 100-file change 390 s → 0.25 s.
 - **Compact storage**: integer keys and workspace-relative paths (≈5× smaller DB, ≈7× faster saves). Indexes from older versions are rebuilt automatically once.
 - **No node_modules indexing**: dependencies come from the manifest instead of walking and parsing `node_modules`.

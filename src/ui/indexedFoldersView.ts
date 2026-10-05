@@ -39,7 +39,10 @@ export class IndexedFoldersProvider implements vscode.TreeDataProvider<vscode.Tr
 
   constructor(
     private readonly workspaceRoot: string,
-    private readonly getFolders: () => string[]
+    private readonly getFolders: () => string[],
+    // While CodeLens is off for the workspace the tree is empty, so VS Code
+    // shows the view's welcome content (a "Turn On" link) instead.
+    private readonly isEnabled: () => boolean
   ) {}
 
   refresh(): void { this.changed.fire(undefined); }
@@ -52,6 +55,7 @@ export class IndexedFoldersProvider implements vscode.TreeDataProvider<vscode.Tr
   getTreeItem(item: vscode.TreeItem): vscode.TreeItem { return item; }
 
   getChildren(parent?: vscode.TreeItem): vscode.TreeItem[] {
+    if (!this.isEnabled()) { return []; }
     const relDir = parent instanceof FolderItem ? parent.relPath : '';
     const folders = this.getFolders();
     const items: vscode.TreeItem[] = [];
