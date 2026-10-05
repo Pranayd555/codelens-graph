@@ -3,18 +3,20 @@ import * as path from 'path';
 import { ASTParser } from './astParser';
 import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
-import { isConfigPath, isNodeModulePath, shouldIndexNodeModuleFile, matchPathFilter } from '../utils';
+import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
 import { TextIndex } from '../indexing/textIndex';
+import { IndexScope, scopeRoots, isInScope, relativeToWorkspace } from './indexScope';
 
 export interface ScanOptions {
   excludePatterns:        string[];
   supportedExtensions:    string[];
   onProgress?:            (current: number, total: number, filePath: string) => void;
-  excludeDeps?:           boolean;
-  depsOnly?:              boolean;
-  indexDependencySymbols?: boolean;
   force?:                 boolean;
 }
+
+// Config files that are indexed (as file nodes, without symbol parsing) even
+// when their extension isn't in supportedExtensions.
+const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
 
 export interface ScanResult {
   filesScanned:  number;
@@ -91,7 +93,6 @@ const ALWAYS_EXCLUDE_DIRS = new Set([
   // ── C# / .NET ────────────────────────────────────────────────────────────
   'obj',                // .NET build intermediates
   'bin',                // .NET build output (same as Java above)
-  'packages',           // NuGet packages
   '.vs',                // Visual Studio project state
   // ── Ruby ─────────────────────────────────────────────────────────────────
   '.bundle',            // Bundler config & gems
@@ -147,13 +148,33 @@ const ALWAYS_EXCLUDE_FILES = new Set([
 
 // ─── WorkspaceScanner ─────────────────────────────────────────────────────────
 
+// The extension host is one thread shared by every extension, so long scans
+// hand control back this often to keep other extensions responsive.
+const YIELD_INTERVAL_MS = 25;
+const yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
+
+// Folder names that are never walked into on their own (build output, caches,
+// tool and VCS folders). A folder the user explicitly selects is still indexed.
+export function isSkippedDirectoryName(name: string): boolean {
+  if (name === 'node_modules') { return true; }
+  if (ALWAYS_EXCLUDE_DIRS.has(name)) { return true; }
+  // Hidden folders are almost always tool caches; .github is the exception.
+  if (name.startsWith('.') && name !== '.github') { return true; }
+  if (/^__pycache__$|^\.pytest_cache$|^\.mypy_cache$/.test(name)) { return true; }
+  return /^.*[-_](cache|dist|build|generated|gen|out|output|artifacts?)$/i.test(name);
+}
+
 export class WorkspaceScanner {
   private textIndex: TextIndex;
   constructor(private parser: ASTParser, private db: GraphDB) {
     this.textIndex = new TextIndex(db);
   }
 
-  async scanWorkspace(rootPaths: string[], options: ScanOptions): Promise<ScanResult> {
+  // Brings the graph in line with the scope: parses new/changed files in scope
+  // and drops indexed files that are gone or no longer in scope (e.g. a
+  // deselected folder). Unchanged files are skipped, so a scope change only
+  // costs the folders that were added or removed.
+  async scanWorkspace(scope: IndexScope, options: ScanOptions): Promise<ScanResult> {
     const start  = Date.now();
     const result: ScanResult = {
       filesScanned: 0, filesSkipped: 0,
@@ -163,31 +184,22 @@ export class WorkspaceScanner {
 
     await this.parser.ensureInit();
 
-    const allFiles    = this.collectFiles(rootPaths, options);
+    const allFiles    = await this.listFiles(scope, options);
     const total       = allFiles.length;
     const indexedSet  = new Set(allFiles.map(f => path.normalize(f)));
 
-    // Remove stale entries for files that disappeared
+    // Drop files that disappeared or fell out of scope (including node_modules
+    // entries written by older versions).
+    let removedStale = false;
+    let lastStaleYield = Date.now();
     for (const indexed of this.db.getAllFiles('all')) {
-      const belongsToRoot = rootPaths.some(root => {
-        const rel = path.relative(root, indexed);
-        return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-      });
-      if (belongsToRoot && !indexedSet.has(path.normalize(indexed))) {
-        const isDep = isNodeModulePath(indexed) || isConfigPath(indexed);
-        if (options.depsOnly && !isDep) {
-          continue;
-        }
-        if (options.excludeDeps && isDep) {
-          continue;
-        }
-        if (isDep) {
-          if (!fs.existsSync(indexed)) {
-            this.db.deleteNodesByFile(indexed);
-          }
-        } else {
-          this.db.deleteNodesByFile(indexed);
-        }
+      if (Date.now() - lastStaleYield > YIELD_INTERVAL_MS) {
+        await yieldToEventLoop();
+        lastStaleYield = Date.now();
+      }
+      if (relativeToWorkspace(indexed, scope.workspaceRoot) === null) { continue; }
+      if (!indexedSet.has(path.normalize(indexed))) {
+        if (this.db.deleteNodesByFile(indexed)) { removedStale = true; }
       }
     }
 
@@ -198,9 +210,14 @@ export class WorkspaceScanner {
     }
 
     let lastPersistTime = Date.now();
-    let unsavedChanges = false;
+    let unsavedChanges = removedStale;
+    let lastYield = Date.now();
 
     for (let i = 0; i < allFiles.length; i++) {
+      if (Date.now() - lastYield > YIELD_INTERVAL_MS) {
+        await yieldToEventLoop();
+        lastYield = Date.now();
+      }
       const filePath = allFiles[i];
       options.onProgress?.(i + 1, total, filePath);
 
@@ -224,7 +241,7 @@ export class WorkspaceScanner {
         const parsed = await this.parser.parseFileAsync(filePath);
         if (parsed.parseErrors.length) { result.errors.push(...parsed.parseErrors); }
 
-        this.db.deleteNodesByFile(filePath);
+        const hadNodes = this.db.deleteNodesByFile(filePath);
 
         if (parsed.nodes.length > 0) {
           this.db.upsertNodes(parsed.nodes);
@@ -238,9 +255,10 @@ export class WorkspaceScanner {
           result.filesScanned++;
           unsavedChanges = true;
         } else {
-          this.db.deleteTextEntriesByFile(filePath);
+          // Empty or unparseable file: re-checked every scan, but only a real
+          // removal (it used to have symbols) counts as a change.
           result.filesScanned++;
-          unsavedChanges = true;
+          if (hadNodes) { unsavedChanges = true; }
         }
       } catch (err) {
         result.errors.push(`${filePath}: ${err}`);
@@ -258,11 +276,15 @@ export class WorkspaceScanner {
       }
     }
 
-    try {
-      this.db.resolveWorkspaceRelationships();
-      this.db.persist();
-    } catch (err) {
-      result.errors.push(`Final persist failed: ${err}`);
+    // Resolving relationships and rewriting the whole DB are the most expensive
+    // steps, so skip both when the scan changed nothing (the common startup case).
+    if (this.db.needsRelationshipResolve() || unsavedChanges) {
+      try {
+        await this.db.resolveWorkspaceRelationships();
+        this.db.persist();
+      } catch (err) {
+        result.errors.push(`Final persist failed: ${err}`);
+      }
     }
     result.edgesAdded = this.db.getStats().totalEdges;
     result.durationMs = Date.now() - start;
@@ -288,7 +310,7 @@ export class WorkspaceScanner {
       const currentSymbols = parsed.nodes
         .filter(n => n.type !== 'file' && n.type !== 'import')
         .map(n => n.name);
-      this.db.resolveWorkspaceRelationships(
+      await this.db.resolveWorkspaceRelationships(
         filePath,
         [...new Set([...previousSymbols, ...currentSymbols])]
       );
@@ -297,8 +319,10 @@ export class WorkspaceScanner {
     return parsed;
   }
 
-  isFileAllowed(filePath: string, workspaceRoot: string, options: ScanOptions): boolean {
+  isFileAllowed(filePath: string, scope: IndexScope, options: ScanOptions): boolean {
+    const workspaceRoot = scope.workspaceRoot;
     const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(workspaceRoot, filePath);
+    if (!isInScope(absolutePath, scope) || isNodeModulePath(absolutePath)) { return false; }
     const ext = path.extname(absolutePath).toLowerCase();
     const filename = path.basename(absolutePath);
     const relPath = path.relative(workspaceRoot, absolutePath).replace(/\\/g, '/');
@@ -309,16 +333,7 @@ export class WorkspaceScanner {
       if (this.matchesGlob(relPath, filename, pattern)) { return false; }
     }
 
-    const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
     const isConfig = isConfigPath(absolutePath);
-    const isNm = isNodeModulePath(absolutePath);
-
-    if (isNm) {
-      // Limit node_modules files to depth 3 relative to node_modules
-      const parts = relPath.split('/');
-      if (parts.length > 5) { return false; }
-      return shouldIndexNodeModuleFile(absolutePath, options.indexDependencySymbols);
-    }
 
     if (isConfig && CONFIG_EXTS.has(ext)) {
       return true;
@@ -327,11 +342,17 @@ export class WorkspaceScanner {
     const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
     if (!extSet.has(ext)) { return false; }
 
+    // Folder-name excludes apply below the selected folders, not to the
+    // folders the user explicitly chose.
+    const selectedRoot = scope.folders
+      .map(f => f.toLowerCase())
+      .find(f => relPath.toLowerCase().startsWith(f + '/')) ?? '';
     const segments = relPath.split('/');
     let currentRelPath = '';
     for (let i = 0; i < segments.length - 1; i++) {
       const segment = segments[i];
       currentRelPath = currentRelPath ? `${currentRelPath}/${segment}` : segment;
+      if (currentRelPath.length <= selectedRoot.length) { continue; }
       if (this.shouldExcludeDir(segment, currentRelPath, options.excludePatterns)) {
         return false;
       }
@@ -342,77 +363,77 @@ export class WorkspaceScanner {
 
   // ── File collection ────────────────────────────────────────────────────────
 
-  private collectFiles(rootPaths: string[], options: ScanOptions): string[] {
+  // Whether a path (file or folder) is somewhere CodeLens indexes: in scope, not
+  // in node_modules, and not inside an excluded folder. Used for watcher events
+  // that may be folders — a deleted or moved folder arrives as one event.
+  isTrackedLocation(absPath: string, scope: IndexScope, options: ScanOptions): boolean {
+    const relPath = relativeToWorkspace(absPath, scope.workspaceRoot);
+    if (relPath === null || !isInScope(absPath, scope) || isNodeModulePath(absPath)) { return false; }
+    const selectedRoot = scope.folders
+      .map(f => f.toLowerCase())
+      .find(f => relPath.toLowerCase() === f || relPath.toLowerCase().startsWith(f + '/')) ?? '';
+    let currentRelPath = '';
+    for (const segment of relPath.split('/')) {
+      currentRelPath = currentRelPath ? `${currentRelPath}/${segment}` : segment;
+      if (currentRelPath.length <= selectedRoot.length) { continue; }
+      if (this.shouldExcludeDir(segment, currentRelPath, options.excludePatterns)) { return false; }
+    }
+    return true;
+  }
+
+  // Indexable files under a folder (e.g. one that was just moved or copied in).
+  async listFilesUnder(absDir: string, scope: IndexScope, options: ScanOptions): Promise<string[]> {
+    if (!this.isTrackedLocation(absDir, scope, options)) { return []; }
+    const files: string[] = [];
+    const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
+    await this.walkDir(absDir, scope.workspaceRoot, extSet, options.excludePatterns, files, true);
+    return files.filter(f => isInScope(f, scope));
+  }
+
+  // Every indexable file in scope: the selected folders (recursively) plus files
+  // directly in the workspace root. Never descends into node_modules.
+  async listFiles(scope: IndexScope, options: ScanOptions): Promise<string[]> {
     const files  = new Array<string>();
     const extSet = new Set(options.supportedExtensions.map(e => e.toLowerCase()));
     const userPatterns = options.excludePatterns;
 
-    for (const root of rootPaths) {
-      this.walkDir(root, root, extSet, userPatterns, files, options);
+    for (const root of scopeRoots(scope)) {
+      await this.walkDir(root, scope.workspaceRoot, extSet, userPatterns, files, true);
+    }
+    if (scope.folders.length) {
+      await this.walkDir(scope.workspaceRoot, scope.workspaceRoot, extSet, userPatterns, files, false);
     }
     return files;
   }
 
-  private walkDir(
+  // workspaceRoot is used for workspace-relative exclude matching; the walk
+  // itself starts at dir.
+  private async walkDir(
     dir: string,
-    root: string,
+    workspaceRoot: string,
     exts: Set<string>,
     userPatterns: string[],
     results: string[],
-    options: ScanOptions,
-    inNodeModules = false,
-    nodeModulesDepth = 0
-  ): void {
+    recursive: boolean
+  ): Promise<void> {
     let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
     catch { return; }
-
-    const CONFIG_EXTS = new Set(['.json', '.md', '.yml', '.yaml', '.js', '.ts', '.tsx', '.jsx', '.json5', '.toml']);
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
-      const relPath  = path.relative(root, fullPath).replace(/\\/g, '/');
-
-      const isNodeModulesDir = entry.name === 'node_modules';
+      const relPath  = path.relative(workspaceRoot, fullPath).replace(/\\/g, '/');
 
       if (entry.isDirectory()) {
-        if (isNodeModulesDir && options.excludeDeps) {
-          continue;
-        }
-        const nextInNodeModules = inNodeModules || isNodeModulesDir;
-        const nextDepth = isNodeModulesDir ? 0 : (nextInNodeModules ? nodeModulesDepth + 1 : 0);
-
-        // Limit depth inside node_modules to 3
-        if (nextInNodeModules && nextDepth > 3) {
-          continue;
-        }
-
+        if (!recursive || entry.name === 'node_modules') { continue; }
         if (this.shouldExcludeDir(entry.name, relPath, userPatterns)) { continue; }
-        this.walkDir(fullPath, root, exts, userPatterns, results, options, nextInNodeModules, nextDepth);
+        await this.walkDir(fullPath, workspaceRoot, exts, userPatterns, results, true);
       } else if (entry.isFile()) {
-        if (options.depsOnly && !inNodeModules) {
-          continue;
-        }
-        if (this.shouldExcludeFile(entry.name, relPath, userPatterns)) {
-          const isConfig = isConfigPath(fullPath);
-          const isNm = inNodeModules;
-          const allowed = (isNm && shouldIndexNodeModuleFile(fullPath, options.indexDependencySymbols)) || (isConfig && CONFIG_EXTS.has(path.extname(entry.name).toLowerCase()));
-          if (!allowed) {
-            continue;
-          }
-        }
-        
         const ext = path.extname(entry.name).toLowerCase();
-        const isConfig = isConfigPath(fullPath);
-        
-        if (inNodeModules) {
-          if (shouldIndexNodeModuleFile(fullPath, options.indexDependencySymbols)) {
-            results.push(fullPath);
-          }
-        } else {
-          if (exts.has(ext) || (isConfig && CONFIG_EXTS.has(ext))) {
-            results.push(fullPath);
-          }
+        const isConfig = isConfigPath(fullPath) && CONFIG_EXTS.has(ext);
+        if (this.shouldExcludeFile(entry.name, relPath, userPatterns) && !isConfig) { continue; }
+        if (exts.has(ext) || isConfig) {
+          results.push(fullPath);
         }
       }
     }
@@ -423,29 +444,12 @@ export class WorkspaceScanner {
   // Handles dotfile dirs (e.g. .angular, .trae) and nested paths.
 
   private shouldExcludeDir(name: string, relPath: string, userPatterns: string[]): boolean {
-    const isNm = name === 'node_modules' || relPath.includes('node_modules/') || relPath.split('/').includes('node_modules');
-    if (isNm) {
-      if (ALWAYS_EXCLUDE_DIRS.has(name)) { return true; }
-      if (name.startsWith('.') && name !== '.github') { return true; }
-      return false;
-    }
+    if (isSkippedDirectoryName(name)) { return true; }
 
-    // 1. Hard-coded never-index set — exact directory name match
-    if (ALWAYS_EXCLUDE_DIRS.has(name)) { return true; }
-
-    // 2. Dotfile directories — any hidden dir is almost certainly a tool cache
-    //    Exception: .github is sometimes needed (but not indexed for code anyway)
-    if (name.startsWith('.') && name !== '.github') { return true; }
-
-    // 3. Directories that look like generated/installed content by name pattern
-    if (/^__pycache__$|^\.pytest_cache$|^\.mypy_cache$/.test(name)) { return true; }
-    if (/^.*[-_](cache|dist|build|generated|gen|out|output|artifacts?)$/i.test(name)) {
-      return true;
-    }
-
-    // 4. User-provided glob patterns — proper segment matching
+    // User-provided glob patterns. A directory matches if the pattern matches
+    // its path or anything inside it (e.g. "**/generated/**" for "src/generated").
     for (const pattern of userPatterns) {
-      if (this.matchesGlob(relPath, name, pattern)) { return true; }
+      if (this.matchesGlob(relPath, name, pattern) || matchPathFilter(relPath + '/', pattern)) { return true; }
     }
 
     return false;

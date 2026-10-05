@@ -32,7 +32,7 @@ function extractKeywords(text: string): string[] {
 // ─── ContextBuilder ───────────────────────────────────────────────────────────
 
 export class ContextBuilder {
-  private snippets    = new SnippetExtractor();
+  private snippets    = new SnippetExtractor(() => this.db.getWorkspaceRoot());
   private classifier  = new FileClassifier();
 
   constructor(private db: GraphDB) {}

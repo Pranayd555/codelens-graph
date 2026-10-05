@@ -32,6 +32,19 @@ function copyWasmFiles() {
   console.log(`Copied ${copied} WASM files → dist/wasm/`);
 }
 
+// ── Copy D3 file to dist/node_modules/d3/dist/ ────────────────────────────────
+function copyD3File() {
+  const dest = path.join(__dirname, 'dist', 'node_modules', 'd3', 'dist');
+  fs.mkdirSync(dest, { recursive: true });
+  const src = path.join(__dirname, 'node_modules', 'd3', 'dist', 'd3.min.js');
+  if (fs.existsSync(src)) {
+    fs.copyFileSync(src, path.join(dest, 'd3.min.js'));
+    console.log('Copied d3.min.js → dist/node_modules/d3/dist/d3.min.js');
+  } else {
+    console.warn('d3.min.js not found in node_modules/d3/dist/');
+  }
+}
+
 // ── Shared build options ──────────────────────────────────────────────────────
 const shared = {
   bundle:    true,
@@ -59,6 +72,7 @@ function writeMcpLauncher() {
 
 async function buildAll() {
   copyWasmFiles();
+  copyD3File();
 
   // 1. VS Code extension bundle (vscode excluded, no shebang)
   await esbuild.build({
@@ -84,6 +98,7 @@ async function buildAll() {
 
 async function buildWatch() {
   copyWasmFiles();
+  copyD3File();
   const ctx = await esbuild.context({
     ...shared,
     entryPoints: ['src/extension.ts'],

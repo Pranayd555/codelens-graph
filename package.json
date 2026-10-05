@@ -2,7 +2,7 @@
   "name": "codelens-graph",
   "displayName": "CodeLens Graph",
   "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "publisher": "PranayDas",
   "repository": {
     "type": "git",
@@ -37,6 +37,12 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "CodeLens Graph only indexes the workspace and writes agent configuration files once the workspace is trusted."
+    }
+  },
   "main": "./dist/extension.js",
   "scripts": {
     "compile": "node esbuild.js",
@@ -90,8 +96,43 @@
       {
         "command": "codelens-graph.clearConfig",
         "title": "CodeLens: Clear Configuration Files and Reset State"
+      },
+      {
+        "command": "codelens-graph.selectIndexedFolders",
+        "title": "CodeLens: Select Indexed Folders…",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "codelens-graph.indexEntireWorkspace",
+        "title": "CodeLens: Index Entire Workspace",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "codelens-graph.refreshIndexedFolders",
+        "title": "CodeLens: Refresh Indexed Folders",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codelens-graph.enableWorkspace",
+        "title": "CodeLens: Turn On for This Workspace"
+      },
+      {
+        "command": "codelens-graph.disableWorkspace",
+        "title": "CodeLens: Turn Off for This Workspace"
       }
     ],
+    "menus": {
+      "view/title": [
+        { "command": "codelens-graph.selectIndexedFolders", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@1" },
+        { "command": "codelens-graph.indexEntireWorkspace", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@2" },
+        { "command": "codelens-graph.refreshIndexedFolders", "when": "view == codelens-graph.indexedFolders && codelens.workspaceEnabled", "group": "navigation@3" }
+      ],
+      "commandPalette": [
+        { "command": "codelens-graph.refreshIndexedFolders", "when": "false" },
+        { "command": "codelens-graph.enableWorkspace", "when": "workspaceFolderCount > 0 && !codelens.workspaceEnabled" },
+        { "command": "codelens-graph.disableWorkspace", "when": "codelens.workspaceEnabled" }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -101,6 +142,13 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "codelens-graph.indexedFolders",
+        "contents": "CodeLens Graph is off for this workspace. Nothing is indexed and no files are created.\n[Turn On for This Workspace](command:codelens-graph.enableWorkspace)\nOnly this workspace is affected; other windows keep their own setting.",
+        "when": "workspaceFolderCount > 0 && !codelens.workspaceEnabled"
+      }
+    ],
     "views": {
       "codelens-graph-sidebar": [
         {
@@ -110,10 +158,10 @@
           "icon": "$(type-hierarchy)"
         },
         {
-          "id": "codelens-graph.symbolTree",
-          "name": "Symbol Explorer",
+          "id": "codelens-graph.indexedFolders",
+          "name": "Indexed Folders",
           "type": "tree",
-          "icon": "$(type-hierarchy)"
+          "icon": "$(list-tree)"
         }
       ]
     },
@@ -180,10 +228,18 @@
           ],
           "description": "Glob patterns for directories and files to exclude from graph indexing."
         },
-        "codeLensGraph.indexDependencySymbols": {
-          "type": "boolean",
-          "default": false,
-          "description": "Whether to index all internal symbols (classes, interfaces, methods, functions, variables) from dependencies in node_modules. Keeping this false drastically reduces database size and memory usage on large codebases."
+        "codeLensGraph.includeFolders": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "Workspace-relative folders to index (e.g. `src`, `packages/api`). Empty means the whole workspace. Files directly in the workspace root (`package.json`, `tsconfig.json`, …) are always indexed. A folder listed here is indexed even if its name is normally skipped (e.g. `build`). Easiest to manage from the **Indexed Folders** view."
+        },
+        "codeLensGraph.largeWorkspaceThreshold": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 0,
+          "markdownDescription": "When a workspace has never been indexed, has no folder selection, and contains more indexable files than this, CodeLens asks which folders to index instead of indexing everything."
         },
         "codeLensGraph.supportedExtensions": {
           "type": "array",
@@ -208,6 +264,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "d3": "^7.9.0",
     "sql.js": "^1.11.0",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6",

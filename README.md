@@ -23,7 +23,9 @@ CodeLens Graph fixes this by providing exact, targeted symbol subgraphs:
 
 ## How it works
 
-On activation, CodeLens Graph silently indexes your entire codebase into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and package dependencies (entry points, signatures, and version details from `node_modules`). It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
+CodeLens Graph is opt-in per workspace. The first time you open a folder, it asks **"Use CodeLens Graph in this workspace?"** once VS Code has settled. Until you answer **Yes**, nothing is parsed and no files are created. **No** keeps it off for that workspace only — other folders and other open VS Code windows keep their own choice. Your answer is stored privately in VS Code (not in the project), and you can change it anytime from the CodeLens sidebar or with **CodeLens: Turn On / Turn Off for This Workspace**. Workspaces that already have a `.codelens/` index are treated as **Yes**.
+
+Once it is on (and the workspace is trusted), CodeLens Graph indexes your entire codebase in the background into a local SQLite graph — every file, class, function, method, variable, import, call relationship, project configurations (like `package.json`, `tsconfig.json`, `.yml`, etc.), and the direct dependencies declared in your `package.json` files (installed version, entry points, type definitions — read without walking or parsing `node_modules`). You choose which folders are indexed from the **Indexed Folders** view; very large workspaces are not indexed until you pick. It then starts an MCP server exposing 10 tools the agent calls natively, just like `read_file`.
 
 The key insight: instead of the agent reading 5–10 files to orient itself, it calls one MCP tool and gets back only the relevant symbols, snippets, and relationships for the current task.
 
@@ -67,7 +69,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.2.4.vsix
+code --install-extension codelens-graph-0.3.0.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
@@ -77,7 +79,7 @@ Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
 CodeLens Graph features an automatic configuration engine that sets up MCP settings and inserts mandatory search rules for your favorite AI assistants:
 
 1. **Automatic Setup (Recommended):**
-   Upon initial scan or by running the `CodeLens: Regenerate AI Agent Skill Files` command, the extension will prompt you to select your target IDEs/assistants:
+   When the first index finishes, CodeLens offers a one-time setup (**Choose Agents… / Not Now / Don't Ask Again**). Nothing outside `.codelens/` is written until you choose. You can also run the `CodeLens: Regenerate AI Agent Skill Files` command at any time to select your target IDEs/assistants:
    - **VS Code (Copilot / Trae)**: Writes MCP server configuration to `.vscode/mcp.json` and instruction rules to `.vscode/codelens.instructions.md`.
    - **Cursor**: Writes instruction rules to `.cursor/rules/codelens.mdc`.
    - **Antigravity**: Integrates instruction rules into `.agents/AGENTS.md`.
@@ -99,6 +101,8 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 
 | Command | Purpose |
 |---------|---------|
+| `CodeLens: Turn On for This Workspace` | Start using CodeLens in this workspace (only this one) |
+| `CodeLens: Turn Off for This Workspace` | Stop indexing and watching this workspace; existing files are kept. The standalone MCP server also answers "off" here |
 | `CodeLens: Build Knowledge Graph` | Full scan of workspace |
 | `CodeLens: Force Rebuild Graph` | Clear and rescan |
 | `CodeLens: Show Graph Explorer` | Interactive D3 force graph |
@@ -110,6 +114,8 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `CodeLens: Regenerate AI Agent Skill Files` | Regenerate rules/MCP configs and prompt for IDE preferences |
 | `CodeLens: Show MCP Usage Report` | Show total agent tool calls and token savings |
 | `CodeLens: Clear Configuration Files and Reset State` | Clean up all CodeLens-generated rule files/configs and reset extension state |
+| `CodeLens: Select Indexed Folders…` | Pick which folders are indexed (with file counts); also available as checkboxes in the **Indexed Folders** view |
+| `CodeLens: Index Entire Workspace` | Clear the folder selection and index everything |
 
 ---
 
@@ -120,8 +126,9 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 | `codeLensGraph.autoRebuildOnSave` | `true` | Update graph on file save |
 | `codeLensGraph.maxGraphDepth` | `2` | BFS hops from entry points |
 | `codeLensGraph.maxTokenBudget` | `2000` | Token cap for agent context |
-| `codeLensGraph.excludePatterns` | `node_modules, dist…` | Folders to skip |
-| `codeLensGraph.indexDependencySymbols` | `false` | Deeply index internal symbols inside `node_modules` |
+| `codeLensGraph.includeFolders` | `[]` (whole workspace) | Folders to index, workspace-relative. Root-level files are always indexed. Stored in `.vscode/settings.json`, so the team and a standalone MCP server share it |
+| `codeLensGraph.largeWorkspaceThreshold` | `5000` | Above this many indexable files, a never-indexed workspace waits for a folder selection |
+| `codeLensGraph.excludePatterns` | `node_modules, dist…` | Globs to skip (`**` supported) |
 | `codeLensGraph.supportedExtensions` | `.ts .js .py .go .rs…` | Languages to parse |
 
 ---
@@ -132,13 +139,15 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
 src/
 ├── extension.ts              # VS Code entry point, command registration
 ├── types.ts                  # GraphNode, GraphEdge, AgentContext, Diagnosis
-├── utils.ts                  # Path helpers, configuration whitelist, and node_modules filters
+├── utils.ts                  # Path helpers, configuration whitelist, glob matching
 ├── ingestion/
 │   ├── astParser.ts          # tree-sitter WASM parser (regex fallback)
-│   ├── workspaceScanner.ts   # Walks workspace, async file parsing
-│   └── fileWatcher.ts        # Incremental graph updates on save
+│   ├── workspaceScanner.ts   # Walks the selected folders, reconciles the graph with them
+│   ├── indexScope.ts         # Folder selection (codeLensGraph.includeFolders) rules
+│   ├── dependencyManifest.ts # Direct dependencies from package.json (no node_modules walk)
+│   └── fileWatcher.ts        # Standalone file watcher (outside VS Code)
 ├── graph/
-│   ├── graphDB.ts            # SQLite: nodes, edges, snapshots, migrations
+│   ├── graphDB.ts            # SQLite graph store (integer-keyed), relationship resolution
 │   └── differ.ts             # Pre/post agent run diff engine
 ├── context/
 │   ├── contextBuilder.ts     # Task → BFS subgraph → compressed context
@@ -146,13 +155,14 @@ src/
 │   └── fileClassifier.ts     # Groups files by semantic category
 ├── agent/
 │   ├── skillGenerator.ts     # Writes .codelens/mcp.json + README
-│   └── backgroundScanner.ts  # Silent background scan on activation
+│   └── backgroundScanner.ts  # Queued background scans and batched file-change updates
 ├── mcp/
 │   ├── mcpServer.ts          # 10 MCP tools (triage, search, context, dependencies…)
 │   └── mcpEntry.ts           # Standalone MCP binary entry point
 └── ui/
     ├── graphPanel.ts         # D3 force-directed graph webview
-    └── statsView.ts          # Sidebar stats panel (WebviewViewProvider)
+    ├── statsView.ts          # Sidebar stats panel (WebviewViewProvider)
+    └── indexedFoldersView.ts # Sidebar folder tree with checkboxes
 ```
 
 ---
@@ -162,7 +172,8 @@ src/
 The graph database is stored at `.codelens/codelens-graph.db` inside your project workspace. This ensures:
 - The VS Code extension and MCP server share the same database
 - No external directory permission prompts for the agent
-- The DB is gitignored automatically
+- The DB is gitignored automatically (via `.codelens/.gitignore` — your root `.gitignore` is not modified)
+- Storage is compact: integer keys and workspace-relative paths (roughly 12 KB per indexed source file). Indexes written by older versions are rebuilt automatically once
 
 ---
 

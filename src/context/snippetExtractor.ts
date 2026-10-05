@@ -1,6 +1,7 @@
 import * as fs   from 'fs';
 import * as path from 'path';
 import { GraphNode } from '../types';
+import { isPathInside } from '../utils';
 
 // ─── How many lines of body to include in a snippet ──────────────────────────
 // Enough to understand the function without reading the whole file.
@@ -13,10 +14,20 @@ const MAX_SNIPPET_CHARS = 600; // hard cap — prevents large functions blowing 
 
 export class SnippetExtractor {
 
+  // Node paths come from the graph DB, which a cloned repo could ship pre-built,
+  // so only files inside the workspace root are ever read.
+  constructor(private getWorkspaceRoot: () => string | null) {}
+
+  private canRead(filePath: string): boolean {
+    const root = this.getWorkspaceRoot();
+    return root !== null && isPathInside(filePath, root);
+  }
+
   // Returns the signature line + up to MAX_SNIPPET_LINES of body.
   // Truncates gracefully if the function is large.
   extractSnippet(node: GraphNode): string | null {
     if (node.type === 'file' || node.type === 'import') { return null; }
+    if (!this.canRead(node.filePath)) { return null; }
 
     try {
       const lines = fs.readFileSync(node.filePath, 'utf-8').split('\n');
@@ -43,6 +54,7 @@ export class SnippetExtractor {
 
   // Returns just the signature line — cheapest option, ~1 token
   extractSignatureLine(node: GraphNode): string | null {
+    if (!this.canRead(node.filePath)) { return null; }
     try {
       const lines  = fs.readFileSync(node.filePath, 'utf-8').split('\n');
       const lineNo = Math.max(0, node.line - 1);
