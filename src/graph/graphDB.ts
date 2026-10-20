@@ -1382,7 +1382,7 @@ export class GraphDB {
     const key = 'a:' + symbolName;
     let pattern = cache.wordPatterns.get(key);
     if (!pattern) {
-      pattern = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s+as\\s+${this.escapeRegExp(symbolName)}\\b`);
+      pattern = new RegExp(`\\b([A-Za-z_$][\\w$]*)(?:\\s+as\\s+|\\s*:\\s*)${this.escapeRegExp(symbolName)}\\b`);
       cache.wordPatterns.set(key, pattern);
     }
     return pattern;
