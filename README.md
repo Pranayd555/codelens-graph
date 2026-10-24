@@ -69,7 +69,7 @@ The agent always calls `codelens_triage` first. It costs ~10 tokens and prevents
 ### Install the VS Code extension
 
 ```bash
-code --install-extension codelens-graph-0.3.0.vsix
+code --install-extension codelens-graph-0.3.1.vsix
 ```
 
 Or: `Ctrl+Shift+P` → `Extensions: Install from VSIX…`
