@@ -4,6 +4,12 @@ import * as crypto from 'crypto';
 import { GraphNode, GraphEdge, ParsedFile, Param, NodeType, CallReference } from '../types';
 import { isConfigPath, isNodeModulePath } from '../utils';
 
+// Bump whenever parsing changes what is stored for unchanged files (new node or
+// edge kinds, scope rules, ...). Indexes built with another version re-parse
+// every file once on the next scan, so existing users get the fix without a
+// manual rebuild. 2: CommonJS require() imports (#9).
+export const PARSER_VERSION = '2';
+
 // ─── Language → WASM mapping ──────────────────────────────────────────────────
 
 const EXTENSION_MAP: Record<string, { language: string; wasm: string }> = {

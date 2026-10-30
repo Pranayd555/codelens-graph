@@ -2,6 +2,7 @@ import * as fs   from 'fs';
 import * as path from 'path';
 import { GraphNode } from '../types';
 import { isPathInside } from '../utils';
+import { detectModuleSystem, formatImport, importSpecifier } from './importHints';
 
 // ─── How many lines of body to include in a snippet ──────────────────────────
 // Enough to understand the function without reading the whole file.
@@ -68,35 +69,23 @@ export class SnippetExtractor {
   // e.g. given node at backend/utils/emailService.js and consumer at backend/routes/auth.js
   // returns  "../utils/emailService"
   resolveImportPath(node: GraphNode, fromFilePath: string): string {
-    const fromDir    = path.dirname(fromFilePath);
-    const toFile     = node.filePath;
-    let   rel        = path.relative(fromDir, toFile).replace(/\\/g, '/');
-
-    // Strip known extensions so the import looks clean
-    rel = rel.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, '');
-
-    // Ensure it starts with ./
-    if (!rel.startsWith('.')) { rel = './' + rel; }
-    return rel;
+    return importSpecifier(node.filePath, path.dirname(fromFilePath));
   }
 
-  // Given a node, returns how to import it — ready to paste
-  buildImportStatement(node: GraphNode, fromFilePath: string, language: string): string {
-    const importPath = this.resolveImportPath(node, fromFilePath);
-    const name       = node.name;
+  // How fromFilePath (written in `language`) would import node — ready to
+  // paste, in that file's module system. Null when there's no useful hint.
+  buildImportStatement(node: GraphNode, fromFilePath: string, language: string): string | null {
+    const system = detectModuleSystem(fromFilePath, this.getWorkspaceRoot());
+    return formatImport(node, this.resolveImportPath(node, fromFilePath), language, system);
+  }
 
-    if (language === 'typescript' || language === 'javascript') {
-      const isDefault = node.modifiers?.includes('default');
-      return isDefault
-        ? `import ${name} from '${importPath}';`
-        : `import { ${name} } from '${importPath}';`;
-    }
-
-    if (language === 'python') {
-      const parts = importPath.replace(/^\.\//, '').replace(/\//g, '.');
-      return `from ${parts} import ${name}`;
-    }
-
-    return `// import ${name} from '${importPath}'`;
+  // How code in the workspace imports node, with the path relative to the
+  // workspace root (no importing file is known) and the module system of the
+  // file that defines it.
+  buildWorkspaceImportStatement(node: GraphNode): string | null {
+    const root = this.getWorkspaceRoot();
+    if (!root || node.type === 'file' || node.type === 'import') { return null; }
+    const system = detectModuleSystem(node.filePath, root);
+    return formatImport(node, importSpecifier(node.filePath, root), node.language, system);
   }
 }

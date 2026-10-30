@@ -190,6 +190,9 @@ npx tsc --noEmit
 # Compile
 npm run compile
 
+# Run the tests (test/*.test.ts, Node's built-in test runner)
+npm test
+
 # Test with F5 in VS Code (launches Extension Development Host)
 
 # Package

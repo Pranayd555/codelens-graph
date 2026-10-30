@@ -17,6 +17,12 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
   - Prevents erroneous emission of dummy `variable` nodes named after destructuring patterns (e.g., `"{ dbAll, dbGet }"`).
   - Populates imported symbol names into `fileImportedNames` during AST ingestion, resolving false-positive `⚠️ undefined: <symbol>` flags on consumer functions.
   - Extended `aliasPattern` in `GraphDB` (`graphDB.ts`) to support CommonJS colon alias syntax (`const { orig: alias } = require(...)`) alongside ESM `as` syntax, ensuring cross-file call edges are accurately resolved.
+- **Calls into npm packages and Node built-ins** are no longer linked to an unrelated workspace symbol that happens to share the name (e.g. `path.normalize()` or `fast-deep-equal`'s `equal()`). Packages count as external when installed in `node_modules` or declared in `package.json`; workspace packages (symlinked or `workspace:`/`file:`/`link:`) and path aliases such as `@/utils` still link into the workspace.
+- **Import hints match the project's module system**: CommonJS files get `const { x } = require(…)` instead of an ES-module `import`. "Import as" paths are now relative to the workspace root (they were relative to the symbol's own folder), and `codelens_node` no longer suggests a JavaScript import for Java, Go, C# and other languages.
+
+### Changed
+- **Existing indexes are re-parsed once after an update that changes parsing**, so fixes like the CommonJS one above apply to files that haven't changed since they were indexed. Previously those kept their old results until edited or rebuilt with **CodeLens: Force Rebuild Graph**.
+- `npm test` runs every test in `test/`.
 
 ---
 

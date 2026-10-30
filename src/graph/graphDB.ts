@@ -164,6 +164,28 @@ interface ResolveCache {
   nodesByName:  Map<string, GraphNode[]>;
   nodesByFile:  Map<string, GraphNode[]>;
   wordPatterns: Map<string, RegExp>;
+  externalModules?: Map<string, boolean>;
+  declaredPackages?: Map<string, string>;   // package name → declared range
+}
+
+const NODE_BUILTINS = new Set<string>(require('module').builtinModules);
+const JS_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+
+// 'pkg', 'pkg/sub', '@scope/pkg' or '@scope/pkg/sub' → the package name;
+// null for relative or absolute specifiers.
+function packageNameOf(source: string): string | null {
+  if (!source || source.startsWith('.') || source.startsWith('/') || path.isAbsolute(source)) { return null; }
+  const parts = source.split('/');
+  if (source.startsWith('@')) {
+    return parts.length >= 2 && parts[0].length > 1 && parts[1] ? `${parts[0]}/${parts[1]}` : null;
+  }
+  return parts[0] || null;
+}
+
+// Import text without its string literals, so `require('lodash/merge')` does
+// not count as binding a local `merge`.
+function withoutStringLiterals(text: string): string {
+  return text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '');
 }
 
 // A stored call reference, with the integer keys the resolver works with.
@@ -359,6 +381,15 @@ export class GraphDB {
 
   needsRelationshipResolve(): boolean {
     return this.fullResolvePending || this.writesSinceResolve;
+  }
+
+  getMetaValue(key: string): string | null {
+    const value = this.db.exec('SELECT value FROM meta WHERE key = ?', [key])[0]?.values[0]?.[0];
+    return value === undefined || value === null ? null : String(value);
+  }
+
+  setMetaValue(key: string, value: string): void {
+    this.db.run('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', [key, value]);
   }
 
   persist(): void {
@@ -1217,6 +1248,7 @@ export class GraphDB {
     const importNodes = importsByFile.get(ref.filePath) ?? [];
     const importedFiles = new Set<string>();
     const candidateNames = new Set<string>([ref.symbolName]);
+    let boundToExternal = false;
     for (const importNode of importNodes) {
       const signature = importNode.signature ?? '';
       const mentionsTarget = this.wordPattern(ref.symbolName, cache).test(signature)
@@ -1227,8 +1259,20 @@ export class GraphDB {
       if (aliasMatch) { candidateNames.add(aliasMatch[1]); }
 
       const resolved = this.resolveImportPath(ref.filePath, importNode.name, cache);
-      if (resolved) { importedFiles.add(path.normalize(resolved)); }
+      if (resolved) {
+        importedFiles.add(path.normalize(resolved));
+      } else if (JS_LANGUAGES.has(importNode.language) && this.isExternalModule(ref.filePath, importNode.name, cache)) {
+        const binding = withoutStringLiterals(signature);
+        if (this.wordPattern(ref.symbolName, cache).test(binding)
+            || (!!ref.qualifier && this.wordPattern(ref.qualifier, cache).test(binding))) {
+          boundToExternal = true;
+        }
+      }
     }
+
+    // Bound only to an npm package or Node built-in: the target is outside the
+    // workspace, so don't fall back to a same-named symbol somewhere else.
+    if (boundToExternal && !importedFiles.size) { return null; }
 
     const candidatesById = new Map<string, GraphNode>();
     for (const name of candidateNames) {
@@ -1357,6 +1401,66 @@ export class GraphDB {
     }
     cache.importPaths.set(key, resolved);
     return resolved;
+  }
+
+  // A bare specifier is external when it is a Node built-in, a package installed
+  // in a node_modules folder between the importer and the workspace root, or a
+  // package declared in a workspace package.json. Workspace packages (symlinked
+  // into node_modules, or declared as workspace:/file:/link:) and unresolved
+  // aliases such as '@/utils' are not, so they keep name-based resolution.
+  private isExternalModule(importerPath: string, source: string, cache: ResolveCache): boolean {
+    if (source.startsWith('node:')) { return true; }
+    const name = packageNameOf(source);
+    if (!name) { return false; }
+    if (NODE_BUILTINS.has(name)) { return true; }
+
+    const external = cache.externalModules ?? (cache.externalModules = new Map());
+    const key = path.dirname(importerPath) + '\0' + name;
+    const cached = external.get(key);
+    if (cached !== undefined) { return cached; }
+
+    let result = false;
+    const installDir = this.findInstalledPackage(name, path.dirname(importerPath));
+    if (installDir) {
+      result = !this.isWorkspacePackageDir(installDir);
+    } else {
+      if (!cache.declaredPackages) {
+        // Read directly: getPackages() may reload the DB from disk mid-resolve.
+        const rows = this.db.exec('SELECT name, declared_range FROM packages')[0]?.values ?? [];
+        cache.declaredPackages = new Map(rows.map(r => [String(r[0]), String(r[1] ?? '')]));
+      }
+      const range = cache.declaredPackages.get(name);
+      result = range !== undefined && !/^(workspace|file|link):/.test(range);
+    }
+    external.set(key, result);
+    return result;
+  }
+
+  // Node-style lookup: <dir>/node_modules/<name>, walking up to the workspace root.
+  private findInstalledPackage(name: string, fromDir: string): string | null {
+    const root = this.root;
+    let dir = fromDir;
+    for (;;) {
+      const candidate = path.join(dir, 'node_modules', ...name.split('/'));
+      if (fs.existsSync(candidate)) { return candidate; }
+      const parent = path.dirname(dir);
+      if (parent === dir || (root && path.relative(root, dir) === '')) { return null; }
+      if (root && path.relative(root, parent).startsWith('..')) { return null; }
+      dir = parent;
+    }
+  }
+
+  // A monorepo package symlinked into node_modules resolves into the workspace.
+  private isWorkspacePackageDir(installDir: string): boolean {
+    const root = this.root;
+    if (!root) { return false; }
+    try {
+      const real = fs.realpathSync(installDir);
+      const rel = path.relative(root, real);
+      return !rel.startsWith('..') && !path.isAbsolute(rel) && !rel.split(path.sep).includes('node_modules');
+    } catch {
+      return false;
+    }
   }
 
   private getNodesByExactNameCached(name: string, cache: ResolveCache): GraphNode[] {

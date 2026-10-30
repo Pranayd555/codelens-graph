@@ -45,7 +45,7 @@
   },
   "main": "./dist/extension.js",
   "scripts": {
-    "test": "npx ts-node test/cjs_require.test.ts",
+    "test": "node --require ts-node/register --test test/*.test.ts",
     "compile": "node esbuild.js",
     "compile:prod": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",

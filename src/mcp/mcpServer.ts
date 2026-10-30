@@ -5,6 +5,7 @@ import { GraphDB }        from '../graph/graphDB';
 import { ASTParser }      from '../ingestion/astParser';
 import { WorkspaceScanner } from '../ingestion/workspaceScanner';
 import { ContextBuilder } from '../context/contextBuilder';
+import { detectModuleSystem, formatImport, importSpecifier } from '../context/importHints';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
@@ -654,7 +655,7 @@ export class MCPServer {
             lines.push('- Params: ' + node.params.map(p => p.name + ': ' + (p.type ?? '?')).join(', '));
           }
           const imp = this.buildImportStmt(node, workspaceRoot);
-          if (imp) { lines.push('- Import as: ' + imp); }
+          if (imp) { lines.push('- Import as: ' + imp + ' (path from workspace root)'); }
           const callerCount = db.getEdgesTo(node.id, 'calls').length;
           const calleeCount = db.getEdgesFrom(node.id, 'calls').length;
           if (callerCount) { lines.push('- Callers: ' + callerCount + ' (run codelens_relations with direction callers)'); }
@@ -1059,13 +1060,7 @@ export class MCPServer {
 
   private buildImportStmt(node: GraphNode, root: string): string | null {
     if (node.type === 'file' || node.type === 'import') { return null; }
-    const rel = './' + this.rel(node.filePath, root).replace(/\.(ts|tsx|js|jsx|mjs)$/, '');
-    if (node.language === 'python') {
-      return 'from ' + rel.replace(/^\.\//, '').replace(/\//g, '.') + ' import ' + node.name;
-    }
-    return node.modifiers?.includes('default')
-      ? 'import ' + node.name + ' from \'' + rel + '\';'
-      : 'import { ' + node.name + ' } from \'' + rel + '\';';
+    return formatImport(node, importSpecifier(node.filePath, root), node.language, detectModuleSystem(node.filePath, root));
   }
 
   // Node paths come from the DB, which a cloned repo could ship pre-built —
