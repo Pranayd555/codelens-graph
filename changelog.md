@@ -21,6 +21,7 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 - **Import hints match the project's module system**: CommonJS files get `const { x } = require(…)` instead of an ES-module `import`. "Import as" paths are now relative to the workspace root (they were relative to the symbol's own folder), and `codelens_node` no longer suggests a JavaScript import for Java, Go, C# and other languages.
 
 ### Changed
+- **Agent MCP configs keep working across extension updates.** Configs ran the server from the versioned install folder (`…/pranaydas.codelens-graph-<version>/dist/mcp.js`), which the next update deletes, so agents configured outside the workspace (`~/.claude.json`, `~/.cursor/mcp.json`, Windsurf) silently lost CodeLens after every update. Generated configs now run a stable launcher, `~/.codelens/mcp.js`, that starts the newest CodeLens version installed in any editor (VS Code, Insiders, Cursor, Windsurf, Antigravity, …). On startup, existing configs that point at a versioned folder are switched to the launcher automatically; only that path changes, and configs pointing anywhere else (e.g. a development build) are left alone.
 - **Existing indexes are re-parsed once after an update that changes parsing**, so fixes like the CommonJS one above apply to files that haven't changed since they were indexed. Previously those kept their old results until edited or rebuilt with **CodeLens: Force Rebuild Graph**.
 - `npm test` runs every test in `test/`.
 

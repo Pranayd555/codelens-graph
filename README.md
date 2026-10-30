@@ -92,6 +92,7 @@ CodeLens Graph features an automatic configuration engine that sets up MCP setti
    - Paste the config into your global config file:
      - **Claude Code (global)**: paste into `~/.claude.json`.
      - **Cursor (local)**: paste into `.cursor/mcp.json`.
+   - The config runs `node ~/.codelens/mcp.js --auto`. That launcher starts the newest CodeLens version installed in any of your editors, so configs keep working after updates. Configs that still point at a versioned extension folder (`…/pranaydas.codelens-graph-<version>/dist/mcp.js`) are switched to the launcher automatically when CodeLens starts.
 
 > **Important:** The graph database lives in `.codelens/` inside your project. Both the extension and the MCP server use the same database — no external directory lookups, no permission popups.
 

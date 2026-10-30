@@ -2,6 +2,7 @@ import * as fs   from 'fs';
 import * as path from 'path';
 import { GraphDB }    from '../graph/graphDB';
 import { GraphStats } from '../types';
+import { launcherConfigPath, launcherPath } from './mcpLauncher';
 
 const MANAGED_START = '<!-- CODELENS_MANAGED_START -->';
 
@@ -319,7 +320,10 @@ ${instruction}
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
+  // The stable launcher in ~/.codelens survives extension updates; this
+  // version's own server is the fallback until the launcher is installed.
   private getMcpEntryPath(): string {
+    if (fs.existsSync(launcherPath())) { return launcherConfigPath(); }
     return path.resolve(__dirname, 'mcp.js').replace(/\\/g, '/');
   }
 

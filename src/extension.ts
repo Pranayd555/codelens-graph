@@ -22,6 +22,7 @@ import {
 import { GraphStats }         from './types';
 import { isNodeModulePath }   from './utils';
 import { setWorkspaceDisabled } from './workspaceOptOut';
+import { installLauncher, migrateAgentConfigs } from './agent/mcpLauncher';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -942,6 +943,29 @@ function registerWorkspace(): void {
   updateActiveWorkspaceRegistry(workspaceRoot);
 }
 
+// Keeps agent MCP configs working across extension updates: refreshes the
+// stable launcher in ~/.codelens, then points any config that still runs a
+// versioned install folder (deleted by the next update) at it.
+function refreshMcpLauncher(context: vscode.ExtensionContext): void {
+  // A development build (F5, tests) must not take over the user's real agent setup.
+  if (context.extensionMode !== vscode.ExtensionMode.Production) {
+    console.log('[CodeLens] Development build: leaving the MCP launcher and agent configs alone.');
+    return;
+  }
+  try {
+    const serverEntry = path.join(context.extensionPath, 'dist', 'mcp.js');
+    if (installLauncher(serverEntry, String(context.extension.packageJSON.version ?? '0.0.0'))) {
+      console.log('[CodeLens] MCP launcher updated: ~/.codelens/mcp.js');
+    }
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+    for (const file of migrateAgentConfigs(undefined, workspaceRoot)) {
+      console.log(`[CodeLens] Pointed the CodeLens MCP server in ${file} at the launcher.`);
+    }
+  } catch (err) {
+    console.error('[CodeLens] Could not refresh the MCP launcher:', err);
+  }
+}
+
 // The normal startup flow, once CodeLens is on for the workspace. settled =
 // VS Code has already finished starting up (the user just turned it on).
 async function runEnabledStartup(context: vscode.ExtensionContext, settled: boolean): Promise<void> {
@@ -963,6 +987,9 @@ async function runEnabledStartup(context: vscode.ExtensionContext, settled: bool
     await whenWorkspaceTrusted(context);
     if (!settled) { await new Promise(resolve => setTimeout(resolve, STARTUP_SETTLE_MS)); }
     if (deactivated || !isWorkspaceEnabled()) { return; }
+
+    // Before indexing, so the agent configs written after the scan use the launcher.
+    refreshMcpLauncher(context);
 
     // Never indexed, no folders selected, and very large: ask before indexing.
     // (A graph rebuilt for a storage upgrade was indexed before — no need to ask.)
