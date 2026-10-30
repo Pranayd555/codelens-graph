@@ -3,6 +3,7 @@
 # Source and build artifacts not needed at runtime
 src/**
 out/**
+test/**
 .vscode-test/**
 .github/**
 esbuild.js
