@@ -351,6 +351,37 @@ export class TreeSitterParser {
           id: makeEdgeId(fileNode.id, 'imports', importId),
           fromId: fileNode.id, toId: importId, type: 'imports',
         });
+      } else if (
+        (language === 'javascript' || language === 'typescript' || language === 'tsx') &&
+        (node.type === 'lexical_declaration' || node.type === 'variable_declaration')
+      ) {
+        const cjsRequires = this.extractCommonJsRequires(node, content);
+        for (const req of cjsRequires) {
+          if (node.parent?.type === 'program') {
+            fileImportedNames.push(...req.names);
+          }
+          if (isNodeModulePath(filePath)) {
+            continue;
+          }
+          const importId = makeNodeId(filePath, `__import__${req.names.join(',')}`, req.line);
+          nodes.push({
+            id: importId,
+            type: 'import',
+            name: req.source,
+            filePath,
+            line: req.line,
+            endLine: req.endLine,
+            language,
+            signature: req.signature,
+            updatedAt: now,
+          });
+          edges.push({
+            id: makeEdgeId(fileNode.id, 'imports', importId),
+            fromId: fileNode.id,
+            toId: importId,
+            type: 'imports',
+          });
+        }
       }
     });
 
@@ -359,6 +390,7 @@ export class TreeSitterParser {
     this.walkTree(tree.rootNode, (tsNode: any) => {
       const ourType = query.nodeTypes[tsNode.type];
       if (!ourType) { return; }
+      if (ourType === 'variable' && this.isCommonJsRequire(tsNode)) { return; }
       const name = this.getNodeName(tsNode, query.nameField, content);
       if (!name || name === '__file__') { return; }
       if (KEYWORDS.has(name.toLowerCase())) { return; }
@@ -371,6 +403,7 @@ export class TreeSitterParser {
     this.walkTree(tree.rootNode, (tsNode: any) => {
       const ourType = query.nodeTypes[tsNode.type];
       if (!ourType) { return; }
+      if (ourType === 'variable' && this.isCommonJsRequire(tsNode)) { return; }
 
       // Get name
       const name = this.getNodeName(tsNode, query.nameField, content);
@@ -523,7 +556,12 @@ export class TreeSitterParser {
         const child = node.child(i);
         if (child.type === 'variable_declarator') {
           const id = child.childForFieldName?.('name');
-          if (id) { return id.text.trim(); }
+          if (id) {
+            if (id.type === 'identifier') {
+              return id.text.trim();
+            }
+            return null;
+          }
         }
       }
     }
@@ -590,6 +628,156 @@ export class TreeSitterParser {
     const pythonImport = /^import\s+([.\w]+)/.exec(text);
     if (pythonImport) { return pythonImport[1]; }
     return null;
+  }
+
+  // ── CommonJS require extraction ───────────────────────────────────────────
+
+  private getRequireCall(valNode: any): any | null {
+    if (!valNode) { return null; }
+    let curr = valNode;
+    while (curr) {
+      if (
+        curr.type === 'as_expression' ||
+        curr.type === 'type_assertion' ||
+        curr.type === 'parenthesized_expression' ||
+        curr.type === 'non_null_expression'
+      ) {
+        curr = curr.childForFieldName?.('expression') ?? curr.namedChildren?.[0] ?? null;
+      } else {
+        break;
+      }
+    }
+    if (!curr) { return null; }
+
+    if (curr.type === 'call_expression') {
+      const fn = curr.childForFieldName?.('function');
+      if (fn?.text === 'require') {
+        return curr;
+      }
+    }
+
+    if (curr.type === 'member_expression') {
+      let obj = curr.childForFieldName?.('object');
+      while (
+        obj &&
+        (obj.type === 'as_expression' ||
+          obj.type === 'type_assertion' ||
+          obj.type === 'parenthesized_expression' ||
+          obj.type === 'non_null_expression')
+      ) {
+        obj = obj.childForFieldName?.('expression') ?? obj.namedChildren?.[0];
+      }
+      if (obj?.type === 'call_expression') {
+        const fn = obj.childForFieldName?.('function');
+        if (fn?.text === 'require') {
+          return obj;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private isCommonJsRequire(node: any): boolean {
+    if (!node) { return false; }
+    if (node.type !== 'lexical_declaration' && node.type !== 'variable_declaration') {
+      return false;
+    }
+    let declaratorCount = 0;
+    let requireCount = 0;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child.type === 'variable_declarator') {
+        declaratorCount++;
+        const valNode = child.childForFieldName?.('value');
+        if (this.getRequireCall(valNode)) {
+          requireCount++;
+        }
+      }
+    }
+    return declaratorCount > 0 && declaratorCount === requireCount;
+  }
+
+  private collectBindingNames(p: any, out: string[]): void {
+    if (!p) { return; }
+    switch (p.type) {
+      case 'identifier':
+      case 'shorthand_property_identifier_pattern': {
+        const text = p.text?.trim();
+        if (text && /^[A-Za-z_$][\w$]*$/.test(text) && !KEYWORDS.has(text.toLowerCase())) {
+          out.push(text);
+        }
+        return;
+      }
+      case 'pair_pattern':
+        this.collectBindingNames(p.childForFieldName?.('value'), out);
+        return;
+      case 'object_assignment_pattern':
+      case 'assignment_pattern':
+        this.collectBindingNames(p.childForFieldName?.('left'), out);
+        return;
+      default:
+        for (const c of p.namedChildren ?? []) {
+          this.collectBindingNames(c, out);
+        }
+    }
+  }
+
+  private extractCommonJsRequires(
+    node: any,
+    content: string
+  ): Array<{ source: string; names: string[]; signature: string; line: number; endLine: number }> {
+    if (node.type !== 'lexical_declaration' && node.type !== 'variable_declaration') {
+      return [];
+    }
+
+    const results: Array<{ source: string; names: string[]; signature: string; line: number; endLine: number }> = [];
+
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child.type !== 'variable_declarator') { continue; }
+
+      const valNode = child.childForFieldName?.('value');
+      const requireCall = this.getRequireCall(valNode);
+      if (!requireCall) { continue; }
+
+      const argsNode = requireCall.childForFieldName?.('arguments');
+      if (!argsNode) { continue; }
+
+      let source: string | null = null;
+      for (let j = 0; j < argsNode.childCount; j++) {
+        const arg = argsNode.child(j);
+        if (arg.type === 'string' || arg.type === 'string_literal') {
+          source = arg.text.replace(/['"`]/g, '').trim();
+          break;
+        }
+      }
+      if (!source) { continue; }
+
+      const nameNode = child.childForFieldName?.('name');
+      if (!nameNode) { continue; }
+
+      const names: string[] = [];
+      this.collectBindingNames(nameNode, names);
+
+      const uniqueNames = [...new Set(names)];
+      if (uniqueNames.length === 0) { continue; }
+
+      const line = child.startPosition.row + 1;
+      const endLine = child.endPosition.row + 1;
+      const rawSig = content.slice(node.startIndex, node.endIndex).trim();
+      const signature = rawSig.replace(/\s+/g, ' ').slice(0, 200);
+
+      results.push({
+        source,
+        names: uniqueNames,
+        signature,
+        line,
+        endLine,
+      });
+    }
+
+    return results;
   }
 
   // ── Params extraction ─────────────────────────────────────────────────────
@@ -905,6 +1093,7 @@ export class TreeSitterParser {
           if (child.startIndex >= node.startIndex) { break; }
           
           const ourType = query.nodeTypes[child.type];
+          if (ourType === 'variable' && this.isCommonJsRequire(child)) { continue; }
           if (ourType === 'variable' || ourType === 'function' || ourType === 'class' || ourType === 'interface' || ourType === 'enum') {
             const name = this.getNodeName(child, query.nameField, content);
             if (name) { parentVars.push(name); }

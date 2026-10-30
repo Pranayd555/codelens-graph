@@ -4,6 +4,22 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ---
 
+## [Unreleased]
+
+### Added
+- Comprehensive test suite for CommonJS `require()` import parsing, scope analysis, and cross-file call resolution (`test/cjs_require.test.ts`).
+- `test` script in `package.json` for running the automated test suite.
+
+### Fixed
+- **CommonJS Destructured `require()` Recognition**:
+  - Tree-sitter parser in `astParser.ts` now identifies `const { ... } = require(...)` and `const x = require(...)` statements as formal module imports.
+  - Emits proper `import` `GraphNode` and `imports` `GraphEdge` for CommonJS `require` statements in JavaScript, TypeScript, and TSX files.
+  - Prevents erroneous emission of dummy `variable` nodes named after destructuring patterns (e.g., `"{ dbAll, dbGet }"`).
+  - Populates imported symbol names into `fileImportedNames` during AST ingestion, resolving false-positive `⚠️ undefined: <symbol>` flags on consumer functions.
+  - Extended `aliasPattern` in `GraphDB` (`graphDB.ts`) to support CommonJS colon alias syntax (`const { orig: alias } = require(...)`) alongside ESM `as` syntax, ensuring cross-file call edges are accurately resolved.
+
+---
+
 ## [0.3.1] - 2026-10-06
 
 ### Changed
