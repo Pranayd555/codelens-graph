@@ -81,7 +81,7 @@ jobs:
       - name: Check package contents
         run: node scripts/check-vsix.js codelens-graph.vsix
       - name: Upload VSIX
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codelens-graph-vsix
           path: codelens-graph.vsix
