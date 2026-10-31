@@ -273,7 +273,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^26.6.5",
     "@types/sql.js": "^1.4.9",
     "@types/vscode": "^1.95.0",
     "chokidar": "^3.6.0",
