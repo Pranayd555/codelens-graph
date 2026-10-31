@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine updates instead of one per package.
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Must stay in step with engines.vscode in package.json.
+      - dependency-name: "@types/vscode"
+        update-types: [version-update:semver-major, version-update:semver-minor]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: monthly

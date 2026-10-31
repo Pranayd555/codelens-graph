@@ -7,6 +7,10 @@ test/**
 .vscode-test/**
 .github/**
 esbuild.js
+scripts/**
+SECURITY.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
 tsconfig.json
 *.vsix
 **/*.map

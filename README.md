@@ -4,6 +4,8 @@
 
 ![CodeLens Graph Demo](assets/codelens-graph.gif)
 
+[![CI](https://github.com/Pranayd555/codelens-graph/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/Pranayd555/codelens-graph/actions/workflows/ci.yml)
+
 **GitHub:** [github.com/pranayd555/codelens-graph](https://github.com/pranayd555/codelens-graph)
 
 ---
@@ -199,6 +201,12 @@ npm test
 # Package
 npx vsce package --allow-missing-repository
 ```
+
+---
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and the pull request workflow, and look for issues labelled [`good first issue`](https://github.com/Pranayd555/codelens-graph/labels/good%20first%20issue). Pull requests target the `dev` branch; CI tests every change on Windows, Linux and macOS. Please report security problems privately ([SECURITY.md](SECURITY.md)).
 
 ---
 

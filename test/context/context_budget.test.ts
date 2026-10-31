@@ -27,8 +27,14 @@ describe('ContextBuilder token budget', () => {
 
   it('a smaller budget keeps a prefix of the ranked nodes', () => {
     const full = cb.build('process order totals', 2, 100000).subgraph.nodes.map(n => n.id);
+    // Node sizes include absolute paths (much longer under the Windows temp
+    // folder), so find the smallest power-of-two budget that fits every node
+    // instead of hard-coding budgets; half of it is then guaranteed to trim.
+    let fitsAll = 30;
+    while (cb.build('process order totals', 2, fitsAll).subgraph.nodes.length < full.length) { fitsAll *= 2; }
+    assert.ok(fitsAll > 30, 'the fixture needs more than the smallest budget');
     let previous = -1;
-    for (const budget of [0, 30, 200, 600, 1500]) {
+    for (const budget of [0, 30, fitsAll / 8, fitsAll / 4, fitsAll / 2]) {
       const ctx = cb.build('process order totals', 2, budget);
       const ids = ctx.subgraph.nodes.map(n => n.id);
       assert.deepEqual(ids, full.slice(0, ids.length), `budget ${budget}`);
