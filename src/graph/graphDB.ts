@@ -1451,12 +1451,14 @@ export class GraphDB {
   }
 
   // A monorepo package symlinked into node_modules resolves into the workspace.
+  // Both sides are compared as real paths: the workspace itself may be reached
+  // through a symlink (e.g. /var → /private/var on macOS, or a linked folder).
   private isWorkspacePackageDir(installDir: string): boolean {
     const root = this.root;
     if (!root) { return false; }
     try {
       const real = fs.realpathSync(installDir);
-      const rel = path.relative(root, real);
+      const rel = path.relative(fs.realpathSync(root), real);
       return !rel.startsWith('..') && !path.isAbsolute(rel) && !rel.split(path.sep).includes('node_modules');
     } catch {
       return false;

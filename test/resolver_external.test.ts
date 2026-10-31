@@ -1,7 +1,11 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
-import { TestWorkspace } from './helpers';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { GraphDB } from '../src/graph/graphDB';
+import { WorkspaceScanner } from '../src/ingestion/workspaceScanner';
+import { TestWorkspace, SCAN_OPTIONS } from './helpers';
 
 // A call bound to an npm package or Node built-in must not be linked to an
 // unrelated same-named symbol elsewhere in the workspace — while workspace
@@ -68,6 +72,34 @@ describe('Calls bound to packages outside the workspace', () => {
 
   it('still links into a workspace package symlinked into node_modules', () => {
     assert.deepStrictEqual(ws.callsFrom('useShared'), ['sharedFn@packages/shared/index.js']);
+  });
+
+  it('still links into a workspace package when the workspace is opened through a symlinked path', async () => {
+    const real = fs.mkdtempSync(path.join(os.tmpdir(), 'codelens-real-'));
+    const linked = `${real}-link`;
+    fs.symlinkSync(real, linked, 'junction');
+    const write = (rel: string, text: string) => {
+      const filePath = path.join(linked, ...rel.split('/'));
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, text);
+    };
+    const db = new GraphDB(path.join(linked, '.codelens'), { followExternalWrites: false });
+    try {
+      write('packages/shared/index.js', 'function linkedSharedFn() { return 1; }\nmodule.exports = { linkedSharedFn };\n');
+      fs.mkdirSync(path.join(linked, 'node_modules', '@acme'), { recursive: true });
+      fs.symlinkSync(path.join(linked, 'packages', 'shared'), path.join(linked, 'node_modules', '@acme', 'shared'), 'junction');
+      write('app/use.js', "const { linkedSharedFn } = require('@acme/shared');\nfunction useLinked() { return linkedSharedFn(); }\nmodule.exports = { useLinked };\n");
+      await db.init();
+      // Same parser as the rest of the file: a second ASTParser falls back to regex parsing.
+      await new WorkspaceScanner(ws.parser, db).scanWorkspace({ workspaceRoot: linked, folders: [] }, SCAN_OPTIONS);
+      const caller = db.searchNodes('useLinked', 5, 'all').find(n => n.name === 'useLinked')!;
+      const targets = db.getEdgesFrom(caller.id, 'calls').map(e => db.getNode(e.toId)?.name);
+      assert.deepStrictEqual(targets, ['linkedSharedFn']);
+    } finally {
+      db.close();
+      fs.rmSync(linked, { recursive: true, force: true });
+      fs.rmSync(real, { recursive: true, force: true });
+    }
   });
 
   it('still links through an unresolved path alias by name', () => {
