@@ -70,12 +70,12 @@ jobs:
       - name: Publish to the VS Code Marketplace
         run: npx --yes "@vscode/vsce@${VSCE_VERSION}" publish --oidc --packagePath "codelens-graph-${{ steps.version.outputs.version }}.vsix"
 
+      # Trusted publishing on Open VSX too: the registry exchanges the same kind
+      # of OIDC token, registered for PranayDas.codelens-graph with this repo,
+      # release.yml and the "release" environment (open-vsx.org → Settings →
+      # Trusted Publishers).
       - name: Publish to Open VSX
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: |
-          if [ -z "${OVSX_PAT}" ]; then echo "::warning::OVSX_PAT is not set — skipped Open VSX"; exit 0; fi
-          npx --yes "ovsx@${OVSX_VERSION}" publish "codelens-graph-${{ steps.version.outputs.version }}.vsix"
+        run: npx --yes "ovsx@${OVSX_VERSION}" publish --trusted-publishing --packagePath "codelens-graph-${{ steps.version.outputs.version }}.vsix"
 
       - name: Create GitHub Release
         env:
