@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write   # create the GitHub Release
+  id-token: write   # OIDC token for Marketplace trusted publishing
 
 concurrency:
   group: release
@@ -24,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Settings → Environments → "release" can require an approval before publishing.
+    # The Marketplace trusted-publishing policy only accepts this workflow file
+    # (release.yml) in this environment, so keep both names in sync with it.
     environment: release
     steps:
       - uses: actions/checkout@v4
@@ -60,12 +63,12 @@ jobs:
       - name: Check package contents
         run: node scripts/check-vsix.js "codelens-graph-${{ steps.version.outputs.version }}.vsix"
 
+      # Trusted publishing: no stored token. The Marketplace exchanges this run's
+      # GitHub OIDC token, accepted only for Pranayd555/codelens-graph,
+      # release.yml and the "release" environment (publisher PranayDas →
+      # Trusted Publishing on marketplace.visualstudio.com/manage).
       - name: Publish to the VS Code Marketplace
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: |
-          if [ -z "${VSCE_PAT}" ]; then echo "::warning::VSCE_PAT is not set — skipped the Marketplace"; exit 0; fi
-          npx --yes "@vscode/vsce@${VSCE_VERSION}" publish --packagePath "codelens-graph-${{ steps.version.outputs.version }}.vsix"
+        run: npx --yes "@vscode/vsce@${VSCE_VERSION}" publish --oidc --packagePath "codelens-graph-${{ steps.version.outputs.version }}.vsix"
 
       - name: Publish to Open VSX
         env:
