@@ -110,12 +110,25 @@ describe('FileWatcher.watchRoots', () => {
   let rec: ReturnType<typeof recorder>;
   let warnSpy: ReturnType<typeof mock.method>;
 
-  before(() => {
+  before(async () => {
     warnSpy = mock.method(console, 'warn', () => {});
     tmp.mkdir('root/sub');
     watcher = new FileWatcher(fakeScanner(async () => {}));
     rec = recorder(watcher);
     watcher.watchRoots([tmp.path('missing-root'), tmp.path('root')], ['.TS']);
+
+    // fs.watch starts asynchronously on some platforms (FSEvents on macOS), so
+    // writes made right after watchRoots can be missed. Touch a probe file
+    // until the watcher reports it, so every test starts with a live watcher.
+    // Touches are spaced well past the debounce, which a faster rewrite would
+    // keep restarting.
+    const probe = tmp.path('root/_probe.ts');
+    const deadline = Date.now() + 20000;
+    for (let i = 0; !rec.events.some(ev => ev.file === probe); i++) {
+      if (Date.now() > deadline) { throw new Error('the watcher never became ready'); }
+      fs.writeFileSync(probe, `export const probe = ${i};`);
+      await delay(DEBOUNCE_MS * 3);
+    }
   });
 
   after(() => {
