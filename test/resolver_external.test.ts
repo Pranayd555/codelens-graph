@@ -90,7 +90,6 @@ describe('Calls bound to packages outside the workspace', () => {
       fs.symlinkSync(path.join(linked, 'packages', 'shared'), path.join(linked, 'node_modules', '@acme', 'shared'), 'junction');
       write('app/use.js', "const { linkedSharedFn } = require('@acme/shared');\nfunction useLinked() { return linkedSharedFn(); }\nmodule.exports = { useLinked };\n");
       await db.init();
-      // Same parser as the rest of the file: a second ASTParser falls back to regex parsing.
       await new WorkspaceScanner(ws.parser, db).scanWorkspace({ workspaceRoot: linked, folders: [] }, SCAN_OPTIONS);
       const caller = db.searchNodes('useLinked', 5, 'all').find(n => n.name === 'useLinked')!;
       const targets = db.getEdgesFrom(caller.id, 'calls').map(e => db.getNode(e.toId)?.name);

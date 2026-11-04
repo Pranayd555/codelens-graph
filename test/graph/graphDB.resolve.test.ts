@@ -71,9 +71,7 @@ describe('Import edge resolution', () => {
     assert.deepEqual(importTargets(fx.path('main.py'))[0], ['pkg/mod.py', 'imports', 'pkg.mod']);
   });
 
-  it('resolves an import of a directory to its index file', {
-    todo: 'BUG: resolveImportPath tries the bare base path first and fs.existsSync() is true for a directory, so "./lib" or Python "pkg.sub" resolves to the folder and no edge is made',
-  }, async () => {
+  it('resolves an import of a directory to its index file', async () => {
     db.upsertNodes([
       importNode(importer, './lib', "import { l } from './lib'", 6),
       importNode(importer, './both', "import { b } from './both'", 7),
@@ -361,9 +359,21 @@ describe('Incremental resolve matches a full resolve', () => {
     await assertMatchesFull('large batch');
   });
 
-  it('after editing a callee that is called through an alias', {
-    todo: 'BUG: incremental resolve re-resolves only refs named after the changed symbols; a ref through an alias ("h" for helper) loses its edge when the callee file is re-parsed',
-  }, async () => {
+  it('after editing a file required through its folder', async () => {
+    await seed();
+    ws.write('src/lib/index.js', 'function fromIndex() { return 1; }\nmodule.exports = { fromIndex };\n');
+    ws.write('src/viaFolder.js', "const { fromIndex } = require('./lib');\nfunction useIndex() { return fromIndex(); }\nmodule.exports = { useIndex };\n");
+    await ws.scanner.updateFile(ws.path('src/lib/index.js'));
+    await ws.scanner.updateFile(ws.path('src/viaFolder.js'));
+    assert.deepEqual(ws.callsFrom('useIndex'), ['fromIndex@src/lib/index.js']);
+
+    ws.write('src/lib/index.js', '// touched\nfunction fromIndex() { return 2; }\nmodule.exports = { fromIndex };\n');
+    await ws.scanner.updateFile(ws.path('src/lib/index.js'));
+    assert.deepEqual(ws.callsFrom('useIndex'), ['fromIndex@src/lib/index.js']);
+    await assertMatchesFull('required through its folder');
+  });
+
+  it('after editing a callee that is called through an alias', async () => {
     await seed();
     ws.write('src/alias.ts', "import { helper as h } from './util';\nexport function viaAlias() { return h(); }\n");
     await ws.scanner.updateFile(ws.path('src/alias.ts'));
