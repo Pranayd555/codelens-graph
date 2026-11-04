@@ -266,7 +266,7 @@ describe('SkillGenerator', () => {
       assert.deepEqual(lines, ['# Top', '## Bottom']);
     });
 
-    it('keeps a user file that only has frontmatter across regenerations and deselect', { todo: 'BUG: user frontmatter is treated as empty, so it is dropped on the 2nd generate and the file is deleted on deselect' }, () => {
+    it('keeps a user file that only has frontmatter across regenerations and deselect', () => {
       ws.write('CLAUDE.md', '---\ntitle: mine\n---\n');
       gen.generateAll(ws.root, stats(), ['Claude']);
       gen.generateAll(ws.root, stats(), ['Claude']);
@@ -276,7 +276,23 @@ describe('SkillGenerator', () => {
       assert.equal(file('CLAUDE.md').trim(), '---\ntitle: mine\n---');
     });
 
-    it('keeps user content that follows a start marker whose end marker was deleted', { todo: 'BUG: an orphan START marker is kept, so the next removal cuts from it to the new END and deletes the user text in between' }, () => {
+    it('still deletes its own rule file, whose frontmatter is the CodeLens header', () => {
+      gen.generateAll(ws.root, stats(), ['cursor', 'vscode']);
+      assert.ok(exists('.cursor/rules/codelens.mdc'));
+      gen.generateAll(ws.root, stats(), []);
+      assert.ok(!exists('.cursor/rules/codelens.mdc'));
+      assert.ok(!exists('.vscode/codelens.instructions.md'));
+    });
+
+    it('keeps user content before an end marker whose start marker was deleted', () => {
+      ws.write('CLAUDE.md', `# Mine\nkeep this\n${END}\n## Also mine\n`);
+      gen.generateAll(ws.root, stats(), ['Claude']);
+      gen.generateAll(ws.root, stats(), []);
+      assert.ok(file('CLAUDE.md').includes('keep this'));
+      assert.ok(file('CLAUDE.md').includes('## Also mine'));
+    });
+
+    it('keeps user content that follows a start marker whose end marker was deleted', () => {
       ws.write('CLAUDE.md', `# Mine\n${START}\nold\n\n## Keep me\n`);
       gen.generateAll(ws.root, stats(), ['Claude']);
       gen.generateAll(ws.root, stats(), []);
@@ -398,7 +414,19 @@ describe('SkillGenerator', () => {
       assert.equal(file('.gitignore').trim(), 'node_modules/');
     });
 
-    it('keeps the .gitignore lines around the old CodeLens block intact', { todo: 'BUG: removeGitignore regex eats the newline before and after the block, joining the neighbouring lines (node_modules/dist/)' }, () => {
+    it('removes the CodeLens block wherever it sits in .gitignore', () => {
+      ws.write('.gitignore', '# CodeLens Graph local index\n.codelens/\ndist/\n');
+      gen.clearAll(ws.root);
+      assert.equal(file('.gitignore'), 'dist/\n');
+    });
+
+    it('keeps a CRLF .gitignore intact around the old CodeLens block', () => {
+      ws.write('.gitignore', 'node_modules/\r\n# CodeLens Graph local index\r\n.codelens/\r\ndist/\r\n');
+      gen.clearAll(ws.root);
+      assert.equal(file('.gitignore'), 'node_modules/\r\ndist/\r\n');
+    });
+
+    it('keeps the .gitignore lines around the old CodeLens block intact', () => {
       ws.write('.gitignore', 'node_modules/\n# CodeLens Graph local index\n.codelens/\ndist/\n');
       gen.clearAll(ws.root);
       assert.equal(file('.gitignore'), 'node_modules/\ndist/\n');
