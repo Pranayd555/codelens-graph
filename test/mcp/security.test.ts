@@ -196,8 +196,7 @@ describe('MCP server security', { timeout: 120000 }, () => {
       assert.ok(!files.text.includes('secret4'), files.text);
     });
 
-    it('codelens_dependencies does not read type definitions outside the workspace',
-      { todo: 'BUG: readDeclaredExports(pkg.types) at mcpServer.ts:760 has no isPathInside check; a pre-built DB can point it anywhere' }, async () => {
+    it('codelens_dependencies does not read type definitions outside the workspace', async () => {
         const { text } = await client.call('codelens_dependencies', { packageName: 'evil-types', queryType: 'exports' });
         assert.ok(!text.includes('OUTSIDE_EXPORT_NAME'), text);
       });
