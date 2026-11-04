@@ -8,8 +8,7 @@ import { SCAN_OPTIONS } from '../helpers';
 // counts as "known" (has .codelens/codelens-graph.db) without the server
 // indexing it.
 
-// One parser per process: a second ASTParser in the same process fails to
-// initialise tree-sitter and silently falls back to regex parsing.
+// One parser per process, so grammars load only once.
 let sharedParser: ASTParser | undefined;
 export const parser = (): ASTParser => (sharedParser ??= new ASTParser());
 

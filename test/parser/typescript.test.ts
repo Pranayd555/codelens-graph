@@ -210,8 +210,7 @@ describe('TypeScript declarations', () => {
     const vars = namesOf(parsed, 'variable');
     assert.ok(vars.includes('VALUE'));
     assert.ok(vars.includes('mutable'));
-    assert.ok(vars.includes('arrow'));
-    assert.deepEqual(get(parsed, 'arrow').modifiers, ['export']);
+    assert.ok(!vars.includes('arrow'), 'a const arrow function is a function, not a variable');
     assert.equal(get(parsed, 'VALUE').line, 48);
     assert.ok(!parsed.nodes.some(n => /[{[\]]/.test(n.name)), 'no node named after a binding pattern');
     for (const local of ['data', 'svc', 'p', 'q', 'first']) {
@@ -253,7 +252,7 @@ describe('TypeScript declarations', () => {
     assert.equal(ref.id, `${main.id}::call::missingFn::23:2`);
   });
 
-  it('keeps calls made inside a const arrow function', { todo: 'BUG: `const f = () => g()` yields only a variable node, so calls in it are dropped (astParser.ts:554-576 never names arrow_function; 596 needs a function node)' }, () => {
+  it('keeps calls made inside a const arrow function', () => {
     assert.ok(parsed.callRefs.some(c => c.symbolName === 'trim'));
   });
 });
@@ -332,7 +331,7 @@ export default function App(): JSX.Element {
     assert.deepEqual(refsOf(get(parsed, 'App')), [], 'Counter is declared in this file');
   });
 
-  it('does not flag intrinsic lowercase JSX elements', { todo: 'BUG: <div>/<section> tag names are reported as undefinedRefs (astParser.ts:1196-1202 treats jsx tag identifiers as references)' }, () => {
+  it('does not flag intrinsic lowercase JSX elements', () => {
     assert.ok(!refsOf(get(parsed, 'Counter')).includes('div'));
   });
 
@@ -384,7 +383,7 @@ function withDefault(p = 1, ...rest) { return p + rest.length; }
     assert.deepEqual(load.localVars, ['res']);
     assert.ok(find(parsed, 'namedExpr', 'function'));
     assert.ok(find(parsed, 'legacy', 'variable'));
-    assert.ok(find(parsed, 'arrowFn', 'variable'));
+    assert.ok(find(parsed, 'arrowFn', 'function'));
   });
 
   it('records calls inside template literals', () => {
@@ -396,7 +395,7 @@ function withDefault(p = 1, ...rest) { return p + rest.length; }
     assert.ok(refsOf(get(parsed, 'load')).includes('globalThing'));
   });
 
-  it('treats default, rest and destructured params as parameters', { todo: 'BUG: JS assignment_pattern/rest_pattern/object_pattern params are skipped, so they go missing and are flagged as undefinedRefs (astParser.ts:797-798)' }, () => {
+  it('treats default, rest and destructured params as parameters', () => {
     const withDefault = get(parsed, 'withDefault');
     assert.deepEqual(withDefault.params?.map(p => p.name), ['p', 'rest']);
     assert.deepEqual(refsOf(withDefault), []);
@@ -417,6 +416,105 @@ export function View(props) {
     const view = get(jsx, 'View', 'function');
     assert.ok(!refsOf(view).includes('Card'));
     assert.deepEqual(callsFrom(jsx, 'View'), ['props.items.map']);
+  });
+});
+
+describe('Functions bound to a name', () => {
+  const fx = new ParserFixture();
+  let parsed: ParsedFile;
+
+  before(async () => {
+    parsed = await fx.parse('bound.tsx', `import { save } from './api';
+/** Formats a price. */
+export const format = async (price: number, { currency, type = 'x' }: Opts): Promise<string> => {
+  const rounded = round(price);
+  return save(rounded, currency, type);
+};
+const single = value => save(value);
+const legacy = function (a) { return save(a); };
+const notAFunction = 42;
+const App = () => <section><Missing /></section>;
+export class Widget {
+  private onClick = (event: Event) => { save(event); };
+  plain = 1;
+}
+function outer() {
+  const inner = () => save(1);
+  return inner();
+}
+`);
+  });
+  after(() => fx.cleanup());
+
+  it('makes a const arrow function a function located by its whole declaration', () => {
+    const fn = get(parsed, 'format', 'function');
+    assert.equal(fn.line, 3);
+    assert.equal(fn.endLine, 6);
+    assert.ok(fn.signature?.startsWith('const format = async'));
+    assert.deepEqual(fn.modifiers?.slice().sort(), ['async', 'export']);
+    assert.equal(fn.docComment?.includes('Formats a price'), true);
+    assert.equal(fn.returnType?.includes('Promise<string>'), true);
+    assert.equal(find(parsed, 'format', 'variable'), undefined, 'not also a variable');
+  });
+
+  it('keeps destructured parameters, including names like "type"', () => {
+    const fn = get(parsed, 'format', 'function');
+    assert.deepEqual(fn.params?.map(p => p.name), ['price', 'currency', 'type']);
+    assert.deepEqual(refsOf(fn), ['round']);
+  });
+
+  it('attributes calls to the arrow function that makes them', () => {
+    assert.deepEqual(callsFrom(parsed, 'format'), ['round', 'save']);
+    assert.deepEqual(callsFrom(parsed, 'single'), ['save']);
+  });
+
+  it('reads the single parameter of x => y', () => {
+    const fn = get(parsed, 'single', 'function');
+    assert.deepEqual(fn.params?.map(p => p.name), ['value']);
+    assert.deepEqual(refsOf(fn), []);
+  });
+
+  it('names anonymous function expressions after their variable', () => {
+    assert.deepEqual(get(parsed, 'legacy', 'function').params?.map(p => p.name), ['a']);
+    assert.equal(find(parsed, 'legacy', 'variable'), undefined);
+    assert.ok(find(parsed, 'notAFunction', 'variable'));
+  });
+
+  it('flags missing JSX components but not HTML elements', () => {
+    assert.deepEqual(refsOf(get(parsed, 'App', 'function')), ['Missing']);
+  });
+
+  it('makes a class-field arrow function a method', () => {
+    const method = get(parsed, 'onClick', 'method');
+    assert.equal(method.line, 12);
+    assert.ok(method.modifiers?.includes('private'));
+    assert.deepEqual(callsFrom(parsed, 'onClick'), ['save']);
+    assert.equal(find(parsed, 'plain', 'method'), undefined);
+  });
+
+  it('does not flag standard language and platform globals', async () => {
+    const p = await fx.parse('globals.ts', `export const encode = (text: string) => {
+  const bytes = new TextEncoder().encode(text);
+  if (!(bytes instanceof Uint8Array)) { throw new TypeError('bad'); }
+  setImmediate(() => queueMicrotask(notDefinedAnywhere));
+  return btoa(String(BigInt(bytes.length)));
+};
+`);
+    assert.deepEqual(refsOf(get(p, 'encode', 'function')), ['notDefinedAnywhere']);
+  });
+
+  it('attributes calls to a named function nested on the first line of its parent', async () => {
+    const p = await fx.parse('sameline.js', `const make = (opts) => wrap(function inner(x) {
+  return helper(x);
+}, opts);
+`);
+    assert.deepEqual(callsFrom(p, 'inner'), ['helper']);
+    assert.deepEqual(callsFrom(p, 'make'), ['wrap']);
+  });
+
+  it('leaves functions nested in functions as part of their parent', () => {
+    assert.equal(find(parsed, 'inner'), undefined);
+    assert.deepEqual(callsFrom(parsed, 'outer').slice().sort(), ['inner', 'save']);
   });
 });
 

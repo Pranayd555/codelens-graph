@@ -1,10 +1,7 @@
 import { ASTParser } from '../../src/ingestion/astParser';
 import { TestWorkspace } from '../helpers';
 
-// web-tree-sitter can only be initialised once per process: a second ASTParser
-// logs "Parser.init is not a function" and silently falls back to regex
-// parsing, which resolves fewer calls. Workspaces in one test file therefore
-// share a single parser.
+// Workspaces in one test file share a parser, so grammars load only once.
 const sharedParser = new ASTParser();
 
 export function newWorkspace(): TestWorkspace {

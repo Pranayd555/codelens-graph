@@ -22,7 +22,6 @@ Run one area: `node --require ts-node/register --test "test/graph/**/*.test.ts"`
 
 - `node:test` + `node:assert/strict`. Helpers live in files not named `*.test.ts` (`helpers.ts`, `*/_*.ts`, `*/fixtures.ts`).
 - Tests use temp directories under the OS temp folder and remove them. Code that reads `os.homedir()` is pointed at a temp "fake home" (`HOME` / `USERPROFILE`) — tests never touch the real home directory.
-- **One `ASTParser` per process.** A second instance currently falls back to regex parsing (see the known bug below), so area helpers share a single parser.
 - Tests must pass on Windows, Linux and macOS. Platform-specific expectations are guarded with `process.platform` (and skipped elsewhere).
 - **Known bugs are `todo` tests.** A test written for the correct behaviour of something that is currently broken is marked `it('…', { todo: 'BUG: …' }, …)`: it runs and fails without failing the suite. When you fix the bug, remove the `todo` option so the test guards it from then on. List them with:
   ```bash
