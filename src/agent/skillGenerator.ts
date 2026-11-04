@@ -5,6 +5,7 @@ import { GraphStats } from '../types';
 import { launcherConfigPath, launcherPath } from './mcpLauncher';
 
 const MANAGED_START = '<!-- CODELENS_MANAGED_START -->';
+const MANAGED_END   = '<!-- CODELENS_MANAGED_END -->';
 
 // Agent rule files CodeLens manages. 'whole' files are owned by CodeLens;
 // 'merge' files belong to the user and only carry a managed section.
@@ -114,17 +115,17 @@ export class SkillGenerator {
 
   removeAll(workspaceRoot: string): void {
     for (const target of AGENT_RULE_FILES) {
-      this.removeManagedSectionFrom(path.join(workspaceRoot, target.rel));
+      this.removeManagedSectionFrom(path.join(workspaceRoot, target.rel), target.mode);
     }
   }
 
   // Strips the managed section; deletes the file if nothing meaningful remains.
-  private removeManagedSectionFrom(filePath: string): void {
+  private removeManagedSectionFrom(filePath: string, mode: 'whole' | 'merge'): void {
     if (!fs.existsSync(filePath)) { return; }
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
       if (!content.includes(MANAGED_START)) { return; }
-      const remaining = this.contentWithoutManagedSection(content);
+      const remaining = this.contentWithoutManagedSection(content, mode);
       if (remaining) {
         writeIfChanged(filePath, remaining);
       } else {
@@ -133,13 +134,13 @@ export class SkillGenerator {
     } catch { /* ignore */ }
   }
 
-  // What is left after removing the managed section, or '' when only
-  // whitespace / frontmatter would remain.
-  private contentWithoutManagedSection(content: string): string {
+  // What is left after removing the managed section, or '' when nothing worth
+  // keeping remains. Frontmatter only counts as nothing in 'whole' files, where
+  // it is CodeLens's own header; in 'merge' files it belongs to the user.
+  private contentWithoutManagedSection(content: string, mode: 'whole' | 'merge'): string {
     const cleaned = this.removeManagedSection(content);
-    const trimmed = cleaned.trim();
-    const withoutFrontmatter = trimmed.replace(/^---[\s\S]*?---/, '').trim();
-    return trimmed && withoutFrontmatter !== '' ? cleaned : '';
+    const meaningful = mode === 'whole' ? cleaned.replace(/^\s*---[\s\S]*?---/, '') : cleaned;
+    return meaningful.trim() ? cleaned : '';
   }
 
   // ── Agent instruction files ───────────────────────────────────────────────
@@ -149,7 +150,7 @@ export class SkillGenerator {
     for (const target of AGENT_RULE_FILES) {
       const filePath = path.join(workspaceRoot, target.rel);
       if (!target.ide || !selectedIdes.includes(target.ide)) {
-        this.removeManagedSectionFrom(filePath);
+        this.removeManagedSectionFrom(filePath, target.mode);
         continue;
       }
       const desired = target.mode === 'whole'
@@ -334,7 +335,7 @@ ${instruction}
     let existing = '';
     try { existing = fs.readFileSync(filePath, 'utf-8'); } catch { /* new file */ }
     if (existing.includes(MANAGED_START)) {
-      existing = this.contentWithoutManagedSection(existing);
+      existing = this.contentWithoutManagedSection(existing, 'merge');
     }
     return (existing.trimEnd() ? existing.trimEnd() + '\n\n' : '') + newContent + '\n';
   }
@@ -344,7 +345,8 @@ ${instruction}
     if (!fs.existsSync(gp)) { return; }
     try {
       const content = fs.readFileSync(gp, 'utf-8');
-      const cleaned = content.replace(/\r?\n# CodeLens Graph local index\r?\n\.codelens\/\r?\n?/, '');
+      // Keeps one line break, so the lines around the block stay separate.
+      const cleaned = content.replace(/(^|\r?\n)# CodeLens Graph local index\r?\n\.codelens\/(?:\r?\n|$)/, '$1');
       if (cleaned !== content) {
         fs.writeFileSync(gp, cleaned, 'utf-8');
       }
@@ -352,10 +354,14 @@ ${instruction}
   }
 
   private removeManagedSection(content: string): string {
-    const s = content.indexOf('<!-- CODELENS_MANAGED_START -->');
-    const e = content.indexOf('<!-- CODELENS_MANAGED_END -->');
-    if (s === -1 || e === -1) { return content; }
+    const s = content.indexOf(MANAGED_START);
+    const e = s === -1 ? -1 : content.indexOf(MANAGED_END, s);
+    // A marker without its partner (e.g. a hand edit) can't tell us where the
+    // section ends: drop just the marker, never the user's text around it.
+    if (s === -1 || e === -1) {
+      return content.split(MANAGED_START).join('').split(MANAGED_END).join('');
+    }
     return (content.slice(0, s).trimEnd() + '\n'
-          + content.slice(e + '<!-- CODELENS_MANAGED_END -->'.length).trimStart()).trim();
+          + content.slice(e + MANAGED_END.length).trimStart()).trim();
   }
 }

@@ -72,9 +72,7 @@ describe('GraphDB storage layout (schema v2)', () => {
     }
   });
 
-  it('round-trips ids that do not start with their file path', {
-    todo: 'BUG: RAW_ID_MARKER is "\\u0000" and sql.js truncates text at NUL, so such keys are stored as "" (ids read back as "<file>::" and collide)',
-  }, async () => {
+  it('round-trips ids that do not start with their file path', async () => {
     fx = new GraphFixture();
     const db = await fx.open();
     const file = fx.path('a.ts');

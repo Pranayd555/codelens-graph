@@ -398,6 +398,9 @@ export class MCPServer {
           if (err instanceof WorkspaceOffError) { return txt(err.message); }
           throw err;
         }
+        // clear_config just deleted .codelens; opening the workspace to log the
+        // call would recreate it and start indexing again.
+        if (name === 'codelens_clear_config') { return result; }
         const text   = result.content.map((c: any) => c.text).join('');
         const { logger } = await this.getWorkspaceContext(args.workspace);
         logger.log(name, args, text, Date.now() - t0);
@@ -756,6 +759,9 @@ export class MCPServer {
           } else if (queryType === 'exports' || queryType === 'types') {
             if (!pkg.types) {
               lines.push('No type definitions found for this package' + (pkg.installed ? '.' : ' (it is not installed).'));
+            } else if (!isPathInside(pkg.types, workspaceRoot)) {
+              // The path comes from the DB, which a cloned repo could ship pre-built.
+              lines.push('This package\'s type definitions are outside the workspace, so they were not read.');
             } else {
               const exported = readDeclaredExports(pkg.types);
               lines.push('Type definitions: ' + rel(pkg.types), '');

@@ -14,6 +14,16 @@ updates:
       # Must stay in step with engines.vscode in package.json.
       - dependency-name: "@types/vscode"
         update-types: [version-update:semver-major, version-update:semver-minor]
+      # Must stay on the Node major of the VS Code versions we support.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+      # Major updates also need a replacement for ts-node, which breaks on TypeScript 7.
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
+      # 0.x minors change the API and the grammar ABI, so upgrade by hand with
+      # tree-sitter-wasms and re-run the parser tests.
+      - dependency-name: web-tree-sitter
+        update-types: [version-update:semver-major, version-update:semver-minor]
 
   - package-ecosystem: github-actions
     directory: /

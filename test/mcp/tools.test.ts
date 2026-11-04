@@ -455,8 +455,7 @@ describe('MCP server tools (contract)', { timeout: 120000 }, () => {
       assert.ok(t.exists('ws/src/math.ts'));
     });
 
-    it('leaves no .codelens folder behind',
-      { todo: 'BUG: the logging wrapper (mcpServer.ts:402) calls getWorkspaceContext after clear_config, recreating .codelens and re-indexing' }, async () => {
+    it('leaves no .codelens folder behind', async () => {
         await client.call('codelens_clear_config');
         assert.ok(!t.exists('ws/.codelens'), 'ws/.codelens should be gone after clear_config');
       });

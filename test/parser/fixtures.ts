@@ -4,10 +4,8 @@ import * as path from 'node:path';
 import { ASTParser } from '../../src/ingestion/astParser';
 import { CallReference, GraphNode, NodeType, ParsedFile } from '../../src/types';
 
-// The one ASTParser per test process. Every test file runs in its own process,
-// and only the first ASTParser in a process gets tree-sitter: web-tree-sitter
-// replaces its module exports during init, so a later instance's init fails
-// and it silently falls back to regex (see multi_instance.test.ts).
+// One ASTParser per test file (each runs in its own process) keeps grammars
+// loaded between tests.
 export const sharedParser = new ASTParser();
 
 // Throwaway directory of source files, parsed with the shared parser.

@@ -1164,7 +1164,7 @@ export class GraphDB {
 
       await this.resolveImportEdges(filesByPath, importsByFile, changedFiles, cache, insertEdge, deleteImporterEdges, maybeYield);
 
-      for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols)) {
+      for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols, importsByFile)) {
         await maybeYield();
         if (!fullResolve) { deleteCallEdges.run([ref.rid]); }
         const target = this.resolveCallTarget(ref, importsByFile, cache);
@@ -1202,13 +1202,42 @@ export class GraphDB {
     return importsByFile;
   }
 
-  private getAffectedCallRefs(changedFiles: string[] | null, changedSymbols: string[]): CallRefRow[] {
+  // Local names that files bind by importing one of the changed files. A call
+  // through such a name (`h()` for `import { helper as h }`, or a default import
+  // under another name) carries no changed file or symbol, but its target just
+  // lost its edges, so it has to be resolved again.
+  private namesBoundFromChangedFiles(
+    changedFiles: string[], importsByFile: Map<string, GraphNode[]>
+  ): Map<string, Set<string>> {
+    const changedBases = new Set<string>();
+    for (const filePath of changedFiles) {
+      for (const base of importBasesFor(filePath)) { changedBases.add(pathKey(base)); }
+    }
+    const bound = new Map<string, Set<string>>();
+    for (const [importerPath, importNodes] of importsByFile) {
+      for (const node of importNodes) {
+        const base = importBase(importerPath, node.name);
+        if (base === null || !changedBases.has(pathKey(base))) { continue; }
+        const names = withoutStringLiterals(node.signature ?? '').match(/[A-Za-z_$][w$]*/g) ?? [];
+        const set = bound.get(importerPath) ?? new Set<string>();
+        for (const name of names) { set.add(name); }
+        bound.set(importerPath, set);
+      }
+    }
+    return bound;
+  }
+
+  private getAffectedCallRefs(
+    changedFiles: string[] | null, changedSymbols: string[], importsByFile: Map<string, GraphNode[]>
+  ): CallRefRow[] {
     let sql = `SELECT r.rid, r.from_nid, r.symbol_name, r.qualifier, f.id, f.path
                FROM call_refs r JOIN files f ON f.id = r.file_id`;
     let params: unknown[] = [];
+    const boundNames = changedFiles ? this.namesBoundFromChangedFiles(changedFiles, importsByFile) : new Map<string, Set<string>>();
     if (changedFiles !== null) {
       const fileParams = [...new Set(changedFiles.map(f => this.toStoredPath(f)))];
-      const symbolParams = [...new Set(changedSymbols)];
+      const allBoundNames = [...boundNames.values()].flatMap(names => [...names]);
+      const symbolParams = [...new Set([...changedSymbols, ...allBoundNames])];
       if (!fileParams.length && !symbolParams.length) { return []; }
       // SQLite caps bound parameters; very large batches fall back to a filtered scan.
       if (fileParams.length + symbolParams.length <= 900) {
@@ -1233,7 +1262,8 @@ export class GraphDB {
         qualifier: qualifier ?? undefined,
         filePath: this.absPathOf(fileId, stored),
       };
-      if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)) { continue; }
+      if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)
+          && !boundNames.get(ref.filePath)?.has(ref.symbolName)) { continue; }
       refs.push(ref);
     }
     stmt.free();
@@ -1397,7 +1427,9 @@ export class GraphDB {
         ...IMPORT_EXTENSIONS.map(ext => path.join(base, `index${ext}`)),
         path.join(base, '__init__.py'),
       ];
-      resolved = candidates.find(candidate => fs.existsSync(candidate)) ?? null;
+      // statSync, not existsSync: a folder named like the import isn't a target,
+      // its index file (or a same-named file next to it) is.
+      resolved = candidates.find(candidate => fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) ?? null;
     }
     cache.importPaths.set(key, resolved);
     return resolved;
