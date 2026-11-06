@@ -70,7 +70,7 @@ describe('FileClassifier.classify', () => {
     assert.equal(classify('/repo/myutilsdir2/index.ts'), 'Other');
   });
 
-  it('classifies unit-test files as Tests, wherever they live', { todo: 'BUG: category order (fileClassifier.ts:13-69) puts *.test.* files under services/routes/... in that category instead of Tests' }, () => {
+  it('classifies unit-test files as Tests, wherever they live', { todo: 'BUG #23: category order (fileClassifier.ts:13-69) puts *.test.* files under services/routes/... in that category instead of Tests' }, () => {
     assert.equal(classify('/repo/src/services/__tests__/emailService.test.ts'), 'Tests');
     assert.equal(classify('/repo/src/routes/auth.test.ts'), 'Tests');
     assert.equal(classify('/repo/test/userService.test.ts'), 'Tests');
@@ -138,7 +138,7 @@ describe('FileClassifier.buildCategoryHint', () => {
     assert.deepEqual(labels, ['Services / business logic', 'Utility / helpers', 'Authentication / security', 'Data models / schemas']);
   });
 
-  it('lists each category at most once', { todo: 'BUG: padding (fileClassifier.ts:125-131) re-adds a category already shown with 4+ files, because its 3-file entry text differs' }, () => {
+  it('lists each category at most once', { todo: 'BUG #23: padding (fileClassifier.ts:125-131) re-adds a category already shown with 4+ files, because its 3-file entry text differs' }, () => {
     const hint = classifier.buildCategoryHint(files, ['nomatch']);
     const labels = hint.split('\n').map(l => l.match(/^\*\*(.+?)\*\*/)?.[1]);
     assert.equal(new Set(labels).size, labels.length, `duplicated category in:\n${hint}`);

@@ -259,7 +259,7 @@ describe('compileSearchRegex', () => {
   });
 
   it('accepts bounded {n,m} quantifiers (they cannot backtrack unboundedly)',
-    { todo: 'BUG: {n,m} counted as unbounded (src/utils.ts:226 checks brace[2] instead of brace[3] === ""), so e.g. \\d{1,3}\\.\\d{1,3}\\.\\d{1,3} is rejected' },
+    { todo: 'BUG #34: {n,m} counted as unbounded (src/utils.ts:226 checks brace[2] instead of brace[3] === ""), so e.g. \\d{1,3}\\.\\d{1,3}\\.\\d{1,3} is rejected' },
     () => {
       assert.ok(accepted('\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}'));
     });

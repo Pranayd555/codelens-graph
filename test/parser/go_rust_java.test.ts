@@ -133,19 +133,19 @@ describe('Go', () => {
     assert.ok(callsFrom(parsed, 'Start').includes('helper'));
   });
 
-  it('names import nodes after the imported package', { todo: 'BUG: Go import nodes have an empty name (getImportSource/extractImportNames ignore import_spec, astParser.ts:351, 602-637)' }, () => {
+  it('names import nodes after the imported package', { todo: 'BUG #38: Go import nodes have an empty name (getImportSource/extractImportNames ignore import_spec, astParser.ts:351, 602-637)' }, () => {
     const names = parsed.nodes.filter(n => n.type === 'import').map(n => n.name);
     assert.ok(names.every(n => n.length > 0));
     assert.ok(names.join(' ').includes('fmt'));
   });
 
-  it('does not flag imported packages as undefined refs', { todo: 'BUG: Go imports are not added to scope, so fmt/str are flagged in NewServer (astParser.ts:602-619)' }, () => {
+  it('does not flag imported packages as undefined refs', { todo: 'BUG #38: Go imports are not added to scope, so fmt/str are flagged in NewServer (astParser.ts:602-619)' }, () => {
     const refs = refsOf(get(parsed, 'NewServer'));
     assert.ok(!refs.includes('fmt'));
     assert.ok(!refs.includes('str'));
   });
 
-  it('emits type, const and var declarations', { todo: 'BUG: type_declaration/var/const have no name field at top level, so Server, Handler, Version, counter are never emitted (astParser.ts:159-161, 554-576)' }, () => {
+  it('emits type, const and var declarations', { todo: 'BUG #38: type_declaration/var/const have no name field at top level, so Server, Handler, Version, counter are never emitted (astParser.ts:159-161, 554-576)' }, () => {
     for (const name of ['Server', 'Handler', 'Version', 'counter']) {
       assert.ok(find(parsed, name), name);
     }
@@ -189,15 +189,15 @@ describe('Rust', () => {
     assert.deepEqual(callsFrom(parsed, 'dist'), ['compute']);
   });
 
-  it('emits a fn named new', { todo: 'BUG: KEYWORDS contains "new", so Rust constructors `fn new` are dropped (astParser.ts:38, 417)' }, () => {
+  it('emits a fn named new', { todo: 'BUG #40: KEYWORDS contains "new", so Rust constructors `fn new` are dropped (astParser.ts:38, 417)' }, () => {
     assert.ok(find(parsed, 'new', 'function'));
   });
 
-  it('does not flag self', { todo: 'BUG: &self is not extracted as a param, so `self` is flagged in methods (astParser.ts:797-798, 1206)' }, () => {
+  it('does not flag self', { todo: 'BUG #39: &self is not extracted as a param, so `self` is flagged in methods (astParser.ts:797-798, 1206)' }, () => {
     assert.ok(!refsOf(get(parsed, 'dist')).includes('self'));
   });
 
-  it('strips /// from doc comments', { todo: 'BUG: `/// A point.` becomes docComment "/ A point." (astParser.ts:856)' }, () => {
+  it('strips /// from doc comments', { todo: 'BUG #39: `/// A point.` becomes docComment "/ A point." (astParser.ts:856)' }, () => {
     assert.equal(get(parsed, 'Point').docComment, 'A point.');
   });
 });
@@ -242,24 +242,24 @@ describe('Java', () => {
     assert.deepEqual(get(parsed, 'run').instantiates, ['Thread']);
   });
 
-  it('extracts method params', { todo: 'BUG: java paramsField is "formal_parameters" but the field is "parameters", so params are never extracted (astParser.ts:198)' }, () => {
+  it('extracts method params', { todo: 'BUG #39: java paramsField is "formal_parameters" but the field is "parameters", so params are never extracted (astParser.ts:198)' }, () => {
     assert.deepEqual(get(parsed, 'build').params?.map(p => p.name), ['n']);
   });
 
-  it('names static imports after the imported member', { todo: 'BUG: `import static java.lang.Math.max;` is named "static" (astParser.ts:634)' }, () => {
+  it('names static imports after the imported member', { todo: 'BUG #39: `import static java.lang.Math.max;` is named "static" (astParser.ts:634)' }, () => {
     assert.equal(parsed.nodes.filter(n => n.type === 'import')[1].name, 'java.lang.Math.max');
   });
 
-  it('reports every modifier, also after annotations', { todo: 'BUG: java modifiers are only seen when the modifiers node is a single keyword (astParser.ts:836-841)' }, () => {
+  it('reports every modifier, also after annotations', { todo: 'BUG #39: java modifiers are only seen when the modifiers node is a single keyword (astParser.ts:836-841)' }, () => {
     assert.deepEqual(get(parsed, 'build').modifiers, ['private', 'static']);
     assert.ok(get(parsed, 'run').modifiers?.includes('public'));
   });
 
-  it('does not flag typed local variables', { todo: 'BUG: local patterns only know const/let/var, so `List<String> xs = ...; xs.size()` flags xs (astParser.ts:1127-1131)' }, () => {
+  it('does not flag typed local variables', { todo: 'BUG #39: local patterns only know const/let/var, so `List<String> xs = ...; xs.size()` flags xs (astParser.ts:1127-1131)' }, () => {
     assert.ok(!refsOf(get(parsed, 'run')).includes('xs'));
   });
 
-  it('strips */ from single-line javadoc', { todo: 'BUG: `/** App class. */` becomes docComment "App class. */" (astParser.ts:856)' }, () => {
+  it('strips */ from single-line javadoc', { todo: 'BUG #39: `/** App class. */` becomes docComment "App class. */" (astParser.ts:856)' }, () => {
     assert.equal(get(parsed, 'App', 'class').docComment, 'App class.');
   });
 });

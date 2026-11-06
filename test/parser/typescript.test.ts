@@ -141,12 +141,12 @@ describe('TypeScript declarations', () => {
     assert.ok(add.docComment?.startsWith('Adds numbers.'));
   });
 
-  it('returnType carries just the type, like params do', { todo: 'BUG: TS returnType keeps the leading ": " of the type annotation (astParser.ts:432)' }, () => {
+  it('returnType carries just the type, like params do', { todo: 'BUG #41: TS returnType keeps the leading ": " of the type annotation (astParser.ts:432)' }, () => {
     assert.equal(get(parsed, 'add').returnType, 'number');
     assert.equal(get(parsed, 'main').returnType, 'Promise<void>');
   });
 
-  it('strips the closing */ from JSDoc comments', { todo: 'BUG: JSDoc docComment ends with a stray "/" from the closing */ line (astParser.ts:855-856)' }, () => {
+  it('strips the closing */ from JSDoc comments', { todo: 'BUG #41: JSDoc docComment ends with a stray "/" from the closing */ line (astParser.ts:855-856)' }, () => {
     assert.equal(get(parsed, 'add').docComment, 'Adds numbers.');
   });
 
@@ -164,7 +164,7 @@ describe('TypeScript declarations', () => {
     assert.deepEqual(main.params, [{ name: 'opt', type: 'string', defaultValue: undefined, rest: false }]);
   });
 
-  it('marks default exports with the default modifier', { todo: 'BUG: "default" is never reported for `export default function` (astParser.ts:843 only adds export)' }, () => {
+  it('marks default exports with the default modifier', { todo: 'BUG #41: "default" is never reported for `export default function` (astParser.ts:843 only adds export)' }, () => {
     assert.ok(get(parsed, 'main').modifiers?.includes('default'));
   });
 
@@ -277,7 +277,7 @@ describe('TypeScript CommonJS require wrappers', () => {
     assert.deepEqual(refsOf(get(parsed, 'useAll')), []);
   });
 
-  it('unwraps an angle-bracket type assertion around require()', { todo: 'BUG: `(<any>require("x"))` is not seen as an import; type_assertion unwrap picks the type argument (astParser.ts:651)' }, async () => {
+  it('unwraps an angle-bracket type assertion around require()', { todo: 'BUG #41: `(<any>require("x"))` is not seen as an import; type_assertion unwrap picks the type argument (astParser.ts:651)' }, async () => {
     const parsed = await fx.parse('old.ts', "const wrapped = (<any>require('./old'));\n");
     assert.deepEqual(parsed.nodes.filter(n => n.type === 'import').map(n => n.name), ['./old']);
   });
@@ -531,7 +531,7 @@ export function run() { return 1; }
     assert.deepEqual(namesOf(parsed, 'function'), ['run']);
   });
 
-  it('keeps methods named like keywords or test hooks', { todo: 'BUG: KEYWORDS/TEST_HOOKS filters drop real declarations named delete/new/setup/before/after/test (astParser.ts:417-418)' }, async () => {
+  it('keeps methods named like keywords or test hooks', { todo: 'BUG #40: KEYWORDS/TEST_HOOKS filters drop real declarations named delete/new/setup/before/after/test (astParser.ts:417-418)' }, async () => {
     const parsed = await fx.parse('holder.ts', `export class Holder {
   delete(key: string) { return key; }
   setup() { return 1; }

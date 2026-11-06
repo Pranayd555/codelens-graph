@@ -137,7 +137,7 @@ describe('WorkspaceScanner file selection', () => {
     });
 
     it('does not index files of a selected folder inside node_modules',
-      { todo: 'BUG: listFiles walks a selected folder under node_modules (workspaceScanner.ts:411-412 only skips node_modules children), although isFileAllowed rejects those files' },
+      { todo: 'BUG #35: listFiles walks a selected folder under node_modules (workspaceScanner.ts:411-412 only skips node_modules children), although isFileAllowed rejects those files' },
       async () => {
         const files = await list(only('node_modules/pkg'), SCAN_OPTIONS);
         assert.ok(!files.some(f => f.startsWith('node_modules/')), files.join(', '));
@@ -192,14 +192,14 @@ describe('WorkspaceScanner file selection', () => {
     });
 
     it('agrees with listFiles on generated files (.d.ts, .min.js)',
-      { todo: 'BUG: walkDir skips *.d.ts / *.min.js (workspaceScanner.ts:476-483) but isFileAllowed (:333) does not, so watcher saves index files a full scan never indexes' },
+      { todo: 'BUG #35: walkDir skips *.d.ts / *.min.js (workspaceScanner.ts:476-483) but isFileAllowed (:333) does not, so watcher saves index files a full scan never indexes' },
       () => {
         assert.equal(allowed('src/types.d.ts'), false);
         assert.equal(allowed('src/vendor.min.js'), false);
       });
 
     it('agrees with listFiles on config files matched by a user exclude pattern',
-      { todo: 'BUG: walkDir lets config files bypass user excludes (workspaceScanner.ts:445 `&& !isConfig`) but isFileAllowed applies them first (:343)' },
+      { todo: 'BUG #35: walkDir lets config files bypass user excludes (workspaceScanner.ts:445 `&& !isConfig`) but isFileAllowed applies them first (:343)' },
       async () => {
         const options = { ...SCAN_OPTIONS, excludePatterns: ['*.md'] };
         const listed = await list(whole(), options);

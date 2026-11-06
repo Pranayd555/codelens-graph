@@ -118,7 +118,7 @@ describe('TS scope analysis: localVars and instantiates', () => {
     assert.equal(new Set(vars).size, vars.length, 'deduplicated');
   });
 
-  it('records the bound name of renamed/rest destructuring as the local', { todo: 'BUG: `{ b: renamed, ...others }` yields localVar "b" (the key) and drops renamed/others (astParser.ts:1129,1141)' }, () => {
+  it('records the bound name of renamed/rest destructuring as the local', { todo: 'BUG #42: `{ b: renamed, ...others }` yields localVar "b" (the key) and drops renamed/others (astParser.ts:1129,1141)' }, () => {
     const vars = get(parsed, 'outer').localVars ?? [];
     assert.ok(vars.includes('renamed'));
     assert.ok(vars.includes('others'));
@@ -139,7 +139,7 @@ describe('TS scope analysis: localVars and instantiates', () => {
     assert.ok(!p.edges.some(e => e.type === 'undefined_ref' || e.type === 'instantiates'));
   });
 
-  it('records classes constructed inside object literals and ternaries', { todo: 'BUG: stripTypeAnnotations treats `key: value` and `? a : b` as type annotations, hiding `new X()` (astParser.ts:922-1001)' }, async () => {
+  it('records classes constructed inside object literals and ternaries', { todo: 'BUG #42: stripTypeAnnotations treats `key: value` and `? a : b` as type annotations, hiding `new X()` (astParser.ts:922-1001)' }, async () => {
     const p = await fx.parse('factory.ts', `export class Factory {}
 export class Other {}
 export function build(flag: boolean) {
@@ -186,7 +186,7 @@ function two() { return shared; }
     assert.deepEqual(get(p, 'tick').params?.map(x => x.name), ['step']);
   });
 
-  it('flags a shorthand property that refers to an undeclared name', { todo: 'BUG: `{ missing }` object shorthand is never checked (astParser.ts:1197 only visits identifier nodes)' }, async () => {
+  it('flags a shorthand property that refers to an undeclared name', { todo: 'BUG #42: `{ missing }` object shorthand is never checked (astParser.ts:1197 only visits identifier nodes)' }, async () => {
     const p = await fx.parse('shorthand.js', 'export function pack() { return { missingValue }; }\n');
     assert.deepEqual(refsOf(get(p, 'pack')), ['missingValue']);
   });

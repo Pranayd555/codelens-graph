@@ -158,7 +158,7 @@ describe('StatsViewProvider webview messages', () => {
   });
 
   it('ignores Object.prototype names as commands',
-    { todo: 'BUG: statsView.ts:37-49 looks commands up in a plain object, so toString/constructor/__proto__ call executeCommand with a function/object' },
+    { todo: 'BUG #45: statsView.ts:37-49 looks commands up in a plain object, so toString/constructor/__proto__ call executeCommand with a function/object' },
     (t) => {
       const { view } = setup(t);
       for (const command of ['toString', 'constructor', '__proto__', 'hasOwnProperty', 'valueOf']) {

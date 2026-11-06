@@ -98,7 +98,7 @@ describe('GraphDB nodes', () => {
   });
 
   it('a file whose first write was rolled back can be written again', {
-    todo: 'BUG: the rollback in upsertNodes leaves the new files row id in the fileIds cache, so later nodes point at a missing files row and are invisible',
+    todo: 'BUG #33: the rollback in upsertNodes leaves the new files row id in the fileIds cache, so later nodes point at a missing files row and are invisible',
   }, () => {
     const a = fx.path('fresh.ts');
     const bad = { ...makeNode(a, 'bad'), name: null } as unknown as GraphNode;

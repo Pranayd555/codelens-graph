@@ -122,7 +122,7 @@ describe('GraphDB text lines', () => {
   });
 
   it('literal search does not treat _ or % as wildcards', {
-    todo: 'BUG: literal searchFileLines/getTextEntriesByWord use LIKE without ESCAPE and no JS re-check, so "_" and "%" match any characters',
+    todo: 'BUG #30: literal searchFileLines/getTextEntriesByWord use LIKE without ESCAPE and no JS re-check, so "_" and "%" match any characters',
   }, () => {
     assert.deepEqual(hits(db.searchFileLines('user_id', undefined, false, false, 50)), ['a:7']);
     assert.deepEqual(db.getTextEntriesByWord('user_id', true).map(e => e.line), [7]);
@@ -191,7 +191,7 @@ describe('GraphDB text lines', () => {
   });
 
   it('addTextEntries keeps entries from different files apart', {
-    todo: 'BUG: addFileLines stores every line under lines[0].filePath, so a multi-file batch is attributed to the first file',
+    todo: 'BUG #31: addFileLines stores every line under lines[0].filePath, so a multi-file batch is attributed to the first file',
   }, async () => {
     const fx2 = new GraphFixture();
     try {
