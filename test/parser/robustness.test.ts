@@ -101,7 +101,7 @@ describe('Robustness', () => {
     assert.equal(get(p, 'afterEmoji').signature, 'function afterEmoji() { return s; }');
   });
 
-  it('keeps non-ASCII parameter names', { todo: 'BUG: params must match /^\\w+$/ (ASCII only), so `café(ñ: number)` has no params (astParser.ts:816)' }, async () => {
+  it('keeps non-ASCII parameter names', { todo: 'BUG #43: params must match /^\\w+$/ (ASCII only), so `café(ñ: number)` has no params (astParser.ts:816)' }, async () => {
     const p = await fx.parse('uni-params.ts', 'export function café(ñame: number, größe: string) { return ñame; }\n');
     assert.deepEqual(get(p, 'café').params?.map(x => x.name), ['ñame', 'größe']);
   });

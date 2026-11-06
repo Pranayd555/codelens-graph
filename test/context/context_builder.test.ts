@@ -113,7 +113,7 @@ describe('ContextBuilder on a small app', () => {
       assert.equal(ctx.depVisibility, 'full');
     });
 
-    it('"deps" finds symbols defined in config files', { todo: 'BUG: deps search SQL (graphDB.ts:731) only matches node_modules/.json/.md paths, so vite.config.ts symbols are never entry points although contextBuilder.ts:62-63 treats config files as deps' }, () => {
+    it('"deps" finds symbols defined in config files', { todo: 'BUG #24: deps search SQL (graphDB.ts:731) only matches node_modules/.json/.md paths, so vite.config.ts symbols are never entry points although contextBuilder.ts:62-63 treats config files as deps' }, () => {
       const ctx = cb.build('emailConfig', 0, 5000, 'short', 'deps');
       assert.deepEqual(symbolsOf(ctx), ['emailConfig']);
     });
@@ -160,13 +160,13 @@ describe('ContextBuilder on a small app', () => {
       assert.match(section(cb.buildSystemPromptInjection(ctx), 'Warnings')!, /^- "sendEmail" \(function\) exists in 2 places/m);
     });
 
-    it('recommends one and the same copy of a duplicated symbol', { todo: 'BUG: contextBuilder.ts:268 suggests "Use the existing one at <this node>", so each copy tells the agent to use itself' }, () => {
+    it('recommends one and the same copy of a duplicated symbol', { todo: 'BUG #22: contextBuilder.ts:268 suggests "Use the existing one at <this node>", so each copy tells the agent to use itself' }, () => {
       const ctx = cb.build('sendEmail', 0, 5000);
       const suggestions = new Set(ctx.diagnoses.filter(d => d.type === 'duplicate_symbol').map(d => d.suggestion));
       assert.equal(suggestions.size, 1, [...suggestions].join('\n'));
     });
 
-    it('lists duplicate locations as short paths', { todo: 'BUG: contextBuilder.ts:258 splits on "/" only, so on Windows the whole absolute path is printed' }, () => {
+    it('lists duplicate locations as short paths', { todo: 'BUG #22: contextBuilder.ts:258 splits on "/" only, so on Windows the whole absolute path is printed' }, () => {
       const ctx = cb.build('sendEmail', 0, 5000);
       for (const d of ctx.diagnoses.filter(x => x.type === 'duplicate_symbol')) {
         assert.ok(!d.message.includes(ws.root), d.message);

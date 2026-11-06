@@ -6,17 +6,8 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ## [Unreleased]
 
-### Added
-- Comprehensive test suite for CommonJS `require()` import parsing, scope analysis, and cross-file call resolution (`test/cjs_require.test.ts`).
-- `test` script in `package.json` for running the automated test suite.
-
 ### Fixed
-- **CommonJS Destructured `require()` Recognition**:
-  - Tree-sitter parser in `astParser.ts` now identifies `const { ... } = require(...)` and `const x = require(...)` statements as formal module imports.
-  - Emits proper `import` `GraphNode` and `imports` `GraphEdge` for CommonJS `require` statements in JavaScript, TypeScript, and TSX files.
-  - Prevents erroneous emission of dummy `variable` nodes named after destructuring patterns (e.g., `"{ dbAll, dbGet }"`).
-  - Populates imported symbol names into `fileImportedNames` during AST ingestion, resolving false-positive `⚠️ undefined: <symbol>` flags on consumer functions.
-  - Extended `aliasPattern` in `GraphDB` (`graphDB.ts`) to support CommonJS colon alias syntax (`const { orig: alias } = require(...)`) alongside ESM `as` syntax, ensuring cross-file call edges are accurately resolved.
+- **CommonJS `require()` is understood as an import** (#8, thanks @Sebxxs004 in #9). `const { dbAll } = require('./db')`, `const db = require('./db')` and renamed forms like `const { dbAll: myDb } = require('./db')` no longer cause false "undefined" warnings on the functions that use them, calls link to the required file even when another file has a function with the same name, and CommonJS files now show which files they import. Nodes named after the pattern (`{ dbAll, dbGet }`) are gone.
 - **Calls into npm packages and Node built-ins** are no longer linked to an unrelated workspace symbol that happens to share the name (e.g. `path.normalize()` or `fast-deep-equal`'s `equal()`). Packages count as external when installed in `node_modules` or declared in `package.json`; workspace packages (symlinked or `workspace:`/`file:`/`link:`) and path aliases such as `@/utils` still link into the workspace.
 - **Import hints match the project's module system**: CommonJS files get `const { x } = require(…)` instead of an ES-module `import`. "Import as" paths are now relative to the workspace root (they were relative to the symbol's own folder), and `codelens_node` no longer suggests a JavaScript import for Java, Go, C# and other languages.
 - **Arrow functions are now real symbols.** `const f = () => {}`, `const f = function () {}` and class fields like `handler = () => {}` were indexed as variables (or not at all), so the calls inside them were lost. They are now functions and methods with parameters, return types and call links, which adds a lot of call links in modern TypeScript and React code.
@@ -33,8 +24,7 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ### Changed
 - **Agent MCP configs keep working across extension updates.** Configs ran the server from the versioned install folder (`…/pranaydas.codelens-graph-<version>/dist/mcp.js`), which the next update deletes, so agents configured outside the workspace (`~/.claude.json`, `~/.cursor/mcp.json`, Windsurf) silently lost CodeLens after every update. Generated configs now run a stable launcher, `~/.codelens/mcp.js`, that starts the newest CodeLens version installed in any editor (VS Code, Insiders, Cursor, Windsurf, Antigravity, …). On startup, existing configs that point at a versioned folder are switched to the launcher automatically; only that path changes, and configs pointing anywhere else (e.g. a development build) are left alone.
-- **Existing indexes are re-parsed once after an update that changes parsing**, so fixes like the CommonJS one above apply to files that haven't changed since they were indexed. Previously those kept their old results until edited or rebuilt with **CodeLens: Force Rebuild Graph**.
-- `npm test` runs every test in `test/`.
+- **Existing indexes are re-parsed once after an update that changes parsing**, so fixes like the ones above apply to files that haven't changed since they were indexed. Previously those kept their old results until edited or rebuilt with **CodeLens: Force Rebuild Graph**.
 
 ---
 

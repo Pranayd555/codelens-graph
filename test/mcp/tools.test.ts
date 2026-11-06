@@ -236,7 +236,7 @@ describe('MCP server tools (contract)', { timeout: 120000 }, () => {
     });
 
     it('does not suggest importing a class method as a module export',
-      { todo: 'BUG: buildImportStmt (mcpServer.ts:1061-1064) emits "import { compute } from ..." for a method' }, async () => {
+      { todo: 'BUG #27: buildImportStmt (mcpServer.ts:1061-1064) emits "import { compute } from ..." for a method' }, async () => {
         const { text } = await client.call('codelens_node', { symbol: 'compute' });
         assert.match(text, /^## \[method\] compute/);
         assert.ok(!text.includes('import { compute }'), text);

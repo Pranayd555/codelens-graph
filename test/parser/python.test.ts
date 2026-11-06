@@ -92,11 +92,11 @@ describe('Python declarations and imports', () => {
     assert.equal(fetch.signature, 'async def fetch(self, user_id: int, flag: bool = False, *args, **kwargs) -> Optional[U]:');
   });
 
-  it('extracts typed, typed-default and splat params', { todo: 'BUG: typed_parameter/typed_default_parameter/*args/**kwargs are dropped from params (astParser.ts:797-799, 815-816)' }, () => {
+  it('extracts typed, typed-default and splat params', { todo: 'BUG #37: typed_parameter/typed_default_parameter/*args/**kwargs are dropped from params (astParser.ts:797-799, 815-816)' }, () => {
     assert.deepEqual(get(parsed, 'fetch').params?.map(p => p.name), ['self', 'user_id', 'flag', 'args', 'kwargs']);
   });
 
-  it('emits module-level and class-level assignments as variables', { todo: 'BUG: python `assignment` has no name field, so MAX_ITEMS/limit are never emitted (astParser.ts:144, 554-576)' }, () => {
+  it('emits module-level and class-level assignments as variables', { todo: 'BUG #37: python `assignment` has no name field, so MAX_ITEMS/limit are never emitted (astParser.ts:144, 554-576)' }, () => {
     assert.ok(find(parsed, 'MAX_ITEMS', 'variable'));
     assert.ok(find(parsed, 'limit', 'variable'));
   });
@@ -112,7 +112,7 @@ describe('Python declarations and imports', () => {
     assert.deepEqual(callsFrom(parsed, 'helper'), ['transform', 'print', 'len']);
   });
 
-  it('records attribute calls such as obj.method()', { todo: 'BUG: python `attribute` callees are ignored, so self.repo.get()/json.loads() produce no callRefs (astParser.ts:585-589)' }, () => {
+  it('records attribute calls such as obj.method()', { todo: 'BUG #37: python `attribute` callees are ignored, so self.repo.get()/json.loads() produce no callRefs (astParser.ts:585-589)' }, () => {
     const calls = callsFrom(parsed, 'helper');
     assert.ok(calls.includes('value.strip'));
   });
@@ -152,23 +152,23 @@ describe('Python scope analysis', () => {
     }
   });
 
-  it('does not flag Python builtins', { todo: 'BUG: Python builtins (print, len, ...) are flagged; only JS_BUILTINS are whitelisted (astParser.ts:1153-1175)' }, () => {
+  it('does not flag Python builtins', { todo: 'BUG #37: Python builtins (print, len, ...) are flagged; only JS_BUILTINS are whitelisted (astParser.ts:1153-1175)' }, () => {
     const refs = refsOf(get(parsed, 'helper'));
     assert.ok(!refs.includes('print'));
     assert.ok(!refs.includes('len'));
   });
 
-  it('treats the first assignment of a body as a local', { todo: 'BUG: /^\\s+(\\w+)\\s*=/ misses the first body line (no indent in body text), so `value` is flagged (astParser.ts:1128)' }, () => {
+  it('treats the first assignment of a body as a local', { todo: 'BUG #37: /^\\s+(\\w+)\\s*=/ misses the first body line (no indent in body text), so `value` is flagged (astParser.ts:1128)' }, () => {
     assert.ok(!refsOf(get(parsed, 'helper')).includes('value'));
     assert.ok(get(parsed, 'fetch').localVars?.includes('result'));
   });
 
-  it('ignores names inside # comments', { todo: 'BUG: stripStringsAndComments only knows JS comments, so `# cache.get()` yields an undefinedRef (astParser.ts:865-919)' }, async () => {
+  it('ignores names inside # comments', { todo: 'BUG #37: stripStringsAndComments only knows JS comments, so `# cache.get()` yields an undefinedRef (astParser.ts:865-919)' }, async () => {
     const p = await fx.parse('comment.py', 'def commented(n):\n    total = n\n    # remember to call cache.get() later\n    return total\n');
     assert.deepEqual(refsOf(get(p, 'commented')), []);
   });
 
-  it('still sees calls after floor division', { todo: 'BUG: `//` floor division is stripped as a JS line comment, hiding the rest of the line (astParser.ts:873-875)' }, async () => {
+  it('still sees calls after floor division', { todo: 'BUG #37: `//` floor division is stripped as a JS line comment, hiding the rest of the line (astParser.ts:873-875)' }, async () => {
     const p = await fx.parse('floor.py', 'def halve(n):\n    return n // 2 + missing_after_floor(n)\n');
     assert.deepEqual(refsOf(get(p, 'halve')), ['missing_after_floor']);
   });

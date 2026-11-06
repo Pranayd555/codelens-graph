@@ -79,7 +79,7 @@ describe('TextIndex', () => {
   });
 
   it('filters by the symbol and identifier token types too', {
-    todo: 'BUG: TextIndex.search only forwards comment/string_literal filters to searchFileLines; tokenType "symbol"/"identifier"/"unknown" is ignored',
+    todo: 'BUG #31: TextIndex.search only forwards comment/string_literal filters to searchFileLines; tokenType "symbol"/"identifier"/"unknown" is ignored',
   }, async () => {
     await index.buildForFile(fx.write('src/w.ts', SOURCE), 'typescript');
     assert.deepEqual(index.search('widget', { tokenType: 'symbol', limit: 50 }).map(r => r.line), [7, 8]);

@@ -13,5 +13,5 @@ Fixes #
 - [ ] The PR targets `dev`
 - [ ] Tests added or updated; `npm test` and `npx tsc --noEmit` pass
 - [ ] If this fixes a bug that had a `todo` test, its `todo` option is removed
-- [ ] `changelog.md` has a line under `## [Unreleased]` (skip for internal-only changes)
+- [ ] `changelog.md` has a line under `## [Unreleased]`, written as a user would notice the change (the Changelog check requires it when shipped code changes)
 - [ ] No new runtime dependencies (or discussed with a maintainer first)

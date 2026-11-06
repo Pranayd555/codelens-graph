@@ -61,7 +61,7 @@ describe('ContextBuilder token budget', () => {
     assert.equal(line.split(', ').length, 15);
   });
 
-  it('the rendered context stays within maxTokenBudget', { todo: 'BUG: trimToBudget (contextBuilder.ts:140-161) budgets only compact node JSON; snippets, warnings and file lists are not counted (deep mode: ~3.8k tokens for a 2k budget)' }, () => {
+  it('the rendered context stays within maxTokenBudget', { todo: 'BUG #21: trimToBudget (contextBuilder.ts:140-161) budgets only compact node JSON; snippets, warnings and file lists are not counted (deep mode: ~3.8k tokens for a 2k budget)' }, () => {
     for (const mode of ['short', 'deep'] as const) {
       const ctx = cb.build('process order totals', 2, 2000, mode);
       assert.ok(ctx.tokenEstimate <= 2000, `${mode}: ${ctx.tokenEstimate} tokens for a 2000 budget`);
@@ -98,7 +98,7 @@ describe('ContextBuilder file categories', () => {
   });
   after(() => { db?.close(); ws.close(); });
 
-  it('classifies files by their path inside the workspace, not its parent folders', { todo: 'BUG: contextBuilder.ts:205,289,412 classify absolute paths, so a parent folder of the root (lib/, api/, services/...) decides every file\'s category' }, () => {
+  it('classifies files by their path inside the workspace, not its parent folders', { todo: 'BUG #23: contextBuilder.ts:205,289,412 classify absolute paths, so a parent folder of the root (lib/, api/, services/...) decides every file\'s category' }, () => {
     const out = cb.buildSystemPromptInjection(cb.build('startServer', 0, 2000));
     const all = section(out, 'All workspace files')!;
     assert.match(all, /^\*\*Other:\*\* main\.ts, server\.ts$/m, all);

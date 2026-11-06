@@ -110,7 +110,7 @@ describe('explicit workspace argument', { timeout: 120000 }, () => {
   });
 
   it('keeps serving the given workspace when a VS Code window for another folder registers',
-    { todo: 'BUG: resolveActiveWorkspace (mcpServer.ts:166-194) consults the registry and cwd before the explicit start() path, so <workspace-path> is ignored' }, async () => {
+    { todo: 'BUG #26: resolveActiveWorkspace (mcpServer.ts:166-194) consults the registry and cwd before the explicit start() path, so <workspace-path> is ignored' }, async () => {
       writeRegistry(home, { 1: { path: t.path('other'), lastActive: Date.now() } });
       const { text } = await client.call('codelens_search', { query: 'projFn' });
       assert.match(text, /projFn @ src\/a\.ts:1/);

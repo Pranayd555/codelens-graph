@@ -80,7 +80,7 @@ describe('SnippetExtractor.extractSnippet', () => {
     assert.equal(extractor.extractSnippet(makeNode({ name: 'dir', filePath: ws.path('src') })), null);
   });
 
-  it('does not bleed a one-line symbol into the following code', { todo: 'BUG: snippetExtractor.ts:173 uses endLine > line, so a symbol with endLine === line gets 12 lines' }, () => {
+  it('does not bleed a one-line symbol into the following code', { todo: 'BUG #25: snippetExtractor.ts:173 uses endLine > line, so a symbol with endLine === line gets 12 lines' }, () => {
     const node = ws.node('first', 'src/oneLiners.ts');
     assert.equal(node.line, node.endLine, 'parser reports a one-line function');
     const snippet = extractor.extractSnippet(node)!;

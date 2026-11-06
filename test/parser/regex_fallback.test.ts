@@ -70,7 +70,7 @@ public:
     assert.deepEqual(namesOf(cc, 'class'), ['A']);
   });
 
-  it('does not turn an indented call statement into a method declaration', { todo: 'BUG: the indented-method regex matches call statements like `  render();` / `start()` (astParser.ts:1265)' }, async () => {
+  it('does not turn an indented call statement into a method declaration', { todo: 'BUG #44: the indented-method regex matches call statements like `  render();` / `start()` (astParser.ts:1265)' }, async () => {
     const p = await fx.parse('call.cpp', 'class W {\n  void draw() {\n    render();\n  }\n};\n');
     assert.equal(find(p, 'render'), undefined);
   });

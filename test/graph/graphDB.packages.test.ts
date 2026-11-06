@@ -41,7 +41,7 @@ describe('GraphDB dependency manifest', () => {
   });
 
   it('detects an unchanged manifest whatever the package-name casing and punctuation', {
-    todo: 'BUG: replacePackages compares SQLite\'s binary ORDER BY name with JS localeCompare order, so e.g. "JSONStream" + "axios" always reports a change and rewrites the DB',
+    todo: 'BUG #32: replacePackages compares SQLite\'s binary ORDER BY name with JS localeCompare order, so e.g. "JSONStream" + "axios" always reports a change and rewrites the DB',
   }, () => {
     const packages = [pkg('JSONStream'), pkg('axios'), pkg('a_b'), pkg('a.b')];
     assert.equal(db.replacePackages(packages), true);

@@ -228,7 +228,7 @@ describe('formatUsageReport', () => {
     assert.match(old, new RegExp(`task="${'z'.repeat(60)}" → 500 tokens`), 'input values are cut to 60 characters');
   });
 
-  it('per-tool token figures agree with the session\'s "Tokens used"', { todo: 'BUG: mcpLogger.ts:403-404 prices the tool breakdown from a static table (TOOL_TOKEN_COST), not the logged tokensEst' }, () => {
+  it('per-tool token figures agree with the session\'s "Tokens used"', { todo: 'BUG #28: mcpLogger.ts:403-404 prices the tool breakdown from a static table (TOOL_TOKEN_COST), not the logged tokensEst' }, () => {
     const old = sessionBlock(formatUsageReport(logs), 2);
     const total = Number(old.match(/Tokens used: ~(\d+)/)![1]);
     const perTool = [...old.matchAll(/^ {2}· \S+ ×\d+ \(~(\d+) tokens\)$/gm)].reduce((s, m) => s + Number(m[1]), 0);

@@ -193,7 +193,7 @@ describe('toggleFolder', () => {
   });
 
   it('on Windows, unchecking a selected folder spelled differently removes it',
-    { skip: !isWin, todo: 'BUG: indexScope.ts:90 compares `f !== target` case-sensitively, so ["Src"] unchecking "src" treats Src as an ancestor and selects its children instead of removing it' },
+    { skip: !isWin, todo: 'BUG #36: indexScope.ts:90 compares `f !== target` case-sensitively, so ["Src"] unchecking "src" treats Src as an ancestor and selects its children instead of removing it' },
     () => {
       // On Windows, listing "Src" or "src" reads the same directory.
       const winFs = (relDir: string) => (relDir.toLowerCase() === 'src' ? ['a', 'b'] : relDir === '' ? ['src'] : []);
