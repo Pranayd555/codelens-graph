@@ -950,6 +950,128 @@ export class GraphDB {
     return results;
   }
 
+  // ── Graph panel ───────────────────────────────────────────────────────────
+
+  // How many neighbours each hub brings into a capped graph view.
+  private static readonly GRAPH_VIEW_NEIGHBOURS = 20;
+
+  // What the graph panel draws: symbols outside node_modules (no import
+  // nodes) and the edges between them, one per pair and type. When there are more than `limit`, only
+  // the `limit` most connected symbols matching the panel's filter and search
+  // are returned, since a force layout can't draw a large repo's whole graph.
+  // `complete` says every symbol is included, so the panel can filter itself.
+  // A few bulk queries rather than one per node: this runs on the extension
+  // host's thread, and per-node queries took minutes on a 100k-symbol repo.
+  getGraphView(limit: number, filter = 'all', query = ''): { nodes: GraphNode[]; edges: GraphEdge[]; total: number; complete: boolean } {
+    this.refreshFromDiskIfChanged();
+    const fileKind = new Map<number, 'code' | 'config'>();
+    for (const { id, path: fp } of this.indexedFiles('all')) {
+      if (!isNodeModulePath(fp)) { fileKind.set(id, isConfigPath(fp) ? 'config' : 'code'); }
+    }
+
+    type Candidate = { nid: number; type: string; name: string; isConfig: boolean; hasIssues: boolean };
+    const candidates: Candidate[] = [];
+    const nodeStmt = this.db.prepare(
+      `SELECT nid, file_id, type, name, undefined_refs IS NOT NULL AND undefined_refs != '[]' FROM nodes WHERE type != 'import'`
+    );
+    while (nodeStmt.step()) {
+      const [nid, fileId, type, name, hasIssues] = nodeStmt.get() as [number, number, string, string, number];
+      const kind = fileKind.get(fileId);
+      if (kind) { candidates.push({ nid, type, name, isConfig: kind === 'config', hasIssues: !!hasIssues }); }
+    }
+    nodeStmt.free();
+
+    const complete = candidates.length <= limit;
+    let chosen = candidates;
+    if (!complete) {
+      // Same rules as the panel's own filter buttons and search box.
+      const q = query.trim().toLowerCase();
+      chosen = candidates.filter(c => {
+        if (filter === 'configs' ? !c.isConfig : c.isConfig) { return false; }
+        if (filter === 'issues' && !c.hasIssues) { return false; }
+        if (filter !== 'all' && filter !== 'configs' && filter !== 'issues' && c.type !== filter) { return false; }
+        return !q || c.name.toLowerCase().includes(q);
+      });
+    }
+    const total = chosen.length;
+
+    // Edges with their endpoints' nids. Calls, imports, inheritance etc. rank
+    // a symbol; "contains" only breaks ties, or every file and class would
+    // outrank the real hubs. (Before calls are linked it is all there is, and
+    // then the largest files and classes are shown.)
+    const edgeRows: Array<[number, number, string, number, string | null]> = [];
+    const links = new Map<number, number>();
+    const members = new Map<number, number>();
+    const edgeStmt = this.db.prepare('SELECT from_nid, to_nid, type, ref_id, metadata FROM edges');
+    while (edgeStmt.step()) {
+      const row = edgeStmt.get() as [number, number, string, number, string | null];
+      edgeRows.push(row);
+      if (complete) { continue; }
+      if (row[2] === 'contains') {
+        members.set(row[0], (members.get(row[0]) ?? 0) + 1);
+      } else {
+        links.set(row[0], (links.get(row[0]) ?? 0) + 1);
+        links.set(row[1], (links.get(row[1]) ?? 0) + 1);
+      }
+    }
+    edgeStmt.free();
+
+    if (!complete && chosen.length > limit) {
+      const count = (m: Map<number, number>, c: Candidate) => m.get(c.nid) ?? 0;
+      const ranked = [...chosen].sort((a, b) => count(links, b) - count(links, a) || count(members, b) - count(members, a)
+        || a.name.localeCompare(b.name) || a.nid - b.nid);
+      const rankOf = new Map(ranked.map((c, i) => [c.nid, i]));
+      // Take each hub with its own best-ranked neighbours, so the panel shows
+      // connected clusters rather than the top symbols scattered on their own.
+      const neighbours = new Map<number, number[]>();
+      for (const [from, to] of edgeRows) {
+        if (from === to || !rankOf.has(from) || !rankOf.has(to)) { continue; }
+        (neighbours.get(from) ?? neighbours.set(from, []).get(from)!).push(to);
+        (neighbours.get(to) ?? neighbours.set(to, []).get(to)!).push(from);
+      }
+      const picked = new Set<number>();
+      for (const hub of ranked) {
+        if (picked.size >= limit) { break; }
+        picked.add(hub.nid);
+        const near = [...new Set(neighbours.get(hub.nid) ?? [])]
+          .filter(nid => !picked.has(nid))
+          .sort((a, b) => rankOf.get(a)! - rankOf.get(b)!)
+          .slice(0, GraphDB.GRAPH_VIEW_NEIGHBOURS);
+        for (const nid of near) {
+          if (picked.size >= limit) { break; }
+          picked.add(nid);
+        }
+      }
+      chosen = ranked.filter(c => picked.has(c.nid));
+    }
+
+    const nodes = chosen.length
+      ? this.queryNodes(`${NODE_SELECT} WHERE n.nid IN (${chosen.map(c => Number(c.nid)).join(',')}) ORDER BY f.path, n.line, n.nid`)
+      : [];
+    const idByNid = new Map<number, string>();
+    for (const node of nodes) { idByNid.set(this.nids.get(node)!, node.id); }
+
+    // One edge per pair and type: a function calling another from ten places
+    // has ten "calls" edges (one per call site), but the panel draws one line.
+    const edges: GraphEdge[] = [];
+    const drawn = new Set<string>();
+    for (const [fromNid, toNid, type, refId, metadata] of edgeRows) {
+      const fromId = idByNid.get(fromNid);
+      const toId = idByNid.get(toNid);
+      if (fromId === undefined || toId === undefined) { continue; }
+      const pair = `${fromNid}>${toNid}:${type}`;
+      if (drawn.has(pair)) { continue; }
+      drawn.add(pair);
+      edges.push({
+        id: `${fromNid}>${toNid}:${type}:${refId}`,
+        fromId, toId,
+        type: type as EdgeType,
+        metadata: metadata ? JSON.parse(metadata) : undefined,
+      });
+    }
+    return { nodes, edges, total, complete };
+  }
+
   // ── BFS traversal ─────────────────────────────────────────────────────────
 
   bfsExpand(seedIds: string[], depth: number): { nodes: GraphNode[]; edges: GraphEdge[] } {

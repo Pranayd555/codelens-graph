@@ -20,8 +20,13 @@ export function toWebviewData(nodes: GraphNode[], edges: GraphEdge[]) {
   };
 }
 
+// total/complete come from GraphDB.getGraphView: when complete is false the
+// data holds only the most connected `nodes.length` of `total` symbols, and the
+// panel asks the extension again when its filter or search changes.
+export type GraphPanelData = ReturnType<typeof toWebviewData> & { total?: number; complete?: boolean };
+
 export function getGraphPanelHtml(
-  graphData: ReturnType<typeof toWebviewData>,
+  graphData: GraphPanelData,
   nonce: string,
   d3ScriptUri: string
 ): string {
@@ -511,8 +516,19 @@ function render() {
     drawHulls(nodes, classChildren);
   });
 
-  document.getElementById('stats-bar').textContent =
-    \`Showing \${nodes.length} of \${RAW.nodes.length} symbols · \${edges.length} edges\`;
+  document.getElementById('stats-bar').textContent = isPartial()
+    ? \`Showing the \${nodes.length.toLocaleString()} most connected of \${RAW.total.toLocaleString()} matching symbols · \${edges.length.toLocaleString()} edges · search or filter to see others\`
+    : \`Showing \${nodes.length} of \${RAW.nodes.length} symbols · \${edges.length} edges\`;
+}
+
+// The graph is too big to send whole: the extension picks the symbols, so
+// filter and search changes go back to it.
+function isPartial() { return RAW.complete === false; }
+let queryTimer = null;
+function requestView(delay) {
+  if (!isPartial()) { return; }
+  clearTimeout(queryTimer);
+  queryTimer = setTimeout(() => send('graphQuery', { filter: activeFilter, query: searchQuery }), delay);
 }
 
 // ── Class hull drawing ─────────────────────────────────────────────────────────
@@ -589,12 +605,14 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
     btn.classList.add('active');
     activeFilter = btn.dataset.type;
     render();
+    requestView(0);
   });
 });
 
 document.getElementById('search').addEventListener('input', ev => {
   searchQuery = ev.target.value.trim();
   render();
+  requestView(300);
 });
 
 window.addEventListener('resize', () => {
@@ -610,7 +628,7 @@ window.addEventListener('message', ev => {
 
   if (msg.command === 'updateGraph') {
     const hadData = RAW.nodes && RAW.nodes.length > 0;
-    RAW = { nodes: msg.nodes || [], edges: msg.edges || [] };
+    RAW = { nodes: msg.nodes || [], edges: msg.edges || [], total: msg.total, complete: msg.complete };
     if (!hadData) {
       // First load — full bootstrap with loading spinner
       bootstrap();
