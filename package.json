@@ -47,6 +47,7 @@
   "scripts": {
     "test": "node --require ts-node/register --test \"test/**/*.test.ts\"",
     "test:coverage": "node --require ts-node/register --enable-source-maps --experimental-test-coverage --test-coverage-exclude=\"test/**\" --test \"test/**/*.test.ts\"",
+    "release:prepare": "node scripts/prepare-release.js",
     "compile": "node esbuild.js",
     "compile:prod": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
