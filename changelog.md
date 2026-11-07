@@ -17,6 +17,7 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 - **Calls through an aliased import keep their link** when the imported file is edited (`import { helper as h }`). Previously the link was lost until a full rebuild.
 - **CodeLens no longer damages your files when updating its section**: front matter in `CLAUDE.md` and similar files is kept, a leftover CodeLens marker no longer causes the text after it to be deleted, and removing the CodeLens block from `.gitignore` no longer merges the lines around it.
 - `codelens_clear_config` no longer recreates `.codelens` and starts re-indexing right after clearing it.
+- **The graph panel no longer freezes VS Code on large repos.** It built its data with two queries per symbol and drew every symbol, which on a 100k-symbol monorepo blocked the extension host for minutes. It now loads in about a second, and above 1,000 symbols it shows the most connected ones with their neighbours. Search and the filter buttons still find any symbol in the index.
 
 ### Security
 - `codelens_dependencies` no longer reads type definition files outside the workspace, which a pre-built index could point it at.

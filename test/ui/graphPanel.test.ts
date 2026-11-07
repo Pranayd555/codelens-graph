@@ -133,6 +133,16 @@ describe('graphPanel.getGraphPanelHtml', () => {
     assert.deepEqual(embeddedData(getGraphPanelHtml({ nodes: [], edges: [] }, NONCE, D3_URI)), { nodes: [], edges: [] });
   });
 
+  it('embeds total/complete for a partial graph, and asks the extension when filters change', () => {
+    const partial = { ...sample, total: 120_000, complete: false };
+    const html = getGraphPanelHtml(partial, NONCE, D3_URI);
+    assert.deepEqual(embeddedData(html), partial);
+    const script = scriptTags(html).find(t => !t.src)!.body;
+    assert.match(script, /RAW\.complete === false/);
+    assert.match(script, /send\('graphQuery', \{ filter: activeFilter, query: searchQuery \}\)/);
+    assert.match(script, /total: msg\.total, complete: msg\.complete/, 'updates keep total/complete');
+  });
+
   it('escapes hostile names and paths so they cannot break out of the script block', () => {
     const hostile = [
       '</script><img src=x onerror=alert(1)>',
