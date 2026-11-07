@@ -29,7 +29,7 @@ jobs:
     # (release.yml) in this environment, so keep both names in sync with it.
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: actions/setup-node@v4
