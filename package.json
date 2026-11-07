@@ -267,7 +267,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "d3": "^7.9.0",
+    "d3": "^7.9.2",
     "sql.js": "^1.15.2",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6",
