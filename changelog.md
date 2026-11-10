@@ -7,6 +7,7 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 ## [Unreleased]
 
 ### Fixed
+- **Regex searches with bounded repeats like `\d{1,3}` work instead of falling back to plain-text search (#34)**.
 - **CommonJS `require()` is understood as an import** (#8, thanks @Sebxxs004 in #9). `const { dbAll } = require('./db')`, `const db = require('./db')` and renamed forms like `const { dbAll: myDb } = require('./db')` no longer cause false "undefined" warnings on the functions that use them, calls link to the required file even when another file has a function with the same name, and CommonJS files now show which files they import. Nodes named after the pattern (`{ dbAll, dbGet }`) are gone.
 - **Calls into npm packages and Node built-ins** are no longer linked to an unrelated workspace symbol that happens to share the name (e.g. `path.normalize()` or `fast-deep-equal`'s `equal()`). Packages count as external when installed in `node_modules` or declared in `package.json`; workspace packages (symlinked or `workspace:`/`file:`/`link:`) and path aliases such as `@/utils` still link into the workspace.
 - **Import hints match the project's module system**: CommonJS files get `const { x } = require(…)` instead of an ES-module `import`. "Import as" paths are now relative to the workspace root (they were relative to the symbol's own folder), and `codelens_node` no longer suggests a JavaScript import for Java, Go, C# and other languages.
