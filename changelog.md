@@ -6,6 +6,10 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] - 2026-11-07
+
 ### Fixed
 - **Regex searches with bounded repeats like `\d{1,3}` work instead of falling back to plain-text search (#34)**.
 - **CommonJS `require()` is understood as an import** (#8, thanks @Sebxxs004 in #9). `const { dbAll } = require('./db')`, `const db = require('./db')` and renamed forms like `const { dbAll: myDb } = require('./db')` no longer cause false "undefined" warnings on the functions that use them, calls link to the required file even when another file has a function with the same name, and CommonJS files now show which files they import. Nodes named after the pattern (`{ dbAll, dbGet }`) are gone.
