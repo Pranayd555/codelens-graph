@@ -2,7 +2,7 @@
   "name": "codelens-graph",
   "displayName": "CodeLens Graph",
   "description": "Builds a live knowledge graph of your codebase so AI agents understand everything before acting.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "PranayDas",
   "repository": {
     "type": "git",
@@ -45,7 +45,9 @@
   },
   "main": "./dist/extension.js",
   "scripts": {
-    "test": "npx ts-node test/cjs_require.test.ts",
+    "test": "node --require ts-node/register --test \"test/**/*.test.ts\"",
+    "test:coverage": "node --require ts-node/register --enable-source-maps --experimental-test-coverage --test-coverage-exclude=\"test/**\" --test \"test/**/*.test.ts\"",
+    "release:prepare": "node scripts/prepare-release.js",
     "compile": "node esbuild.js",
     "compile:prod": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
@@ -264,19 +266,18 @@
     }
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "d3": "^7.9.0",
-    "sql.js": "^1.11.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "d3": "^7.9.2",
+    "sql.js": "^1.15.2",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/sql.js": "^1.4.9",
     "@types/vscode": "^1.95.0",
-    "chokidar": "^3.6.0",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.0"
   },

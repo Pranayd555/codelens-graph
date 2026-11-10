@@ -164,6 +164,28 @@ interface ResolveCache {
   nodesByName:  Map<string, GraphNode[]>;
   nodesByFile:  Map<string, GraphNode[]>;
   wordPatterns: Map<string, RegExp>;
+  externalModules?: Map<string, boolean>;
+  declaredPackages?: Map<string, string>;   // package name → declared range
+}
+
+const NODE_BUILTINS = new Set<string>(require('module').builtinModules);
+const JS_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+
+// 'pkg', 'pkg/sub', '@scope/pkg' or '@scope/pkg/sub' → the package name;
+// null for relative or absolute specifiers.
+function packageNameOf(source: string): string | null {
+  if (!source || source.startsWith('.') || source.startsWith('/') || path.isAbsolute(source)) { return null; }
+  const parts = source.split('/');
+  if (source.startsWith('@')) {
+    return parts.length >= 2 && parts[0].length > 1 && parts[1] ? `${parts[0]}/${parts[1]}` : null;
+  }
+  return parts[0] || null;
+}
+
+// Import text without its string literals, so `require('lodash/merge')` does
+// not count as binding a local `merge`.
+function withoutStringLiterals(text: string): string {
+  return text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '');
 }
 
 // A stored call reference, with the integer keys the resolver works with.
@@ -359,6 +381,15 @@ export class GraphDB {
 
   needsRelationshipResolve(): boolean {
     return this.fullResolvePending || this.writesSinceResolve;
+  }
+
+  getMetaValue(key: string): string | null {
+    const value = this.db.exec('SELECT value FROM meta WHERE key = ?', [key])[0]?.values[0]?.[0];
+    return value === undefined || value === null ? null : String(value);
+  }
+
+  setMetaValue(key: string, value: string): void {
+    this.db.run('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', [key, value]);
   }
 
   persist(): void {
@@ -919,6 +950,128 @@ export class GraphDB {
     return results;
   }
 
+  // ── Graph panel ───────────────────────────────────────────────────────────
+
+  // How many neighbours each hub brings into a capped graph view.
+  private static readonly GRAPH_VIEW_NEIGHBOURS = 20;
+
+  // What the graph panel draws: symbols outside node_modules (no import
+  // nodes) and the edges between them, one per pair and type. When there are more than `limit`, only
+  // the `limit` most connected symbols matching the panel's filter and search
+  // are returned, since a force layout can't draw a large repo's whole graph.
+  // `complete` says every symbol is included, so the panel can filter itself.
+  // A few bulk queries rather than one per node: this runs on the extension
+  // host's thread, and per-node queries took minutes on a 100k-symbol repo.
+  getGraphView(limit: number, filter = 'all', query = ''): { nodes: GraphNode[]; edges: GraphEdge[]; total: number; complete: boolean } {
+    this.refreshFromDiskIfChanged();
+    const fileKind = new Map<number, 'code' | 'config'>();
+    for (const { id, path: fp } of this.indexedFiles('all')) {
+      if (!isNodeModulePath(fp)) { fileKind.set(id, isConfigPath(fp) ? 'config' : 'code'); }
+    }
+
+    type Candidate = { nid: number; type: string; name: string; isConfig: boolean; hasIssues: boolean };
+    const candidates: Candidate[] = [];
+    const nodeStmt = this.db.prepare(
+      `SELECT nid, file_id, type, name, undefined_refs IS NOT NULL AND undefined_refs != '[]' FROM nodes WHERE type != 'import'`
+    );
+    while (nodeStmt.step()) {
+      const [nid, fileId, type, name, hasIssues] = nodeStmt.get() as [number, number, string, string, number];
+      const kind = fileKind.get(fileId);
+      if (kind) { candidates.push({ nid, type, name, isConfig: kind === 'config', hasIssues: !!hasIssues }); }
+    }
+    nodeStmt.free();
+
+    const complete = candidates.length <= limit;
+    let chosen = candidates;
+    if (!complete) {
+      // Same rules as the panel's own filter buttons and search box.
+      const q = query.trim().toLowerCase();
+      chosen = candidates.filter(c => {
+        if (filter === 'configs' ? !c.isConfig : c.isConfig) { return false; }
+        if (filter === 'issues' && !c.hasIssues) { return false; }
+        if (filter !== 'all' && filter !== 'configs' && filter !== 'issues' && c.type !== filter) { return false; }
+        return !q || c.name.toLowerCase().includes(q);
+      });
+    }
+    const total = chosen.length;
+
+    // Edges with their endpoints' nids. Calls, imports, inheritance etc. rank
+    // a symbol; "contains" only breaks ties, or every file and class would
+    // outrank the real hubs. (Before calls are linked it is all there is, and
+    // then the largest files and classes are shown.)
+    const edgeRows: Array<[number, number, string, number, string | null]> = [];
+    const links = new Map<number, number>();
+    const members = new Map<number, number>();
+    const edgeStmt = this.db.prepare('SELECT from_nid, to_nid, type, ref_id, metadata FROM edges');
+    while (edgeStmt.step()) {
+      const row = edgeStmt.get() as [number, number, string, number, string | null];
+      edgeRows.push(row);
+      if (complete) { continue; }
+      if (row[2] === 'contains') {
+        members.set(row[0], (members.get(row[0]) ?? 0) + 1);
+      } else {
+        links.set(row[0], (links.get(row[0]) ?? 0) + 1);
+        links.set(row[1], (links.get(row[1]) ?? 0) + 1);
+      }
+    }
+    edgeStmt.free();
+
+    if (!complete && chosen.length > limit) {
+      const count = (m: Map<number, number>, c: Candidate) => m.get(c.nid) ?? 0;
+      const ranked = [...chosen].sort((a, b) => count(links, b) - count(links, a) || count(members, b) - count(members, a)
+        || a.name.localeCompare(b.name) || a.nid - b.nid);
+      const rankOf = new Map(ranked.map((c, i) => [c.nid, i]));
+      // Take each hub with its own best-ranked neighbours, so the panel shows
+      // connected clusters rather than the top symbols scattered on their own.
+      const neighbours = new Map<number, number[]>();
+      for (const [from, to] of edgeRows) {
+        if (from === to || !rankOf.has(from) || !rankOf.has(to)) { continue; }
+        (neighbours.get(from) ?? neighbours.set(from, []).get(from)!).push(to);
+        (neighbours.get(to) ?? neighbours.set(to, []).get(to)!).push(from);
+      }
+      const picked = new Set<number>();
+      for (const hub of ranked) {
+        if (picked.size >= limit) { break; }
+        picked.add(hub.nid);
+        const near = [...new Set(neighbours.get(hub.nid) ?? [])]
+          .filter(nid => !picked.has(nid))
+          .sort((a, b) => rankOf.get(a)! - rankOf.get(b)!)
+          .slice(0, GraphDB.GRAPH_VIEW_NEIGHBOURS);
+        for (const nid of near) {
+          if (picked.size >= limit) { break; }
+          picked.add(nid);
+        }
+      }
+      chosen = ranked.filter(c => picked.has(c.nid));
+    }
+
+    const nodes = chosen.length
+      ? this.queryNodes(`${NODE_SELECT} WHERE n.nid IN (${chosen.map(c => Number(c.nid)).join(',')}) ORDER BY f.path, n.line, n.nid`)
+      : [];
+    const idByNid = new Map<number, string>();
+    for (const node of nodes) { idByNid.set(this.nids.get(node)!, node.id); }
+
+    // One edge per pair and type: a function calling another from ten places
+    // has ten "calls" edges (one per call site), but the panel draws one line.
+    const edges: GraphEdge[] = [];
+    const drawn = new Set<string>();
+    for (const [fromNid, toNid, type, refId, metadata] of edgeRows) {
+      const fromId = idByNid.get(fromNid);
+      const toId = idByNid.get(toNid);
+      if (fromId === undefined || toId === undefined) { continue; }
+      const pair = `${fromNid}>${toNid}:${type}`;
+      if (drawn.has(pair)) { continue; }
+      drawn.add(pair);
+      edges.push({
+        id: `${fromNid}>${toNid}:${type}:${refId}`,
+        fromId, toId,
+        type: type as EdgeType,
+        metadata: metadata ? JSON.parse(metadata) : undefined,
+      });
+    }
+    return { nodes, edges, total, complete };
+  }
+
   // ── BFS traversal ─────────────────────────────────────────────────────────
 
   bfsExpand(seedIds: string[], depth: number): { nodes: GraphNode[]; edges: GraphEdge[] } {
@@ -1133,7 +1286,7 @@ export class GraphDB {
 
       await this.resolveImportEdges(filesByPath, importsByFile, changedFiles, cache, insertEdge, deleteImporterEdges, maybeYield);
 
-      for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols)) {
+      for (const ref of this.getAffectedCallRefs(changedFiles, changedSymbols, importsByFile)) {
         await maybeYield();
         if (!fullResolve) { deleteCallEdges.run([ref.rid]); }
         const target = this.resolveCallTarget(ref, importsByFile, cache);
@@ -1171,13 +1324,42 @@ export class GraphDB {
     return importsByFile;
   }
 
-  private getAffectedCallRefs(changedFiles: string[] | null, changedSymbols: string[]): CallRefRow[] {
+  // Local names that files bind by importing one of the changed files. A call
+  // through such a name (`h()` for `import { helper as h }`, or a default import
+  // under another name) carries no changed file or symbol, but its target just
+  // lost its edges, so it has to be resolved again.
+  private namesBoundFromChangedFiles(
+    changedFiles: string[], importsByFile: Map<string, GraphNode[]>
+  ): Map<string, Set<string>> {
+    const changedBases = new Set<string>();
+    for (const filePath of changedFiles) {
+      for (const base of importBasesFor(filePath)) { changedBases.add(pathKey(base)); }
+    }
+    const bound = new Map<string, Set<string>>();
+    for (const [importerPath, importNodes] of importsByFile) {
+      for (const node of importNodes) {
+        const base = importBase(importerPath, node.name);
+        if (base === null || !changedBases.has(pathKey(base))) { continue; }
+        const names = withoutStringLiterals(node.signature ?? '').match(/[A-Za-z_$][w$]*/g) ?? [];
+        const set = bound.get(importerPath) ?? new Set<string>();
+        for (const name of names) { set.add(name); }
+        bound.set(importerPath, set);
+      }
+    }
+    return bound;
+  }
+
+  private getAffectedCallRefs(
+    changedFiles: string[] | null, changedSymbols: string[], importsByFile: Map<string, GraphNode[]>
+  ): CallRefRow[] {
     let sql = `SELECT r.rid, r.from_nid, r.symbol_name, r.qualifier, f.id, f.path
                FROM call_refs r JOIN files f ON f.id = r.file_id`;
     let params: unknown[] = [];
+    const boundNames = changedFiles ? this.namesBoundFromChangedFiles(changedFiles, importsByFile) : new Map<string, Set<string>>();
     if (changedFiles !== null) {
       const fileParams = [...new Set(changedFiles.map(f => this.toStoredPath(f)))];
-      const symbolParams = [...new Set(changedSymbols)];
+      const allBoundNames = [...boundNames.values()].flatMap(names => [...names]);
+      const symbolParams = [...new Set([...changedSymbols, ...allBoundNames])];
       if (!fileParams.length && !symbolParams.length) { return []; }
       // SQLite caps bound parameters; very large batches fall back to a filtered scan.
       if (fileParams.length + symbolParams.length <= 900) {
@@ -1202,7 +1384,8 @@ export class GraphDB {
         qualifier: qualifier ?? undefined,
         filePath: this.absPathOf(fileId, stored),
       };
-      if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)) { continue; }
+      if (fileSet && !fileSet.has(ref.filePath) && !symbolSet.has(ref.symbolName)
+          && !boundNames.get(ref.filePath)?.has(ref.symbolName)) { continue; }
       refs.push(ref);
     }
     stmt.free();
@@ -1217,6 +1400,7 @@ export class GraphDB {
     const importNodes = importsByFile.get(ref.filePath) ?? [];
     const importedFiles = new Set<string>();
     const candidateNames = new Set<string>([ref.symbolName]);
+    let boundToExternal = false;
     for (const importNode of importNodes) {
       const signature = importNode.signature ?? '';
       const mentionsTarget = this.wordPattern(ref.symbolName, cache).test(signature)
@@ -1227,8 +1411,20 @@ export class GraphDB {
       if (aliasMatch) { candidateNames.add(aliasMatch[1]); }
 
       const resolved = this.resolveImportPath(ref.filePath, importNode.name, cache);
-      if (resolved) { importedFiles.add(path.normalize(resolved)); }
+      if (resolved) {
+        importedFiles.add(path.normalize(resolved));
+      } else if (JS_LANGUAGES.has(importNode.language) && this.isExternalModule(ref.filePath, importNode.name, cache)) {
+        const binding = withoutStringLiterals(signature);
+        if (this.wordPattern(ref.symbolName, cache).test(binding)
+            || (!!ref.qualifier && this.wordPattern(ref.qualifier, cache).test(binding))) {
+          boundToExternal = true;
+        }
+      }
     }
+
+    // Bound only to an npm package or Node built-in: the target is outside the
+    // workspace, so don't fall back to a same-named symbol somewhere else.
+    if (boundToExternal && !importedFiles.size) { return null; }
 
     const candidatesById = new Map<string, GraphNode>();
     for (const name of candidateNames) {
@@ -1353,10 +1549,74 @@ export class GraphDB {
         ...IMPORT_EXTENSIONS.map(ext => path.join(base, `index${ext}`)),
         path.join(base, '__init__.py'),
       ];
-      resolved = candidates.find(candidate => fs.existsSync(candidate)) ?? null;
+      // statSync, not existsSync: a folder named like the import isn't a target,
+      // its index file (or a same-named file next to it) is.
+      resolved = candidates.find(candidate => fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) ?? null;
     }
     cache.importPaths.set(key, resolved);
     return resolved;
+  }
+
+  // A bare specifier is external when it is a Node built-in, a package installed
+  // in a node_modules folder between the importer and the workspace root, or a
+  // package declared in a workspace package.json. Workspace packages (symlinked
+  // into node_modules, or declared as workspace:/file:/link:) and unresolved
+  // aliases such as '@/utils' are not, so they keep name-based resolution.
+  private isExternalModule(importerPath: string, source: string, cache: ResolveCache): boolean {
+    if (source.startsWith('node:')) { return true; }
+    const name = packageNameOf(source);
+    if (!name) { return false; }
+    if (NODE_BUILTINS.has(name)) { return true; }
+
+    const external = cache.externalModules ?? (cache.externalModules = new Map());
+    const key = path.dirname(importerPath) + '\0' + name;
+    const cached = external.get(key);
+    if (cached !== undefined) { return cached; }
+
+    let result = false;
+    const installDir = this.findInstalledPackage(name, path.dirname(importerPath));
+    if (installDir) {
+      result = !this.isWorkspacePackageDir(installDir);
+    } else {
+      if (!cache.declaredPackages) {
+        // Read directly: getPackages() may reload the DB from disk mid-resolve.
+        const rows = this.db.exec('SELECT name, declared_range FROM packages')[0]?.values ?? [];
+        cache.declaredPackages = new Map(rows.map(r => [String(r[0]), String(r[1] ?? '')]));
+      }
+      const range = cache.declaredPackages.get(name);
+      result = range !== undefined && !/^(workspace|file|link):/.test(range);
+    }
+    external.set(key, result);
+    return result;
+  }
+
+  // Node-style lookup: <dir>/node_modules/<name>, walking up to the workspace root.
+  private findInstalledPackage(name: string, fromDir: string): string | null {
+    const root = this.root;
+    let dir = fromDir;
+    for (;;) {
+      const candidate = path.join(dir, 'node_modules', ...name.split('/'));
+      if (fs.existsSync(candidate)) { return candidate; }
+      const parent = path.dirname(dir);
+      if (parent === dir || (root && path.relative(root, dir) === '')) { return null; }
+      if (root && path.relative(root, parent).startsWith('..')) { return null; }
+      dir = parent;
+    }
+  }
+
+  // A monorepo package symlinked into node_modules resolves into the workspace.
+  // Both sides are compared as real paths: the workspace itself may be reached
+  // through a symlink (e.g. /var → /private/var on macOS, or a linked folder).
+  private isWorkspacePackageDir(installDir: string): boolean {
+    const root = this.root;
+    if (!root) { return false; }
+    try {
+      const real = fs.realpathSync(installDir);
+      const rel = path.relative(fs.realpathSync(root), real);
+      return !rel.startsWith('..') && !path.isAbsolute(rel) && !rel.split(path.sep).includes('node_modules');
+    } catch {
+      return false;
+    }
   }
 
   private getNodesByExactNameCached(name: string, cache: ResolveCache): GraphNode[] {

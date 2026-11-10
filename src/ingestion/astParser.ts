@@ -4,6 +4,13 @@ import * as crypto from 'crypto';
 import { GraphNode, GraphEdge, ParsedFile, Param, NodeType, CallReference } from '../types';
 import { isConfigPath, isNodeModulePath } from '../utils';
 
+// Bump whenever parsing changes what is stored for unchanged files (new node or
+// edge kinds, scope rules, ...). Indexes built with another version re-parse
+// every file once on the next scan, so existing users get the fix without a
+// manual rebuild. 2: CommonJS require() imports (#9). 3: arrow-function symbols,
+// JS default/rest/destructured params, no JSX intrinsics in undefinedRefs.
+export const PARSER_VERSION = '3';
+
 // ─── Language → WASM mapping ──────────────────────────────────────────────────
 
 const EXTENSION_MAP: Record<string, { language: string; wasm: string }> = {
@@ -205,6 +212,11 @@ LANG_QUERIES['tsx'] = LANG_QUERIES['typescript'];
 
 // ─── TreeSitterParser ─────────────────────────────────────────────────────────
 
+// web-tree-sitter replaces its module exports during init, so it can only be
+// initialised once per process. Every parser shares that one initialisation; a
+// second init would fail and silently leave its parser on the regex fallback.
+let treeSitterRuntime: Promise<any> | null = null;
+
 export class TreeSitterParser {
   // Lazily initialised — we only load WASM when we first need it
   private Parser: typeof import('web-tree-sitter') | null = null;
@@ -227,26 +239,32 @@ export class TreeSitterParser {
   async init(): Promise<void> {
     if (this.initialised) { return; }
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const Parser = require('web-tree-sitter');
-      // Resolve tree-sitter.wasm — in dist/wasm/ when bundled, otherwise node_modules
-      const treeSitterWasm = require('path').join(this.wasmDir, 'tree-sitter.wasm');
-      let wasmPath = treeSitterWasm;
-      if (!require('fs').existsSync(wasmPath)) {
-        try {
-          wasmPath = require('path').join(
-            require('path').dirname(require.resolve('web-tree-sitter')), 'tree-sitter.wasm'
-          );
-        } catch (resolveErr) {
-          console.warn('[CodeLens] Failed to resolve fallback tree-sitter path:', resolveErr);
-        }
-      }
-      await Parser.init({ locateFile: () => wasmPath });
-      this.Parser = Parser;
+      treeSitterRuntime ??= this.loadRuntime();
+      this.Parser = await treeSitterRuntime;
       this.initialised = true;
     } catch (e) {
+      treeSitterRuntime = null;
       console.warn('[CodeLens] tree-sitter init failed, falling back to regex:', e);
     }
+  }
+
+  private async loadRuntime(): Promise<any> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Parser = require('web-tree-sitter');
+    // Resolve tree-sitter.wasm — in dist/wasm/ when bundled, otherwise node_modules
+    const treeSitterWasm = require('path').join(this.wasmDir, 'tree-sitter.wasm');
+    let wasmPath = treeSitterWasm;
+    if (!require('fs').existsSync(wasmPath)) {
+      try {
+        wasmPath = require('path').join(
+          require('path').dirname(require.resolve('web-tree-sitter')), 'tree-sitter.wasm'
+        );
+      } catch (resolveErr) {
+        console.warn('[CodeLens] Failed to resolve fallback tree-sitter path:', resolveErr);
+      }
+    }
+    await Parser.init({ locateFile: () => wasmPath });
+    return Parser;
   }
 
   isReady(): boolean { return this.initialised && this.Parser !== null; }
@@ -390,7 +408,7 @@ export class TreeSitterParser {
     this.walkTree(tree.rootNode, (tsNode: any) => {
       const ourType = query.nodeTypes[tsNode.type];
       if (!ourType) { return; }
-      if (ourType === 'variable' && this.isCommonJsRequire(tsNode)) { return; }
+      if (ourType === 'variable' && (this.isCommonJsRequire(tsNode) || this.declaresBoundFunction(tsNode))) { return; }
       const name = this.getNodeName(tsNode, query.nameField, content);
       if (!name || name === '__file__') { return; }
       if (KEYWORDS.has(name.toLowerCase())) { return; }
@@ -400,10 +418,11 @@ export class TreeSitterParser {
     });
 
     // ── Walk all declaration nodes ─────────────────────────────────────────
+    const functionNodes = new Map<number, GraphNode>();
     this.walkTree(tree.rootNode, (tsNode: any) => {
       const ourType = query.nodeTypes[tsNode.type];
       if (!ourType) { return; }
-      if (ourType === 'variable' && this.isCommonJsRequire(tsNode)) { return; }
+      if (ourType === 'variable' && (this.isCommonJsRequire(tsNode) || this.declaresBoundFunction(tsNode))) { return; }
 
       // Get name
       const name = this.getNodeName(tsNode, query.nameField, content);
@@ -413,13 +432,22 @@ export class TreeSitterParser {
       if (ourType === 'variable' && isInsideFunctionOrMethod(tsNode)) { return; }
       if (isNodeModulePath(filePath) && ['function', 'method', 'variable', 'import'].includes(ourType)) { return; }
 
-      const line    = tsNode.startPosition.row + 1;
-      const endLine = tsNode.endPosition.row + 1;
+      // `const f = () => {}` is located and described by its whole declaration.
+      const bound    = this.boundFunction(tsNode);
+      const declNode = bound?.declaration ?? tsNode;
+      const nodeType = bound?.isClassField ? 'method' : ourType;
+      const line     = declNode.startPosition.row + 1;
+      const endLine  = declNode.endPosition.row + 1;
 
       // Get params
-      const params = query.paramsField
+      let params = query.paramsField
         ? this.extractParams(tsNode.childForFieldName?.(query.paramsField), content)
         : undefined;
+      // `x => x + 1` has a single `parameter` instead of a parameter list.
+      if (!params && tsNode.type === 'arrow_function') {
+        const single = tsNode.childForFieldName?.('parameter');
+        if (single?.type === 'identifier') { params = [{ name: single.text.trim(), rest: false }]; }
+      }
 
       // Get return type
       const returnType = query.returnField
@@ -427,10 +455,12 @@ export class TreeSitterParser {
         : undefined;
 
       // Get modifiers (export, async, public, etc.)
-      const modifiers = this.extractModifiers(tsNode, content);
+      const modifiers = bound
+        ? [...new Set([...this.extractModifiers(declNode, content), ...this.extractModifiers(tsNode, content)])]
+        : this.extractModifiers(tsNode, content);
 
       // Get docstring from preceding comment
-      const docComment = this.extractDocComment(tsNode, lines);
+      const docComment = this.extractDocComment(declNode, lines);
 
       // Scope analysis on function/method bodies
       let undefinedRefs: string[] | undefined;
@@ -458,9 +488,9 @@ export class TreeSitterParser {
 
       const nodeId = makeNodeId(filePath, name, line);
       const graphNode: GraphNode = {
-        id: nodeId, type: ourType, name, filePath,
+        id: nodeId, type: nodeType, name, filePath,
         line, endLine, language,
-        signature:   content.slice(tsNode.startIndex, tsNode.startIndex + 200).split('\n')[0].trim(),
+        signature:   content.slice(declNode.startIndex, declNode.startIndex + 200).split('\n')[0].trim(),
         returnType,
         params,
         modifiers,
@@ -473,6 +503,7 @@ export class TreeSitterParser {
       };
 
       nodes.push(graphNode);
+      if (nodeType === 'function' || nodeType === 'method') { functionNodes.set(tsNode.id, graphNode); }
       edges.push({
         id: makeEdgeId(fileNode.id, 'contains', nodeId),
         fromId: fileNode.id, toId: nodeId, type: 'contains',
@@ -511,7 +542,7 @@ export class TreeSitterParser {
       const calleeName = this.getCallName(tsNode, query.callNamePath, content);
       if (!calleeName) { return; }
 
-      const enclosing = this.findEnclosingFunction(tsNode, nodes);
+      const enclosing = this.findEnclosingFunction(tsNode, functionNodes);
       if (!enclosing) { return; }
 
       const callTarget = tsNode.childForFieldName?.(query.callNamePath[0]);
@@ -545,7 +576,45 @@ export class TreeSitterParser {
 
   // ── Name extraction ───────────────────────────────────────────────────────
 
+  // An anonymous function that takes its name from what it is bound to: a
+  // non-nested `const f = () => {}` or a class field `f = () => {}`. Functions
+  // nested in other functions stay part of their parent, like local variables.
+  private boundFunction(node: any): { name: string; declaration: any; isClassField: boolean } | null {
+    if (node.type !== 'arrow_function' && node.type !== 'function_expression') { return null; }
+    if (node.childForFieldName?.('name') || isInsideFunctionOrMethod(node)) { return null; }
+    const parent = node.parent;
+    if (parent?.childForFieldName?.('value')?.id !== node.id) { return null; }
+    if (parent.type === 'variable_declarator') {
+      const id = parent.childForFieldName('name');
+      return id?.type === 'identifier'
+        ? { name: id.text.trim(), declaration: parent.parent ?? parent, isClassField: false }
+        : null;
+    }
+    if (parent.type === 'public_field_definition' || parent.type === 'field_definition') {
+      const key = parent.childForFieldName('name') ?? parent.childForFieldName('property');
+      return key?.type === 'property_identifier' || key?.type === 'private_property_identifier'
+        ? { name: key.text.trim(), declaration: parent, isClassField: true }
+        : null;
+    }
+    return null;
+  }
+
+  // Whether the variable node a declaration would produce is really a function.
+  private declaresBoundFunction(node: any): boolean {
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child.type === 'variable_declarator') {
+        const value = child.childForFieldName?.('value');
+        return !!value && this.boundFunction(value) !== null;
+      }
+    }
+    return false;
+  }
+
   private getNodeName(node: any, field: string, _content: string): string | null {
+    const bound = this.boundFunction(node);
+    if (bound) { return bound.name; }
+
     // Try field name first
     const named = node.childForFieldName?.(field);
     if (named) { return named.text.trim(); }
@@ -583,12 +652,14 @@ export class TreeSitterParser {
     return null;
   }
 
-  private findEnclosingFunction(node: any, nodes: GraphNode[]): GraphNode | null {
-    const line = node.startPosition.row + 1;
-    // Find the innermost function/method that contains this line
-    return nodes
-      .filter(n => (n.type === 'function' || n.type === 'method') && n.line <= line && n.endLine >= line)
-      .sort((a, b) => b.line - a.line)[0] ?? null;
+  // The innermost symbol whose function contains this node. Walks the syntax
+  // tree, because line numbers can't separate functions sharing their lines.
+  private findEnclosingFunction(node: any, functionNodes: Map<number, GraphNode>): GraphNode | null {
+    for (let curr = node.parent; curr; curr = curr.parent) {
+      const found = functionNodes.get(curr.id);
+      if (found) { return found; }
+    }
+    return null;
   }
 
   // ── Import name extraction ────────────────────────────────────────────────
@@ -704,7 +775,9 @@ export class TreeSitterParser {
       case 'identifier':
       case 'shorthand_property_identifier_pattern': {
         const text = p.text?.trim();
-        if (text && /^[A-Za-z_$][\w$]*$/.test(text) && !KEYWORDS.has(text.toLowerCase())) {
+        // No KEYWORDS check: it lists words from other languages too (type, use,
+        // not...), which are ordinary names here, and JS reserved words can't be bindings.
+        if (text && /^[A-Za-z_$][\w$]*$/.test(text)) {
           out.push(text);
         }
         return;
@@ -789,22 +862,19 @@ export class TreeSitterParser {
     for (let i = 0; i < paramsNode.childCount; i++) {
       const child = paramsNode.child(i);
       if (['identifier', 'required_parameter', 'optional_parameter',
-           'rest_parameter', 'default_parameter', 'typed_parameter'].includes(child.type)) {
-        const nameNode = child.childForFieldName?.('pattern') ?? child.childForFieldName?.('name') ?? child;
+           'rest_parameter', 'default_parameter', 'typed_parameter',
+           'assignment_pattern', 'rest_pattern', 'object_pattern', 'array_pattern'].includes(child.type)) {
+        // JavaScript's `p = 1` is an assignment_pattern; TypeScript's is a
+        // required_parameter with a `value`.
+        const nameNode = child.childForFieldName?.('pattern') ?? child.childForFieldName?.('name')
+          ?? child.childForFieldName?.('left') ?? child;
         const typeNode = child.childForFieldName?.('type');
-        const defNode  = child.childForFieldName?.('value');
-        
+        const defNode  = child.childForFieldName?.('value') ?? child.childForFieldName?.('right');
+
         if (nameNode.type === 'object_pattern' || nameNode.type === 'array_pattern') {
-          this.walkTree(nameNode, (n: any) => {
-            if (n.type === 'identifier' || n.type === 'shorthand_property_identifier_pattern' || n.type === 'shorthand_property_identifier') {
-              if (this.isDeclarationIdentifier(n)) {
-                params.push({
-                  name: n.text.trim(),
-                  rest: false
-                });
-              }
-            }
-          });
+          const names: string[] = [];
+          this.collectBindingNames(nameNode, names);
+          for (const name of new Set(names)) { params.push({ name, rest: false }); }
         } else {
           const name     = nameNode.text.replace(/^\.\.\./, '').trim();
           if (name && /^\w+$/.test(name)) {
@@ -1158,6 +1228,22 @@ export class TreeSitterParser {
       'decodeURIComponent','encodeURIComponent','decodeURI','encodeURI',
       'URL','URLSearchParams','fetch','Request','Response','Headers','parseInt',
       'parseFloat','isNaN','isFinite','structuredClone','AbortController','AbortSignal',
+      // Language globals
+      'globalThis','BigInt','Function','Proxy','Reflect','Intl','Iterator','WeakRef','escape','unescape',
+      'TypeError','RangeError','SyntaxError','ReferenceError','EvalError','URIError','AggregateError',
+      'ArrayBuffer','SharedArrayBuffer','DataView','Atomics','WebAssembly',
+      'Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array','Int32Array','Uint32Array',
+      'Float32Array','Float64Array','BigInt64Array','BigUint64Array',
+      // Node.js and web platform globals
+      'setImmediate','clearImmediate','queueMicrotask','performance','navigator','location','history',
+      'TextEncoder','TextDecoder','atob','btoa','Blob','File','FormData','FileReader',
+      'ReadableStream','WritableStream','TransformStream','CompressionStream','DecompressionStream',
+      'Event','CustomEvent','EventTarget','addEventListener','removeEventListener','dispatchEvent',
+      'WebSocket','XMLHttpRequest','EventSource','BroadcastChannel','MessageChannel','Worker',
+      'localStorage','sessionStorage','caches','indexedDB','HTMLElement','customElements','getComputedStyle',
+      'requestAnimationFrame','cancelAnimationFrame','requestIdleCallback','cancelIdleCallback',
+      'MutationObserver','ResizeObserver','IntersectionObserver','alert','confirm','prompt',
+      'Bun','Deno',
     ]);
 
     const inScope = new Set([
@@ -1191,6 +1277,8 @@ export class TreeSitterParser {
         if (n.type !== 'identifier') { return; }
         if (this.isDeclarationIdentifier(n)) { return; }
         const name = n.text.trim();
+        // <div> is an HTML element, not a reference; <Missing /> still counts.
+        if (/^[a-z]/.test(name) && n.parent?.type?.startsWith('jsx_') && n.parent.childForFieldName?.('name')?.id === n.id) { return; }
         if (seen.has(name) || inScope.has(name) || name.length <= 1) { return; }
         seen.add(name);
         undefinedRefs.push(name);

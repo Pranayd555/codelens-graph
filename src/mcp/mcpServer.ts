@@ -5,6 +5,7 @@ import { GraphDB }        from '../graph/graphDB';
 import { ASTParser }      from '../ingestion/astParser';
 import { WorkspaceScanner } from '../ingestion/workspaceScanner';
 import { ContextBuilder } from '../context/contextBuilder';
+import { detectModuleSystem, formatImport, importSpecifier } from '../context/importHints';
 import { FileClassifier } from '../context/fileClassifier';
 import { MCPLogger }      from './mcpLogger';
 import { GraphNode }      from '../types';
@@ -397,6 +398,9 @@ export class MCPServer {
           if (err instanceof WorkspaceOffError) { return txt(err.message); }
           throw err;
         }
+        // clear_config just deleted .codelens; opening the workspace to log the
+        // call would recreate it and start indexing again.
+        if (name === 'codelens_clear_config') { return result; }
         const text   = result.content.map((c: any) => c.text).join('');
         const { logger } = await this.getWorkspaceContext(args.workspace);
         logger.log(name, args, text, Date.now() - t0);
@@ -654,7 +658,7 @@ export class MCPServer {
             lines.push('- Params: ' + node.params.map(p => p.name + ': ' + (p.type ?? '?')).join(', '));
           }
           const imp = this.buildImportStmt(node, workspaceRoot);
-          if (imp) { lines.push('- Import as: ' + imp); }
+          if (imp) { lines.push('- Import as: ' + imp + ' (path from workspace root)'); }
           const callerCount = db.getEdgesTo(node.id, 'calls').length;
           const calleeCount = db.getEdgesFrom(node.id, 'calls').length;
           if (callerCount) { lines.push('- Callers: ' + callerCount + ' (run codelens_relations with direction callers)'); }
@@ -755,6 +759,9 @@ export class MCPServer {
           } else if (queryType === 'exports' || queryType === 'types') {
             if (!pkg.types) {
               lines.push('No type definitions found for this package' + (pkg.installed ? '.' : ' (it is not installed).'));
+            } else if (!isPathInside(pkg.types, workspaceRoot)) {
+              // The path comes from the DB, which a cloned repo could ship pre-built.
+              lines.push('This package\'s type definitions are outside the workspace, so they were not read.');
             } else {
               const exported = readDeclaredExports(pkg.types);
               lines.push('Type definitions: ' + rel(pkg.types), '');
@@ -1059,13 +1066,7 @@ export class MCPServer {
 
   private buildImportStmt(node: GraphNode, root: string): string | null {
     if (node.type === 'file' || node.type === 'import') { return null; }
-    const rel = './' + this.rel(node.filePath, root).replace(/\.(ts|tsx|js|jsx|mjs)$/, '');
-    if (node.language === 'python') {
-      return 'from ' + rel.replace(/^\.\//, '').replace(/\//g, '.') + ' import ' + node.name;
-    }
-    return node.modifiers?.includes('default')
-      ? 'import ' + node.name + ' from \'' + rel + '\';'
-      : 'import { ' + node.name + ' } from \'' + rel + '\';';
+    return formatImport(node, importSpecifier(node.filePath, root), node.language, detectModuleSystem(node.filePath, root));
   }
 
   // Node paths come from the DB, which a cloned repo could ship pre-built —

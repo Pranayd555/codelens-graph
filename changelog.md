@@ -6,17 +6,30 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ## [Unreleased]
 
-### Added
-- Comprehensive test suite for CommonJS `require()` import parsing, scope analysis, and cross-file call resolution (`test/cjs_require.test.ts`).
-- `test` script in `package.json` for running the automated test suite.
+---
+
+## [0.4.0] - 2026-11-07
 
 ### Fixed
-- **CommonJS Destructured `require()` Recognition**:
-  - Tree-sitter parser in `astParser.ts` now identifies `const { ... } = require(...)` and `const x = require(...)` statements as formal module imports.
-  - Emits proper `import` `GraphNode` and `imports` `GraphEdge` for CommonJS `require` statements in JavaScript, TypeScript, and TSX files.
-  - Prevents erroneous emission of dummy `variable` nodes named after destructuring patterns (e.g., `"{ dbAll, dbGet }"`).
-  - Populates imported symbol names into `fileImportedNames` during AST ingestion, resolving false-positive `⚠️ undefined: <symbol>` flags on consumer functions.
-  - Extended `aliasPattern` in `GraphDB` (`graphDB.ts`) to support CommonJS colon alias syntax (`const { orig: alias } = require(...)`) alongside ESM `as` syntax, ensuring cross-file call edges are accurately resolved.
+- **CommonJS `require()` is understood as an import** (#8, thanks @Sebxxs004 in #9). `const { dbAll } = require('./db')`, `const db = require('./db')` and renamed forms like `const { dbAll: myDb } = require('./db')` no longer cause false "undefined" warnings on the functions that use them, calls link to the required file even when another file has a function with the same name, and CommonJS files now show which files they import. Nodes named after the pattern (`{ dbAll, dbGet }`) are gone.
+- **Calls into npm packages and Node built-ins** are no longer linked to an unrelated workspace symbol that happens to share the name (e.g. `path.normalize()` or `fast-deep-equal`'s `equal()`). Packages count as external when installed in `node_modules` or declared in `package.json`; workspace packages (symlinked or `workspace:`/`file:`/`link:`) and path aliases such as `@/utils` still link into the workspace.
+- **Import hints match the project's module system**: CommonJS files get `const { x } = require(…)` instead of an ES-module `import`. "Import as" paths are now relative to the workspace root (they were relative to the symbol's own folder), and `codelens_node` no longer suggests a JavaScript import for Java, Go, C# and other languages.
+- **Arrow functions are now real symbols.** `const f = () => {}`, `const f = function () {}` and class fields like `handler = () => {}` were indexed as variables (or not at all), so the calls inside them were lost. They are now functions and methods with parameters, return types and call links, which adds a lot of call links in modern TypeScript and React code.
+- **Fewer false "undefined" warnings**: default, rest and destructured parameters in JavaScript (`function f({ items }, ...rest)`) are recognized, and HTML tags in JSX (`<div>`) and standard globals (`Uint8Array`, `TextEncoder`, `setImmediate`, …) are no longer flagged. Missing components like `<Missing />` still are.
+- **The MCP server could index a second workspace without its call graph.** Only the first parser in a process worked properly; later ones silently fell back to regex parsing, which finds no calls or parameters.
+- **Importing a folder now links to its index file** (`require('./lib')` → `lib/index.js`, Python packages → `__init__.py`). Previously no link was created.
+- **Calls through an aliased import keep their link** when the imported file is edited (`import { helper as h }`). Previously the link was lost until a full rebuild.
+- **CodeLens no longer damages your files when updating its section**: front matter in `CLAUDE.md` and similar files is kept, a leftover CodeLens marker no longer causes the text after it to be deleted, and removing the CodeLens block from `.gitignore` no longer merges the lines around it.
+- `codelens_clear_config` no longer recreates `.codelens` and starts re-indexing right after clearing it.
+- **The graph panel no longer freezes VS Code on large repos.** It built its data with two queries per symbol and drew every symbol, which on a 100k-symbol monorepo blocked the extension host for minutes. It now loads in about a second, and above 1,000 symbols it shows the most connected ones with their neighbours. Search and the filter buttons still find any symbol in the index.
+
+### Security
+- `codelens_dependencies` no longer reads type definition files outside the workspace, which a pre-built index could point it at.
+- Updated `@modelcontextprotocol/sdk`, `zod` and other dependencies; `npm audit` reports 0 known vulnerabilities in production dependencies.
+
+### Changed
+- **Agent MCP configs keep working across extension updates.** Configs ran the server from the versioned install folder (`…/pranaydas.codelens-graph-<version>/dist/mcp.js`), which the next update deletes, so agents configured outside the workspace (`~/.claude.json`, `~/.cursor/mcp.json`, Windsurf) silently lost CodeLens after every update. Generated configs now run a stable launcher, `~/.codelens/mcp.js`, that starts the newest CodeLens version installed in any editor (VS Code, Insiders, Cursor, Windsurf, Antigravity, …). On startup, existing configs that point at a versioned folder are switched to the launcher automatically; only that path changes, and configs pointing anywhere else (e.g. a development build) are left alone.
+- **Existing indexes are re-parsed once after an update that changes parsing**, so fixes like the ones above apply to files that haven't changed since they were indexed. Previously those kept their old results until edited or rebuilt with **CodeLens: Force Rebuild Graph**.
 
 ---
 

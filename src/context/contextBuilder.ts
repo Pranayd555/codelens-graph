@@ -227,9 +227,11 @@ export class ContextBuilder {
           const definedIn = this.db.searchNodes(ref, 3)
             .filter(n => n.type !== 'import' && n.name === ref);
 
+          const importStmt = definedIn.length > 0
+            ? this.snippets.buildImportStatement(definedIn[0], node.filePath, node.language)
+            : null;
           const suggestion = definedIn.length > 0
-            ? `"${ref}" is defined in ${definedIn[0].filePath}:${definedIn[0].line}. ` +
-              `Add: ${this.snippets.buildImportStatement(definedIn[0], node.filePath, node.language)}`
+            ? `"${ref}" is defined in ${definedIn[0].filePath}:${definedIn[0].line}.` + (importStmt ? ` Add: ${importStmt}` : '')
             : `"${ref}" is not defined anywhere in the codebase — check spelling or add the definition`;
 
           diagnoses.push({
@@ -325,8 +327,8 @@ export class ContextBuilder {
       lines.push(`- **Location:** \`.../${relPath}:${node.line}\``);
 
       // IMPROVEMENT 2: Import path — tell agent exactly how to import this
-      const importStmt = this.snippets.buildImportStatement(node, node.filePath, node.language);
-      lines.push(`- **Import as:** \`${importStmt}\``);
+      const importStmt = this.snippets.buildWorkspaceImportStatement(node);
+      if (importStmt) { lines.push(`- **Import as:** \`${importStmt}\` (path from workspace root)`); }
 
       // Signature
       if (node.signature) {

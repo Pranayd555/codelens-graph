@@ -1,6 +1,6 @@
 import * as fs   from 'fs';
 import * as path from 'path';
-import { ASTParser } from './astParser';
+import { ASTParser, PARSER_VERSION } from './astParser';
 import { GraphDB }   from '../graph/graphDB';
 import { ParsedFile } from '../types';
 import { isConfigPath, isNodeModulePath, matchPathFilter } from '../utils';
@@ -184,6 +184,10 @@ export class WorkspaceScanner {
 
     await this.parser.ensureInit();
 
+    // Files indexed by an older parser are re-parsed even when unchanged.
+    const parserChanged = this.db.getMetaValue('parser_version') !== PARSER_VERSION;
+    const reparseAll    = !!options.force || parserChanged;
+
     const allFiles    = await this.listFiles(scope, options);
     const total       = allFiles.length;
     const indexedSet  = new Set(allFiles.map(f => path.normalize(f)));
@@ -233,7 +237,7 @@ export class WorkspaceScanner {
 
         const existingFile = fileNodeMap.get(path.normalize(filePath));
         const isUnmodified = existingFile && existingFile.size === fileStat.size && existingFile.lastModified === fileStat.mtimeMs;
-        if (!options.force && isUnmodified) {
+        if (!reparseAll && isUnmodified) {
           result.filesSkipped++;
           continue;
         }
@@ -274,6 +278,13 @@ export class WorkspaceScanner {
           result.errors.push(`Intermediate persist failed: ${err}`);
         }
       }
+    }
+
+    // Recorded only after a complete pass, so an interrupted re-parse resumes
+    // on the next scan.
+    if (parserChanged) {
+      this.db.setMetaValue('parser_version', PARSER_VERSION);
+      unsavedChanges = true;
     }
 
     // Resolving relationships and rewriting the whole DB are the most expensive

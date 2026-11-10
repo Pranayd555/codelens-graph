@@ -22,6 +22,7 @@ import {
 import { GraphStats }         from './types';
 import { isNodeModulePath }   from './utils';
 import { setWorkspaceDisabled } from './workspaceOptOut';
+import { installLauncher, migrateAgentConfigs } from './agent/mcpLauncher';
 
 // ─── Extension-wide state ─────────────────────────────────────────────────────
 
@@ -542,15 +543,15 @@ async function manualBuild(context: vscode.ExtensionContext, force = false): Pro
 
 let lastSentVersion = -1;
 
+// A force layout in a webview stays usable up to about this many symbols.
+const GRAPH_PANEL_MAX_NODES = 1000;
+// The panel's filter button and search text. They only matter when the graph is
+// larger than GRAPH_PANEL_MAX_NODES: then the extension picks what to show.
+let graphPanelView = { filter: 'all', query: '' };
+
 function buildGraphWebviewData() {
-  const allFiles = db.getAllFiles('all').filter(f => !isNodeModulePath(f));
-  const allNodes = allFiles.flatMap(f => db.getNodesByFile(f));
-  const edgeMap  = new Map<string, import('./types').GraphEdge>();
-  for (const n of allNodes) {
-    for (const e of db.getEdgesFrom(n.id)) { edgeMap.set(e.id, e); }
-    for (const e of db.getEdgesTo(n.id))   { edgeMap.set(e.id, e); }
-  }
-  return toWebviewData(allNodes, [...edgeMap.values()]);
+  const view = db.getGraphView(GRAPH_PANEL_MAX_NODES, graphPanelView.filter, graphPanelView.query);
+  return { ...toWebviewData(view.nodes, view.edges), total: view.total, complete: view.complete };
 }
 
 async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
@@ -592,6 +593,11 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
     if (msg.command === 'buildGraph') {
       vscode.commands.executeCommand('codelens-graph.buildGraph');
     }
+    if (msg.command === 'graphQuery') {
+      graphPanelView = { filter: String(msg.filter ?? 'all'), query: String(msg.query ?? '') };
+      lastSentVersion = db.getVersion();
+      graphPanel?.webview.postMessage({ command: 'updateGraph', ...buildGraphWebviewData() });
+    }
     if (msg.command === 'ready') {
       // Send current status so panel knows if it's scanning
       graphPanel?.webview.postMessage({ command: 'setStatus', status: currentStatus });
@@ -622,7 +628,10 @@ async function showGraphPanel(context: vscode.ExtensionContext): Promise<void> {
     }
   });
 
-  graphPanel.onDidDispose(() => { graphPanel = undefined; });
+  graphPanel.onDidDispose(() => {
+    graphPanel = undefined;
+    graphPanelView = { filter: 'all', query: '' };
+  });
 }
 
 
@@ -942,6 +951,29 @@ function registerWorkspace(): void {
   updateActiveWorkspaceRegistry(workspaceRoot);
 }
 
+// Keeps agent MCP configs working across extension updates: refreshes the
+// stable launcher in ~/.codelens, then points any config that still runs a
+// versioned install folder (deleted by the next update) at it.
+function refreshMcpLauncher(context: vscode.ExtensionContext): void {
+  // A development build (F5, tests) must not take over the user's real agent setup.
+  if (context.extensionMode !== vscode.ExtensionMode.Production) {
+    console.log('[CodeLens] Development build: leaving the MCP launcher and agent configs alone.');
+    return;
+  }
+  try {
+    const serverEntry = path.join(context.extensionPath, 'dist', 'mcp.js');
+    if (installLauncher(serverEntry, String(context.extension.packageJSON.version ?? '0.0.0'))) {
+      console.log('[CodeLens] MCP launcher updated: ~/.codelens/mcp.js');
+    }
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+    for (const file of migrateAgentConfigs(undefined, workspaceRoot)) {
+      console.log(`[CodeLens] Pointed the CodeLens MCP server in ${file} at the launcher.`);
+    }
+  } catch (err) {
+    console.error('[CodeLens] Could not refresh the MCP launcher:', err);
+  }
+}
+
 // The normal startup flow, once CodeLens is on for the workspace. settled =
 // VS Code has already finished starting up (the user just turned it on).
 async function runEnabledStartup(context: vscode.ExtensionContext, settled: boolean): Promise<void> {
@@ -963,6 +995,9 @@ async function runEnabledStartup(context: vscode.ExtensionContext, settled: bool
     await whenWorkspaceTrusted(context);
     if (!settled) { await new Promise(resolve => setTimeout(resolve, STARTUP_SETTLE_MS)); }
     if (deactivated || !isWorkspaceEnabled()) { return; }
+
+    // Before indexing, so the agent configs written after the scan use the launcher.
+    refreshMcpLauncher(context);
 
     // Never indexed, no folders selected, and very large: ask before indexing.
     // (A graph rebuilt for a storage upgrade was indexed before — no need to ask.)

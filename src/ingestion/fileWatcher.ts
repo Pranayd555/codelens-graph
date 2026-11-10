@@ -6,7 +6,7 @@ type ChangeCallback = (filePath: string, changeType: 'change' | 'add' | 'unlink'
 // ─── FileWatcher ───────────────────────────────────────────────────────────────
 // Watches the workspace for file changes and triggers incremental graph updates.
 // In a VS Code extension, this wraps vscode.workspace.createFileSystemWatcher.
-// This standalone version uses chokidar for testability outside VS Code.
+// This standalone version uses fs.watch for testability outside VS Code.
 
 export class FileWatcher {
   private callbacks: ChangeCallback[] = [];
