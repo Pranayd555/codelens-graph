@@ -44,13 +44,17 @@ if (base === 'main') {
 } else if (process.env.PR_AUTHOR === 'dependabot[bot]' || labels.includes('skip-changelog')) {
   console.log('Changelog check skipped (Dependabot or skip-changelog label).');
 } else {
-  const changed = git('diff', '--name-only', `origin/${base}...HEAD`).split('\n').filter(Boolean);
+  // Compare with where the pull request started, not the base branch's tip:
+  // when the base moves on (e.g. a release empties Unreleased), a run against
+  // the older merge would otherwise see the difference as the PR's own notes.
+  const forkPoint = git('merge-base', `origin/${base}`, 'HEAD').trim();
+  const changed = git('diff', '--name-only', `${forkPoint}...HEAD`).split('\n').filter(Boolean);
   // package.json counts only when a field that reaches users changes; scripts
   // and devDependencies don't.
   const SHIPPED_FIELDS = ['dependencies', 'contributes', 'engines', 'main', 'activationEvents', 'capabilities', 'bin', 'extensionDependencies'];
   const manifestShips = () => {
     try {
-      const before = JSON.parse(git('show', `origin/${base}:package.json`));
+      const before = JSON.parse(git('show', `${forkPoint}:package.json`));
       const after = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
       return SHIPPED_FIELDS.some(k => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
     } catch {
@@ -59,7 +63,7 @@ if (base === 'main') {
   };
   const shipped = changed.filter(f => /^(src\/|esbuild\.js$|\.vscodeignore$)/.test(f) || (f === 'package.json' && manifestShips()));
   if (shipped.length) {
-    const before = git('show', `origin/${base}:changelog.md`).replace(/\r\n/g, '\n');
+    const before = git('show', `${forkPoint}:changelog.md`).replace(/\r\n/g, '\n');
     const unreleasedBefore = (() => {
       const start = before.indexOf('## [Unreleased]');
       if (start < 0) { return ''; }

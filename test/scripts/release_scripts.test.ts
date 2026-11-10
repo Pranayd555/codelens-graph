@@ -135,6 +135,25 @@ describe('Changelog check for pull requests', () => {
       assert.equal(repo.check('dev').code, 1, 'dependencies ship');
     });
 
+    it('compares with where the branch started, not dev\'s tip, once a release has emptied Unreleased', () => {
+      // dev has notes; a contributor branches off and changes code without a note.
+      repo.addUnreleasedNote('Earlier fix.');
+      repo.commit('notes on dev');
+      repo.git('update-ref', 'refs/remotes/origin/dev', 'HEAD');
+      repo.git('checkout', '-q', '-b', 'contrib');
+      repo.write('src/a.ts', 'export const a = 2;\n');
+      repo.commit('change without a note');
+      // Meanwhile dev is released: its Unreleased section is now empty.
+      repo.git('checkout', '-q', 'dev');
+      assert.equal(repo.run('prepare-release.js', ['0.4.0']).code, 0);
+      repo.commit('Release 0.4.0');
+      repo.git('update-ref', 'refs/remotes/origin/dev', 'HEAD');
+      repo.git('checkout', '-q', 'contrib');
+      const res = repo.check('dev');
+      assert.equal(res.code, 1, res.out);
+      assert.match(res.out, /adds nothing under "## \[Unreleased\]"/);
+    });
+
     it('is skipped for Dependabot and for the skip-changelog label', () => {
       repo.write('package.json', repo.read('package.json').replace('"main"', '"dependencies": { "x": "1" },\n  "main"'));
       repo.commit('deps');
