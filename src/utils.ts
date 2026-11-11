@@ -223,7 +223,7 @@ function isRegexBacktrackSafe(pattern: string): boolean {
 
     const brace = c === '{' ? /^\{(\d+)(,(\d*))?\}/.exec(pattern.slice(i)) : null;
     if (c === '*' || c === '+' || c === '?' || brace) {
-      const unbounded = c === '*' || c === '+' || (brace !== null && brace[2] !== undefined);
+      const unbounded = c === '*' || c === '+' || (brace !== null && brace[3] === '');
       if (unbounded) {
         if (prevAtomWasRiskyGroup) { return false; }
         if (++unboundedCount > 2) { return false; }

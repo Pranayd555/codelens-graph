@@ -6,6 +6,9 @@ All notable changes to the **CodeLens Graph** extension will be documented in th
 
 ## [Unreleased]
 
+### Fixed
+- **Regex searches with bounded repeats** like `\d{1,3}` work instead of falling back to plain-text search (#34, thanks @anubhavaanand in #55).
+
 ---
 
 ## [0.4.0] - 2026-11-07
